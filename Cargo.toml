@@ -1,0 +1,19 @@
+[package]
+name = "netns-proxy"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap = { version = "4.2.4", features = ["derive"] }
+unshare = "0.7.0"
+fork = "0.1.21"
+tokio = { version = "1.27.0", features = ["process", "full"] }
+rtnetlink = "0.12.0"
+sysinfo = "0.28.4"
+flexi_logger = "0.25"
+log = "0.4.17"
+futures = "0.3.28"
+ipgen = "1.0.2"
+ipnetwork = "0.20.0"
