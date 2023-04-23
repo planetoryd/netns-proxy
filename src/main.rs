@@ -6,6 +6,7 @@ use ipgen::subnet;
 use ipnetwork::IpNetwork;
 use rtnetlink::{new_connection, LinkAddRequest, NetworkNamespace};
 use std::os::fd::AsRawFd;
+use std::time::Duration;
 use std::{
     borrow::Borrow,
     path::{Path, PathBuf},
@@ -95,12 +96,17 @@ async fn config_ns(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let res = NetworkNamespace::add(ns_name.to_owned()).await;
     match res {
-        Ok(_) => (),
+        Ok(_) => {
+            log::debug!("{ns_name} created") 
+        },
         Err(_) => {
             // likely dup
-            NetworkNamespace::del(ns_name.to_owned()).await?;
-            NetworkNamespace::add(ns_name.to_owned()).await?;
-            log::debug!("success in creating {ns_name}") // XXX this crates sucks. important messages aren't necessarily errors
+            // NetworkNamespace::del(ns_name.to_owned()).await?; // FIXME
+            // NetworkNamespace::add(ns_name.to_owned()).await?;
+            // log::debug!("success in creating {ns_name}") // XXX this crates sucks. important messages aren't necessarily errors
+
+            // removal of ns fails at even number times. cant fix
+            log::debug!("{ns_name} exists") // XXX this crates sucks. important messages aren't necessarily errors
         }
     }
 
@@ -151,7 +157,6 @@ async fn config_ns(
 
     let mut vh = handle.link().get().match_name(f(&ns_name, true)).execute();
     let lm = vh.try_next().await?.unwrap();
-    handle.link().set(lm.header.index).up().execute().await?;
     handle
         .address()
         .add(lm.header.index, ip_vh, 16)
@@ -162,10 +167,10 @@ async fn config_ns(
         .add(lm.header.index, ip6_vh, 125)
         .execute()
         .await?;
+    handle.link().set(lm.header.index).up().execute().await?;
 
     let mut vn = handle.link().get().match_name(f(&ns_name, false)).execute();
     let lm = vn.try_next().await?.unwrap();
-    handle.link().set(lm.header.index).up().execute().await?;
     handle
         .address()
         .add(lm.header.index, ip_vn, 16)
@@ -176,6 +181,7 @@ async fn config_ns(
         .add(lm.header.index, ip6_vn, 125)
         .execute()
         .await?;
+    handle.link().set(lm.header.index).up().execute().await?;
 
     log::info!("veth subnet {subnet_veth}, {subnet6_veth}, host {ip_vh}, {ip6_vh}, guest {ip_vn}, {ip6_vn}");
 
@@ -245,7 +251,7 @@ async fn main() -> Result<(), String> {
             flexi_logger::Logger::try_with_env_or_str("error,netns_proxy=info")
                 .unwrap()
                 .log_to_file(FileSpec::default())
-                .duplicate_to_stdout(flexi_logger::Duplicate::Info)
+                .duplicate_to_stdout(flexi_logger::Duplicate::All)
                 .start()
                 .unwrap(),
         );
