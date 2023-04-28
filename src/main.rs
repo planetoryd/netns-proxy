@@ -2,7 +2,7 @@
 #![feature(async_closure)]
 use clap::{Parser, Subcommand};
 use flexi_logger::FileSpec;
-use futures::{stream::TryStreamExt, StreamExt};
+use futures::TryStreamExt;
 use ipgen::subnet;
 use ipnetwork::IpNetwork;
 use rtnetlink::{new_connection, Handle, LinkAddRequest, NetworkNamespace};
@@ -14,10 +14,11 @@ use std::{
     process::exit,
 };
 use sysinfo::{self, ProcessExt, System, SystemExt};
-use tokio::runtime;
 
+use async_compat::CompatExt;
 use flexi_logger::writers::FileLogWriter;
 use fork::{chdir, close_fd, fork, setsid, Fork};
+use smol::{io, net, prelude, Unblock};
 // Standard procedure
 // Creates various netns, base-vpn, socks, i2p, lokinet, un-firewalled
 // Kill other running processes, suspected
@@ -66,12 +67,12 @@ pub fn daemon_with_parent(nochdir: bool, noclose: bool) -> Result<Fork, i32> {
 
 async fn inner_daemon(ns_path: String, ns_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let (connection, handle, _) = new_connection().unwrap();
-    tokio::spawn(connection);
+    smol::spawn(connection).detach();
     // as for now, the code above works, the new process is in the netns, checked on 4/24
     // get lo up and check netns
     log::debug!("get interface lo");
 
-    let mut vn = handle.link().get().match_name("lo".to_owned()).execute();
+    let mut vn = handle.link().get().match_name("lo1".to_owned()).execute();
     match vn.try_next().await {
         Ok(x) => {
             if let Some(lm) = x {
@@ -82,16 +83,16 @@ async fn inner_daemon(ns_path: String, ns_name: &str) -> Result<(), Box<dyn std:
         }
         _ => {
             log::error!("interface lo, not found");
-            exit(1);
+            // exit(1);
         }
     }
-    exit(0);
+    Ok(())
+    // exit(0);
 }
 
 fn fork_n_daemonize(ns_path: String, ns_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     match daemon_with_parent(true, true).unwrap() {
         Fork::Child => {
-            NetworkNamespace::prep_for_fork()
             unsafe {
                 logger.as_ref().unwrap().reset_flw(&FileLogWriter::builder(
                     FileSpec::default().discriminant(ns_name),
@@ -100,11 +101,7 @@ fn fork_n_daemonize(ns_path: String, ns_name: &str) -> Result<(), Box<dyn std::e
             log::info!("netns-proxy of {ns_path}, daemon started");
             NetworkNamespace::unshare_processing(ns_path.clone())?;
 
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(inner_daemon(ns_path, ns_name))?;
+            smol::block_on(async_compat::Compat::new(inner_daemon(ns_path, ns_name)))?;
 
             // tokio::time::sleep(tokio::time::Duration::from_secs(10000)).await;
         }
@@ -232,7 +229,7 @@ async fn config_ns(
 
 async fn config_network() -> Result<(), Box<dyn std::error::Error>> {
     let (connection, handle, _) = new_connection().unwrap();
-    tokio::spawn(connection);
+    smol::spawn(connection).detach();
 
     let base_ns = "base_p".to_owned();
     config_ns(&base_ns, veth_from_ns, &handle).await?;
@@ -281,23 +278,19 @@ fn main() -> Result<(), String> {
     }
     let cli = Cli::parse();
 
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(async {
-            match &cli.command {
-                Some(Commands::Stop {}) => {
-                    // kill_suspected();
-                }
-                None => match config_network().await {
-                    Ok(_) => {}
-                    Err(x) => {
-                        log::error!("config network failed {x}")
-                    }
-                },
+    smol::block_on(async_compat::Compat::new(async {
+        match &cli.command {
+            Some(Commands::Stop {}) => {
+                // kill_suspected();
             }
-        });
+            None => match config_network().await {
+                Ok(_) => {}
+                Err(x) => {
+                    log::error!("config network failed {x}")
+                }
+            },
+        }
+    }));
 
     match &cli.command {
         Some(Commands::Stop {}) => {}
