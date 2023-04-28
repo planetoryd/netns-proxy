@@ -1,10 +1,11 @@
 #![feature(ip)]
+#![feature(async_closure)]
 use clap::{Parser, Subcommand};
 use flexi_logger::FileSpec;
 use futures::{stream::TryStreamExt, StreamExt};
 use ipgen::subnet;
 use ipnetwork::IpNetwork;
-use rtnetlink::{new_connection, LinkAddRequest, NetworkNamespace};
+use rtnetlink::{new_connection, Handle, LinkAddRequest, NetworkNamespace};
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 use std::{
@@ -13,6 +14,7 @@ use std::{
     process::exit,
 };
 use sysinfo::{self, ProcessExt, System, SystemExt};
+use tokio::runtime;
 
 use flexi_logger::writers::FileLogWriter;
 use fork::{chdir, close_fd, fork, setsid, Fork};
@@ -62,22 +64,48 @@ pub fn daemon_with_parent(nochdir: bool, noclose: bool) -> Result<Fork, i32> {
     }
 }
 
-async fn fork_n_daemonize(
-    ns_path: String,
-    ns_name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn inner_daemon(ns_path: String, ns_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let (connection, handle, _) = new_connection().unwrap();
+    tokio::spawn(connection);
+    // as for now, the code above works, the new process is in the netns, checked on 4/24
+    // get lo up and check netns
+    log::debug!("get interface lo");
+
+    let mut vn = handle.link().get().match_name("lo".to_owned()).execute();
+    match vn.try_next().await {
+        Ok(x) => {
+            if let Some(lm) = x {
+                log::debug!("set lo up");
+                handle.link().set(lm.header.index).up().execute().await?;
+            }
+            log::error!("lo not found");
+        }
+        _ => {
+            log::error!("interface lo, not found");
+            exit(1);
+        }
+    }
+    exit(0);
+}
+
+fn fork_n_daemonize(ns_path: String, ns_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     match daemon_with_parent(true, true).unwrap() {
         Fork::Child => {
+            NetworkNamespace::prep_for_fork()
             unsafe {
                 logger.as_ref().unwrap().reset_flw(&FileLogWriter::builder(
                     FileSpec::default().discriminant(ns_name),
                 ))?;
             }
-
             log::info!("netns-proxy of {ns_path}, daemon started");
-            NetworkNamespace::unshare_processing(ns_path)?;
-            // as for now, the code above works, the new process is in the netns, checked on 4/24
-            // TODO: should double check netns
+            NetworkNamespace::unshare_processing(ns_path.clone())?;
+
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(inner_daemon(ns_path, ns_name))?;
+
             // tokio::time::sleep(tokio::time::Duration::from_secs(10000)).await;
         }
         Fork::Parent(_) => {
@@ -97,8 +125,8 @@ async fn config_ns(
     let res = NetworkNamespace::add(ns_name.to_owned()).await;
     match res {
         Ok(_) => {
-            log::debug!("{ns_name} created") 
-        },
+            log::debug!("{ns_name} created")
+        }
         Err(_) => {
             // likely dup
             // NetworkNamespace::del(ns_name.to_owned()).await?; // FIXME
@@ -218,10 +246,6 @@ async fn config_network() -> Result<(), Box<dyn std::error::Error>> {
     let clean_ipv6 = "clean_ipv6".to_owned();
     config_ns(&clean_ipv6, veth_from_ns, &handle).await?;
 
-    let mut p = PathBuf::from(rtnetlink::NETNS_PATH);
-    p.push(&base_ns);
-    fork_n_daemonize(p.to_str().unwrap().to_owned(), &base_ns).await?;
-
     Ok(())
 }
 
@@ -243,12 +267,11 @@ enum Commands {
     Stop {},
 }
 
-#[tokio::main]
-async fn main() -> Result<(), String> {
+fn main() -> Result<(), String> {
     // this is very safe
     unsafe {
         logger = Some(
-            flexi_logger::Logger::try_with_env_or_str("error,netns_proxy=info")
+            flexi_logger::Logger::try_with_env_or_str("error,netns_proxy=debug")
                 .unwrap()
                 .log_to_file(FileSpec::default())
                 .duplicate_to_stdout(flexi_logger::Duplicate::All)
@@ -258,20 +281,35 @@ async fn main() -> Result<(), String> {
     }
     let cli = Cli::parse();
 
-    match &cli.command {
-        Some(Commands::Stop {}) => {
-            // kill_suspected();
-        }
-        None => {
-            match config_network().await {
-                Ok(_) => {}
-                Err(x) => {
-                    log::error!("config network failed {x}")
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            match &cli.command {
+                Some(Commands::Stop {}) => {
+                    // kill_suspected();
                 }
+                None => match config_network().await {
+                    Ok(_) => {}
+                    Err(x) => {
+                        log::error!("config network failed {x}")
+                    }
+                },
             }
+        });
 
-            // configs and starts the daemons
+    match &cli.command {
+        Some(Commands::Stop {}) => {}
+        None => {
+            let base_ns = "base_p".to_owned();
+            let mut p = PathBuf::from(rtnetlink::NETNS_PATH);
+            p.push(&base_ns);
+            if let Err(x) = fork_n_daemonize(p.to_str().unwrap().to_owned(), &base_ns) {
+                log::error!("{x}");
+            }
         }
     }
+
     Ok(())
 }
