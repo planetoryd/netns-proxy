@@ -2,6 +2,7 @@ use std::env;
 
 use clap::{Parser, Subcommand};
 use flexi_logger::FileSpec;
+use netns_proxy::TASKS;
 use tokio::{
     io::AsyncWriteExt,
     process::{Child, Command},
@@ -64,13 +65,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for ns in netns_proxy::TASKS {
                     unsafe {
                         KIDS.push(Command::new(&sp).arg(ns).spawn()?);
-                        set.spawn(KIDS.last_mut().unwrap().wait());
+                        set.spawn(async move {
+                            let res = KIDS.last_mut().unwrap().wait().await;
+                            (ns, res)
+                        });
                     }
                 }
 
                 while let Some(res) = set.join_next().await {
                     let idx = res.unwrap();
-                    log::info!("exited {:?}", idx);
+                    log::error!("{} exited, with {:?}. re-cap, {}/{} running", idx.0, idx.1, set.len(), TASKS.len());
                 }
             }
             Err(x) => {
