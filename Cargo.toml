@@ -7,8 +7,6 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4.2.4", features = ["derive"] }
-unshare = "0.7.0"
-fork = "0.1.21"
 tokio = { version = "1.27.0", features = ["process", "full"] }
 rtnetlink = "0.12.0"
 sysinfo = "0.28.4"
@@ -17,5 +15,8 @@ log = "0.4.17"
 futures = "0.3.28"
 ipgen = "1.0.2"
 ipnetwork = "0.20.0"
-smol = "1.3.0"
-async-compat = "0.2.1"
+netlink-packet-route = "0.15.0"
+users = "0.11.0"
+nix = { version = "0.26.2", features = ["user", "sched"] }
+serde = { version = "1.0.160", features = ["derive"] }
+serde_json = "1.0.96"
