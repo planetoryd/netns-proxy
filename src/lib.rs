@@ -4,15 +4,7 @@
 #![feature(setgroups)]
 use flexi_logger::FileSpec;
 
-use flexi_logger::writers::FileLogWriter;
-use futures::TryStreamExt;
-use ipgen::subnet;
 use ipnetwork::IpNetwork;
-use netlink_packet_route::{
-    constants::{AF_BRIDGE, RTEXT_FILTER_BRVLAN},
-    link::nlas::Nla,
-    nlas::link::State,
-};
 
 use nix::{
     sched::CloneFlags,
