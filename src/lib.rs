@@ -271,7 +271,7 @@ pub async fn inner_daemon(
                 "-l",
                 "127.0.0.53", // systemd-resolved
                 "-l",
-                "[::1]:53",
+                "::1",
                 "-p",
                 "53",
                 "-u",
@@ -282,6 +282,61 @@ pub async fn inner_daemon(
             let mut dnsh = dns_async.spawn()?;
 
             tokio::try_join!(tun2h.wait(), dnsh.wait())?;
+        }
+        "i2p" => {
+            // netns that can only access i2p
+        }
+        "clean_ip1" => {
+            let proxy1 = &secret.proxies[ns_name][0];
+            assert!(!proxy1.is_empty());
+            log::debug!("clean proxy, {proxy1}");
+
+            let mut tun2 = std::process::Command::new("tun2socks");
+            tun2.uid(ui.into()).gid(gi.into()).groups(&[gi.into()]);
+            tun2.args(&["-device", tun, "-proxy", &prxy_ipv4]);
+            let mut tun2_async: Command = tun2.into();
+            tun2_async.stdout(Stdio::piped());
+            let mut tun2h = tun2_async.spawn()?;
+            let stdout = tun2h.stdout.take().unwrap();
+            let reader = tokio::io::BufReader::new(stdout).lines();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(watch_log(reader, tx));
+            rx.await?;
+            set_up(tun).await?;
+            set_up(&veth_from_ns(ns_name, false)).await?;
+            ip_add_route(tun, None).await.ok();
+            ip_add_route6(tun, Some("::/0")).await.ok();
+            // outputs to stdout. no logs kept
+
+            let mut dns = std::process::Command::new("dnsproxy");
+            dns.uid(ui.into()).gid(gi.into()).groups(&[gi.into()]);
+            dns.args(&[
+                "-l",
+                "127.0.0.1",
+                "-l",
+                "127.0.0.53", // systemd-resolved
+                "-l",
+                "::1",
+                "-p",
+                "53",
+                "-u",
+                "tcp://1.1.1.1:53",
+                "--cache",
+            ]);
+            let mut dns_async: Command = dns.into();
+            let mut dnsh = dns_async.spawn()?;
+
+            let mut gost = std::process::Command::new("gost");
+            gost.uid(ui.into()).gid(gi.into()).groups(&[gi.into()]);
+            gost.args(&[
+                "-L=socks5://localhost:1080",
+                ("-F=".to_owned() + &prxy_ipv4).as_ref(),
+                &("-F=".to_owned() + proxy1),
+            ]);
+            let mut gost_async: Command = gost.into();
+            let mut gosth = gost_async.spawn()?;
+
+            tokio::try_join!(tun2h.wait(), dnsh.wait(), gosth.wait())?;
         }
         "clean_ipv6" => {
             let proxy6 = &secret.proxies[ns_name][0];
