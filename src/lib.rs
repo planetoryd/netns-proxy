@@ -145,7 +145,7 @@ pub async fn inner_daemon(
     ns_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let tun_target_port = 9909;
-
+    
     unsafe {
         logger = Some(
             flexi_logger::Logger::try_with_env_or_str("error,netns_proxy=debug")
@@ -577,4 +577,4 @@ pub async fn config_network() -> Result<ConfigRes, Box<dyn std::error::Error>> {
     Ok(res)
 }
 
-pub static TASKS: [&str; 4] = ["base_p", "i2p", "clean_ip1", "clean_ipv6"];
+pub static TASKS: [&str; 5] = ["base_p", "i2p", "clean_ip1", "clean_ipv6", "lokins"];

@@ -42,6 +42,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let cli = Cli::parse();
 
+    tokio::spawn(async {
+        tokio::signal::ctrl_c().await.unwrap();
+        log::warn!("Received Ctrl+C");
+        let i = nix::unistd::getpgrp();
+        // for some obscure reason the sigterm is only sent to the parent when you hit ctrl c
+        // do a clean exit
+        Command::new("pkill") 
+            .arg("-c")
+            .arg("-g")
+            .arg(i.as_raw().to_string())
+            .spawn()
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+    });
+
     match &cli.command {
         Some(Commands::Stop {}) => {
             // kill_suspected();
@@ -74,7 +91,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 while let Some(res) = set.join_next().await {
                     let idx = res.unwrap();
-                    log::error!("{} exited, with {:?}. re-cap, {}/{} running", idx.0, idx.1, set.len(), TASKS.len());
+                    log::error!(
+                        "{} exited, with {:?}. re-cap, {}/{} running",
+                        idx.0,
+                        idx.1,
+                        set.len(),
+                        TASKS.len()
+                    );
                 }
             }
             Err(x) => {
