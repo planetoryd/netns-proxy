@@ -1,28 +1,12 @@
 {
   "netns_info": {
-    "base_p": {
-      "subnet_veth": "10.2.0.4/16",
-      "subnet6_veth": "fc00:59ab:210:d5bd:c9d7:b891:f13d:91ad/125",
-      "ip_vh": "10.2.252.205",
-      "ip6_vh": "fc00:59ab:210:d5bd:c9d7:b891:f13d:91ae",
-      "ip_vn": "10.2.192.3",
-      "ip6_vn": "fc00:59ab:210:d5bd:c9d7:b891:f13d:91aa"
-    },
-    "lokins": {
-      "subnet_veth": "10.248.51.110/16",
-      "subnet6_veth": "fc00:9a6b:f54a:c62e:5cff:c6ac:9158:d4dc/125",
-      "ip_vh": "10.248.218.245",
-      "ip6_vh": "fc00:9a6b:f54a:c62e:5cff:c6ac:9158:d4d5",
-      "ip_vn": "10.248.72.141",
-      "ip6_vn": "fc00:9a6b:f54a:c62e:5cff:c6ac:9158:d4d9"
-    },
-    "clean_ip1": {
-      "subnet_veth": "10.66.126.114/16",
-      "subnet6_veth": "fc00:5d0f:5e0:9656:cb2d:6642:aaf0:b229/125",
-      "ip_vh": "10.66.206.100",
-      "ip6_vh": "fc00:5d0f:5e0:9656:cb2d:6642:aaf0:b22e",
-      "ip_vn": "10.66.160.194",
-      "ip6_vn": "fc00:5d0f:5e0:9656:cb2d:6642:aaf0:b221"
+    "clean_ipv6": {
+      "subnet_veth": "10.248.153.198/16",
+      "subnet6_veth": "fc00:bb67:f625:2246:b2bc:1364:67fe:b585/125",
+      "ip_vh": "10.248.163.193",
+      "ip6_vh": "fc00:bb67:f625:2246:b2bc:1364:67fe:b58b",
+      "ip_vn": "10.248.252.74",
+      "ip6_vn": "fc00:bb67:f625:2246:b2bc:1364:67fe:b58a"
     },
     "i2p": {
       "subnet_veth": "10.20.20.86/16",
@@ -32,13 +16,29 @@
       "ip_vn": "10.20.214.156",
       "ip6_vn": "fc00:8dd:17a1:83a1:8bfe:cc21:12c2:2752"
     },
-    "clean_ipv6": {
-      "subnet_veth": "10.248.153.198/16",
-      "subnet6_veth": "fc00:bb67:f625:2246:b2bc:1364:67fe:b585/125",
-      "ip_vh": "10.248.163.193",
-      "ip6_vh": "fc00:bb67:f625:2246:b2bc:1364:67fe:b58b",
-      "ip_vn": "10.248.252.74",
-      "ip6_vn": "fc00:bb67:f625:2246:b2bc:1364:67fe:b58a"
+    "lokins": {
+      "subnet_veth": "10.248.51.110/16",
+      "subnet6_veth": "fc00:9a6b:f54a:c62e:5cff:c6ac:9158:d4dc/125",
+      "ip_vh": "10.248.218.245",
+      "ip6_vh": "fc00:9a6b:f54a:c62e:5cff:c6ac:9158:d4d5",
+      "ip_vn": "10.248.72.141",
+      "ip6_vn": "fc00:9a6b:f54a:c62e:5cff:c6ac:9158:d4d9"
+    },
+    "base_p": {
+      "subnet_veth": "10.2.0.4/16",
+      "subnet6_veth": "fc00:59ab:210:d5bd:c9d7:b891:f13d:91ad/125",
+      "ip_vh": "10.2.252.205",
+      "ip6_vh": "fc00:59ab:210:d5bd:c9d7:b891:f13d:91ae",
+      "ip_vn": "10.2.192.3",
+      "ip6_vn": "fc00:59ab:210:d5bd:c9d7:b891:f13d:91aa"
+    },
+    "clean_ip1": {
+      "subnet_veth": "10.66.126.114/16",
+      "subnet6_veth": "fc00:5d0f:5e0:9656:cb2d:6642:aaf0:b229/125",
+      "ip_vh": "10.66.206.100",
+      "ip6_vh": "fc00:5d0f:5e0:9656:cb2d:6642:aaf0:b22e",
+      "ip_vn": "10.66.160.194",
+      "ip6_vn": "fc00:5d0f:5e0:9656:cb2d:6642:aaf0:b221"
     }
   }
 }

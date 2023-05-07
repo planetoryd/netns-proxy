@@ -1,8 +1,18 @@
-use std::env;
-
+#![feature(setgroups)]
 use clap::{Parser, Subcommand};
 use flexi_logger::FileSpec;
+use libc;
 use netns_proxy::TASKS;
+use nix::{
+    sched::CloneFlags,
+    unistd::{getppid, getresuid},
+};
+use std::{
+    env,
+    ops::Deref,
+    os::{fd::AsRawFd, unix::process::CommandExt},
+};
+use sysinfo::{Gid, Pid, PidExt, ProcessExt, System, SystemExt};
 use tokio::{
     io::AsyncWriteExt,
     process::{Child, Command},
@@ -25,6 +35,13 @@ struct Cli {
 enum Commands {
     /// stops all suspected netns-proxy processes/daemons
     Stop {},
+    /// exec in the netns, with EVERYTHING else untampered. requires SUID
+    Exec {
+        #[arg(short, long)]
+        ns: String,
+        #[arg(short, long)]
+        cmd: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -48,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let i = nix::unistd::getpgrp();
         // for some obscure reason the sigterm is only sent to the parent when you hit ctrl c
         // do a clean exit
-        Command::new("pkill") 
+        Command::new("pkill")
             .arg("-c")
             .arg("-g")
             .arg(i.as_raw().to_string())
@@ -59,9 +76,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap();
     });
 
-    match &cli.command {
+    match cli.command {
         Some(Commands::Stop {}) => {
-            // kill_suspected();
+            netns_proxy::kill_suspected();
+        }
+        Some(Commands::Exec { mut cmd, ns }) => {
+            if cmd.is_none() {
+                cmd = Some("fish".to_owned());
+            }
+            let sysi = System::new_all();
+            let par = sysi
+                .process(sysinfo::Pid::from_u32(getppid().as_raw() as u32))
+                .unwrap();
+            let puid = par.user_id().unwrap().deref();
+            let pgid1 = par.group_id().unwrap();
+            let pgid = pgid1.deref();
+            nix::sched::setns(
+                netns_proxy::nsfd(&ns)?.as_raw_fd(),
+                CloneFlags::CLONE_NEWNET,
+            )?;
+
+            let got_ns_ = String::from_utf8(
+                Command::new("ip")
+                    .args(["netns", "identify"])
+                    .arg(sysinfo::get_current_pid()?.to_string())
+                    .output()
+                    .await?
+                    .stdout,
+            )?;
+            let got_ns = got_ns_.trim();
+            log::info!("current ns {}", got_ns);
+
+            if got_ns != ns {
+                log::error!("entering netns failed, {} != {}", got_ns, ns);
+                std::process::exit(1);
+            }
+
+            netns_proxy::drop_privs1(
+                nix::unistd::Gid::from_raw(*pgid),
+                nix::unistd::Uid::from_raw(*puid),
+            )
+            .await?;
+
+            let mut proc = std::process::Command::new(cmd.unwrap());
+
+            // proc.args(&[""]);
+
+            let mut cmd_async: Command = proc.into();
+            let mut t = cmd_async.spawn()?;
+            t.wait().await?;
         }
         None => match netns_proxy::config_network().await {
             Ok(r) => {

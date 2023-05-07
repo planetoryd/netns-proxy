@@ -7,6 +7,7 @@ use flexi_logger::FileSpec;
 use ipnetwork::IpNetwork;
 
 use nix::{
+    libc::{kill, SIGTERM},
     sched::CloneFlags,
     unistd::{setgroups, Gid, Uid},
 };
@@ -22,7 +23,7 @@ use std::{
 };
 use std::{collections::HashMap, time::Duration};
 use std::{env, os::fd::AsRawFd, process};
-use sysinfo::{self, get_current_pid, ProcessExt, System, SystemExt};
+use sysinfo::{self, get_current_pid, Pid, PidExt, ProcessExt, System, SystemExt};
 use tokio::{
     self,
     fs::File,
@@ -63,7 +64,16 @@ pub fn kill_suspected() {
     for (pid, process) in s.processes() {
         // kill by saved pids
         // or by matching commandlines
-        println!("{} {:?}", pid, process.cmd());
+        let c = process.cmd();
+        if c.into_iter().any(|x| x.contains("tun2socks"))
+            || c.into_iter().any(|x| x.contains("gost"))
+            || c.into_iter().any(|x| x.contains("dnsproxy"))
+        {
+            println!("killed {pid} {}", c[0]);
+            unsafe {
+                kill(pid.as_u32() as i32, SIGTERM);
+            }
+        }
     }
 }
 
@@ -145,7 +155,7 @@ pub async fn inner_daemon(
     ns_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let tun_target_port = 9909;
-    
+
     unsafe {
         logger = Some(
             flexi_logger::Logger::try_with_env_or_str("error,netns_proxy=debug")
@@ -230,7 +240,7 @@ pub async fn inner_daemon(
             tx.send(true).unwrap();
             log::debug!("tun2socks, {}", line);
             while let Some(line) = reader.next_line().await? {
-                log::debug!("tun2socks, {}", line);
+                log::trace!("tun2socks, {}", line);
             }
         }
 
@@ -433,15 +443,30 @@ pub async fn ip_add_route6(
     }
 }
 
-// won't use this function
-pub async fn drop_privs() -> Result<(), Box<dyn Error>> {
-    let log_name = env::var("LOGNAME")?;
-    let log_user = users::get_user_by_name(&log_name).unwrap();
+pub async fn drop_privs(name: &str) -> Result<(), Box<dyn Error>> {
+    log::trace!("drop privs, to {name}");
+    let log_user = users::get_user_by_name(name).unwrap();
     let gi = Gid::from_raw(log_user.primary_group_id());
     let ui = Uid::from_raw(log_user.uid());
+    log::trace!("GID to {gi}");
     nix::unistd::setresgid(gi, gi, gi)?;
-    nix::unistd::setresuid(ui, ui, ui)?;
+    log::trace!("change groups");
     setgroups(&[gi])?;
+    log::trace!("UID to {ui}");
+    nix::unistd::setresuid(ui, ui, ui)?;
+
+    log::info!("dropped privs");
+
+    Ok(())
+}
+
+pub async fn drop_privs1(gi: Gid, ui: Uid) -> Result<(), Box<dyn Error>> {
+    log::trace!("GID to {gi}");
+    nix::unistd::setresgid(gi, gi, gi)?;
+    log::trace!("change groups");
+    setgroups(&[gi])?;
+    log::trace!("UID to {ui}");
+    nix::unistd::setresuid(ui, ui, ui)?;
 
     log::info!("dropped privs");
 
