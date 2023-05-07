@@ -52,3 +52,9 @@ some are todos
 2. `clean_ip1` and `clean_ipv6`, for second-hops, as vpn exits tend to be ip-blacklisted
 3. `i2p`, netns that can only access i2p
 4. `lokins`, not sure how to do this
+
+## make it SUID, and the exec feature
+
+make it SUID, and with `netns-proxy exec --ns target_ns` it can start a process with everything unchanged but netns
+
+by default it starts `fish`
