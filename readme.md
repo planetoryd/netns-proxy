@@ -7,6 +7,9 @@ aka
 - Netns with default gateways to VPNs
 - VPN without making it the default gateway 
 
+it configures a few network namespaces i need, and starts `tun2socks` in some of them to turn socks proxies into VPNs. 
+`dnsproxy` is chosen and used in every netns. `gost` for chaining proxies, although it is be possible with nftables.
+
 do:
 
 - set your firewall to allow 10.0.0.0/8
@@ -19,6 +22,8 @@ why:
 - netns is lightweight
 - ability to do everything, to be as root, while being and only being proxied (no further sandboxing by itself)
     - so this is not a particular sandbox for specific flatpak-apps
+    - so you can do package updates
+- everything JUST works, the execution environment is untampered.
 
 example `secret.json`
 
