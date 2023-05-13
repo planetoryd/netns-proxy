@@ -157,6 +157,7 @@ pub async fn inner_daemon(
     let tun_target_port = 9909;
 
     unsafe {
+        log::trace!("set logger");
         logger = Some(
             flexi_logger::Logger::try_with_env_or_str("error,netns_proxy=debug")
                 .unwrap()
@@ -388,6 +389,7 @@ pub async fn inner_daemon(
                 "--cache",
             ]);
             let mut dns_async: Command = dns.into();
+            dns_async.kill_on_drop(true);
             let mut dnsh = dns_async.spawn()?;
 
             tokio::try_join!(tun2h.wait(), dnsh.wait(), gosth.wait())?;
