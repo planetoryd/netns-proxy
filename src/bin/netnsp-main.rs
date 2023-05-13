@@ -46,6 +46,9 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+    let mut set = JoinSet::new();
+
     // this is very safe
     unsafe {
         netns_proxy::logger = Some(
@@ -138,25 +141,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut sp = env::current_exe()?;
                 sp.pop();
                 sp.push("netnsp-sub");
-                let sp1= sp.into_os_string();
+                let sp1 = sp.into_os_string();
                 // start daemons
 
-                let mut set = JoinSet::new();
-                static mut KIDS: Vec<Child> = Vec::new();
                 for ns in netns_proxy::TASKS {
                     let spx = sp1.clone();
-                    unsafe {
-                        KIDS.push(Command::new(spx.clone()).arg(ns).spawn()?);
-                        set.spawn(async move {
-                            let spx = spx.clone();
-                            log::info!("wait on {:?} {ns}", spx);
-                            let res = KIDS.last_mut().unwrap().wait().await; // line of segfault
-                            // so there is asyncity involved in the problem
-                            // the segfault doesnt happen if the await is executed after all the processes exited
-                            // the segfault happens when the sub-processes are alive
-                            (ns, res)
-                        });
-                    }
+
+                    set.spawn(async move {
+                        let spx = spx.clone();
+                        log::info!("wait on {:?} {ns}", spx);
+                        let mut cmd = Command::new(spx.clone()).arg(ns).spawn().unwrap();
+                        let task = cmd.wait();
+                        let res = task.await;
+                        (ns, res)
+                    });
                 }
 
                 while let Some(res) = set.join_next().await {

@@ -282,18 +282,8 @@ pub async fn inner_daemon(
                 "--cache",
             ]);
             let mut dns_async: Command = dns.into();
-            dns_async.stdout(Stdio::piped());
-            dns_async.stderr(Stdio::piped());
+            // dns_async.kill_on_drop(true);
             let mut dnsh = dns_async.spawn()?;
-            let stdout = dnsh.stdout.take().unwrap();
-            let stderr = dnsh.stderr.take().unwrap();
-            let reader = tokio::io::BufReader::new(stdout).lines();
-            let reader2 = tokio::io::BufReader::new(stderr).lines();
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            tokio::spawn(watch_log(reader, tx, "base_p_dns, "));
-
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            tokio::spawn(watch_log(reader2, tx, "base_p_dns, "));
 
             tokio::try_join!(tun2h.wait(), dnsh.wait())?;
         }
