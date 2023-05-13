@@ -32,7 +32,7 @@ example `secret.json`
 
 ## use with mullvad-browser
 
-0. enter netns with `sudo -E ip netns exec base_p sudo -E -u $LOGNAME fish` (this should maximally avoid altering execution environment, without using a VM)
+0. enter netns with `netnsp-main exec --ns base_p`
 1. run `./start-mullvad-browser.desktop -p` and create your profiles, name them, `i2p` and `base_p`
 2. use `./start-mullvad-browser.desktop -p base_p` next time
 
@@ -56,6 +56,8 @@ some are todos
 ## make it SUID, and the exec feature
 
 make it SUID, and with `netns-proxy exec --ns target_ns` it can start a process with everything unchanged but netns
+
+minimally obtrusive, while `sudo` messes with a lot of things
 
 by default it starts `fish`
 
