@@ -158,11 +158,18 @@ pub async fn inner_daemon(
 
     unsafe {
         log::trace!("set logger");
+        // logger = Some(
+        //     flexi_logger::Logger::try_with_env_or_str("error,netns_proxy=debug")
+        //         .unwrap()
+        //         .log_to_file(FileSpec::default())
+        //         .duplicate_to_stdout(flexi_logger::Duplicate::All)
+        //         .start()
+        //         .unwrap(),
+        // );
         logger = Some(
             flexi_logger::Logger::try_with_env_or_str("error,netns_proxy=debug")
                 .unwrap()
-                .log_to_file(FileSpec::default())
-                .duplicate_to_stdout(flexi_logger::Duplicate::All)
+                .log_to_stdout()
                 .start()
                 .unwrap(),
         );
@@ -468,7 +475,7 @@ pub async fn drop_privs1(gi: Gid, ui: Uid) -> Result<(), Box<dyn Error>> {
     log::trace!("GID to {gi}");
     nix::unistd::setresgid(gi, gi, gi)?;
     log::trace!("change groups");
-    setgroups(&[gi])?;
+    // setgroups(&[gi])?;
     log::trace!("UID to {ui}");
     nix::unistd::setresuid(ui, ui, ui)?;
 

@@ -58,3 +58,5 @@ some are todos
 make it SUID, and with `netns-proxy exec --ns target_ns` it can start a process with everything unchanged but netns
 
 by default it starts `fish`
+
+- you can use it to enter netns, but (probably) programs cant use it to escape a netns

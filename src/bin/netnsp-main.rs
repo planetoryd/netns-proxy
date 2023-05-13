@@ -46,16 +46,25 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-
     let mut set = JoinSet::new();
 
     // this is very safe
+    // unsafe {
+    //     netns_proxy::logger = Some(
+    //         flexi_logger::Logger::try_with_env_or_str("error,netnsp_main=debug,netns_proxy=debug")
+    //             .unwrap()
+    //             .log_to_file(FileSpec::default())
+    //             .duplicate_to_stdout(flexi_logger::Duplicate::All)
+    //             .start()
+    //             .unwrap(),
+    //     );
+    // }
+
     unsafe {
         netns_proxy::logger = Some(
             flexi_logger::Logger::try_with_env_or_str("error,netnsp_main=debug,netns_proxy=debug")
                 .unwrap()
-                .log_to_file(FileSpec::default())
-                .duplicate_to_stdout(flexi_logger::Duplicate::All)
+                .log_to_stdout()
                 .start()
                 .unwrap(),
         );
@@ -84,6 +93,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             netns_proxy::kill_suspected();
         }
         Some(Commands::Exec { mut cmd, ns }) => {
+            let got_ns_ = String::from_utf8(
+                Command::new("ip")
+                    .args(["netns", "identify"])
+                    .arg(sysinfo::get_current_pid()?.to_string())
+                    .output()
+                    .await?
+                    .stdout,
+            )?;
+            let got_ns = got_ns_.trim();
+            log::info!("current ns {}", got_ns);
+
+            if !got_ns.is_empty() {
+                log::error!("ACCESS DENIED");
+                std::process::exit(1);
+            }
+
             if cmd.is_none() {
                 cmd = Some("fish".to_owned());
             }
