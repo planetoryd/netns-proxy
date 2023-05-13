@@ -234,14 +234,15 @@ pub async fn inner_daemon(
     log::debug!("{gi}, {ui}");
 
     async fn watch_log(
-        mut reader: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+        mut reader: tokio::io::Lines<tokio::io::BufReader<impl tokio::io::AsyncRead + Unpin>>,
         tx: tokio::sync::oneshot::Sender<bool>,
+        pre: &str,
     ) -> Result<(), std::io::Error> {
         if let Some(line) = reader.next_line().await? {
             tx.send(true).unwrap();
-            log::debug!("tun2socks, {}", line);
+            log::debug!("{pre} {}", line);
             while let Some(line) = reader.next_line().await? {
-                log::trace!("tun2socks, {}", line);
+                log::trace!("{pre} {}", line);
             }
         }
 
@@ -259,12 +260,11 @@ pub async fn inner_daemon(
             let stdout = tun2h.stdout.take().unwrap();
             let reader = tokio::io::BufReader::new(stdout).lines();
             let (tx, rx) = tokio::sync::oneshot::channel();
-            tokio::spawn(watch_log(reader, tx));
+            tokio::spawn(watch_log(reader, tx, "tun2socks"));
             rx.await?;
             set_up(tun).await?;
             set_up(&veth_from_ns(ns_name, false)).await?;
             ip_add_route(tun, None).await.ok();
-            // outputs to stdout. no logs kept
 
             let mut dns = std::process::Command::new("dnsproxy");
             dns.uid(ui.into()).gid(gi.into()).groups(&[gi.into()]);
@@ -282,7 +282,18 @@ pub async fn inner_daemon(
                 "--cache",
             ]);
             let mut dns_async: Command = dns.into();
+            dns_async.stdout(Stdio::piped());
+            dns_async.stderr(Stdio::piped());
             let mut dnsh = dns_async.spawn()?;
+            let stdout = dnsh.stdout.take().unwrap();
+            let stderr = dnsh.stderr.take().unwrap();
+            let reader = tokio::io::BufReader::new(stdout).lines();
+            let reader2 = tokio::io::BufReader::new(stderr).lines();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(watch_log(reader, tx, "base_p_dns, "));
+
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(watch_log(reader2, tx, "base_p_dns, "));
 
             tokio::try_join!(tun2h.wait(), dnsh.wait())?;
         }
@@ -303,7 +314,7 @@ pub async fn inner_daemon(
             let stdout = tun2h.stdout.take().unwrap();
             let reader = tokio::io::BufReader::new(stdout).lines();
             let (tx, rx) = tokio::sync::oneshot::channel();
-            tokio::spawn(watch_log(reader, tx));
+            tokio::spawn(watch_log(reader, tx, "clean_ip1_tun"));
             rx.await?;
             set_up(tun).await?;
             set_up(&veth_from_ns(ns_name, false)).await?;
@@ -327,6 +338,7 @@ pub async fn inner_daemon(
                 "--cache",
             ]);
             let mut dns_async: Command = dns.into();
+            dns_async.kill_on_drop(true);
             let mut dnsh = dns_async.spawn()?;
 
             let mut gost = std::process::Command::new("gost");
@@ -365,7 +377,7 @@ pub async fn inner_daemon(
             let stdout = tun2h.stdout.take().unwrap();
             let reader = tokio::io::BufReader::new(stdout).lines();
             let (tx, rx) = tokio::sync::oneshot::channel();
-            tokio::spawn(watch_log(reader, tx));
+            tokio::spawn(watch_log(reader, tx, "clean_ipv6_tun,"));
             rx.await?;
             set_up(tun).await?;
             set_up(&veth_from_ns(ns_name, false)).await?;
