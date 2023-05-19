@@ -67,3 +67,9 @@ minimally obtrusive, while `sudo` messes with a lot of things
 by default it starts `fish`
 
 - you can use it to enter netns, but (probably) programs cant use it to escape a netns
+
+## security
+
+- when configuring, it stores the inode number of root netns in netns.json 
+- when `exec`-ing, it checks if current netns matches the recorded inode number
+- if it matches, the process is in the root netns, it proceeds to enter the desired netns

@@ -4,12 +4,14 @@
 #![feature(setgroups)]
 use flexi_logger::FileSpec;
 
+use futures::{FutureExt, TryFutureExt};
 use ipnetwork::IpNetwork;
 
+use anyhow::{anyhow, Context, Ok, Result};
 use nix::{
     libc::{kill, SIGTERM},
     sched::CloneFlags,
-    unistd::{setgroups, Gid, Uid},
+    unistd::{getppid, setgroups, Gid, Uid},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -17,6 +19,7 @@ use std::{
     error::Error,
     net::IpAddr,
     net::{Ipv4Addr, SocketAddrV6},
+    ops::Deref,
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{exit, Stdio},
@@ -42,6 +45,7 @@ pub static mut logger: Option<flexi_logger::LoggerHandle> = None;
 #[derive(Serialize, Deserialize, Default)]
 pub struct ConfigRes {
     pub netns_info: HashMap<String, NetnsInfo>,
+    pub root_inode: u64,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -85,7 +89,7 @@ pub fn veth_from_ns(nsname: &str, host: bool) -> String {
     }
 }
 
-pub async fn set_up(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn set_up(name: &str) -> Result<()> {
     let res = Command::new("ip")
         .args(["link", "set", name, "up"])
         .output()
@@ -94,11 +98,11 @@ pub async fn set_up(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     if res.success() {
         Ok(())
     } else {
-        Err(format!("setting {name} up fails").into())
+        Err(anyhow!("setting {name} up fails"))
     }
 }
 
-pub async fn add_veth_pair(ns_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn add_veth_pair(ns_name: &str) -> Result<()> {
     let res = Command::new("ip")
         .args([
             "link",
@@ -116,11 +120,11 @@ pub async fn add_veth_pair(ns_name: &str) -> Result<(), Box<dyn std::error::Erro
     if res.success() {
         Ok(())
     } else {
-        Err(format!("adding {ns_name} veth pair fails").into())
+        Err(anyhow!("adding {ns_name} veth pair fails"))
     }
 }
 
-pub async fn add_addr_dev(addr: &str, dev: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn add_addr_dev(addr: &str, dev: &str) -> Result<()> {
     let res = Command::new("ip")
         .args(["addr", "add", addr, "dev", dev])
         .output()
@@ -129,13 +133,13 @@ pub async fn add_addr_dev(addr: &str, dev: &str) -> Result<(), Box<dyn std::erro
     if res.success() {
         Ok(())
     } else {
-        let r = format!("adding {addr} to {dev} fails");
+        let r = anyhow!("adding {addr} to {dev} fails");
         log::warn!("{r}");
-        Err(r.into())
+        Err(r)
     }
 }
 
-pub async fn ip_setns(ns_name: &str, dev: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn ip_setns(ns_name: &str, dev: &str) -> Result<()> {
     let res = Command::new("ip")
         .args(["link", "set", dev, "netns", ns_name])
         .output()
@@ -144,16 +148,18 @@ pub async fn ip_setns(ns_name: &str, dev: &str) -> Result<(), Box<dyn std::error
     if res.success() {
         Ok(())
     } else {
-        let r = format!("moving {dev} to {ns_name} fails");
+        let r = anyhow!("moving {dev} to {ns_name} fails");
         log::warn!("{r}");
-        Err(r.into())
+        Err(r)
     }
 }
 
 pub async fn inner_daemon(
     ns_path: String,
     ns_name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+    uid: Option<String>,
+    gid: Option<String>,
+) -> Result<()> {
     let tun_target_port = 9909;
 
     unsafe {
@@ -195,7 +201,11 @@ pub async fn inner_daemon(
     let got_ns_ = String::from_utf8(
         Command::new("ip")
             .args(["netns", "identify"])
-            .arg(sysinfo::get_current_pid()?.to_string())
+            .arg(
+                sysinfo::get_current_pid()
+                    .map_err(anyhow::Error::msg)?
+                    .to_string(),
+            )
             .output()
             .await?
             .stdout,
@@ -233,10 +243,31 @@ pub async fn inner_daemon(
     // let prxy_ipv6 = "socks5://".to_owned() + &prxy_ipv6.to_string();
     // log::debug!("proxy ipv6 {}", prxy_ipv6);
 
-    let log_name = env::var("SUDO_USER")?;
-    let log_user = users::get_user_by_name(&log_name).unwrap();
-    let gi = Gid::from_raw(log_user.primary_group_id());
-    let ui = Uid::from_raw(log_user.uid());
+    let r_ui: u32;
+    let r_gi: u32;
+
+    if let core::result::Result::Ok(log_name) = env::var("SUDO_USER") { // run from sudo
+        let log_user = users::get_user_by_name(&log_name).unwrap();
+        r_ui = log_user.uid();
+        r_gi = log_user.primary_group_id();
+    } else if uid.is_some() && gid.is_some() { // supplied
+        r_gi = gid.unwrap().parse()?;
+        r_ui = uid.unwrap().parse()?;
+    } else { // as child process of some non-root
+        let sysi = System::new_all();
+        let par = sysi
+            .process(sysinfo::Pid::from_u32(getppid().as_raw() as u32))
+            .unwrap();
+        let puid = par.user_id().unwrap().deref();
+        let pgid1 = par.group_id().unwrap();
+        let pgid = pgid1.deref();
+        r_gi = *pgid;
+        r_ui = *puid;
+    }
+
+    let gi = Gid::from_raw(r_gi);
+    let ui = Uid::from_raw(r_ui);
+
     assert!(!ui.is_root());
     log::debug!("{gi}, {ui}");
 
@@ -244,7 +275,7 @@ pub async fn inner_daemon(
         mut reader: tokio::io::Lines<tokio::io::BufReader<impl tokio::io::AsyncRead + Unpin>>,
         tx: tokio::sync::oneshot::Sender<bool>,
         pre: &str,
-    ) -> Result<(), std::io::Error> {
+    ) -> Result<()> {
         if let Some(line) = reader.next_line().await? {
             tx.send(true).unwrap();
             log::debug!("{pre} {}", line);
@@ -292,7 +323,10 @@ pub async fn inner_daemon(
             // dns_async.kill_on_drop(true);
             let mut dnsh = dns_async.spawn()?;
 
-            tokio::try_join!(tun2h.wait(), dnsh.wait())?;
+            tokio::try_join!(
+                tun2h.wait().map_err(|e| e.into()),
+                dnsh.wait().map_err(|e| e.into())
+            )?;
         }
         "i2p" => {
             // netns that can only access i2p
@@ -348,7 +382,11 @@ pub async fn inner_daemon(
             let mut gost_async: Command = gost.into();
             let mut gosth = gost_async.spawn()?;
 
-            tokio::try_join!(tun2h.wait(), dnsh.wait(), gosth.wait())?;
+            tokio::try_join!(
+                tun2h.wait().map_err(|e| e.into()),
+                dnsh.wait().map_err(|e| e.into()),
+                gosth.wait().map_err(|e| e.into())
+            )?;
         }
         "clean_ipv6" => {
             let proxy6 = &secret.proxies[ns_name][0];
@@ -401,21 +439,21 @@ pub async fn inner_daemon(
             dns_async.kill_on_drop(true);
             let mut dnsh = dns_async.spawn()?;
 
-            tokio::try_join!(tun2h.wait(), dnsh.wait(), gosth.wait())?;
+            tokio::try_join!(
+                tun2h.wait().map_err(|e| e.into()),
+                dnsh.wait().map_err(|e| e.into()),
+                gosth.wait().map_err(|e| e.into())
+            )?;
         }
         _ => {
             log::warn!("no matches found, exiting");
         }
-    }
+    };
 
     Ok(())
-    // exit(0);
 }
 
-pub async fn ip_add_route(
-    dev: &str,
-    mut dst: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn ip_add_route(dev: &str, mut dst: Option<&str>) -> Result<()> {
     if dst.is_none() {
         dst = Some("default");
     }
@@ -427,16 +465,13 @@ pub async fn ip_add_route(
     if res.success() {
         Ok(())
     } else {
-        let r = format!("adding route to {dev} fails");
+        let r = anyhow!("adding route to {dev} fails");
         log::warn!("{r}");
-        Err(r.into())
+        Err(r)
     }
 }
 
-pub async fn ip_add_route6(
-    dev: &str,
-    mut dst: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn ip_add_route6(dev: &str, mut dst: Option<&str>) -> Result<()> {
     if dst.is_none() {
         dst = Some("default");
     }
@@ -448,13 +483,13 @@ pub async fn ip_add_route6(
     if res.success() {
         Ok(())
     } else {
-        let r = format!("adding route to {dev} fails");
+        let r = anyhow!("adding route to {dev} fails");
         log::warn!("{r}");
-        Err(r.into())
+        Err(r)
     }
 }
 
-pub async fn drop_privs(name: &str) -> Result<(), Box<dyn Error>> {
+pub async fn drop_privs(name: &str) -> Result<()> {
     log::trace!("drop privs, to {name}");
     let log_user = users::get_user_by_name(name).unwrap();
     let gi = Gid::from_raw(log_user.primary_group_id());
@@ -471,7 +506,7 @@ pub async fn drop_privs(name: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-pub async fn drop_privs1(gi: Gid, ui: Uid) -> Result<(), Box<dyn Error>> {
+pub async fn drop_privs1(gi: Gid, ui: Uid) -> Result<()> {
     log::trace!("GID to {gi}");
     nix::unistd::setresgid(gi, gi, gi)?;
     log::trace!("change groups");
@@ -484,13 +519,14 @@ pub async fn drop_privs1(gi: Gid, ui: Uid) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-pub fn nsfd(ns_name: &str) -> Result<std::fs::File, std::io::Error> {
+pub fn nsfd(ns_name: &str) -> Result<std::fs::File> {
     let mut p = PathBuf::from(NETNS_PATH);
     p.push(ns_name);
-    std::fs::File::open(p)
+    let r = std::fs::File::open(p)?;
+    Ok(r)
 }
 
-pub async fn add_netns(ns_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn add_netns(ns_name: &str) -> Result<()> {
     let res = Command::new("ip")
         .args(["netns", "add", ns_name])
         .output()
@@ -499,16 +535,13 @@ pub async fn add_netns(ns_name: &str) -> Result<(), Box<dyn std::error::Error>> 
     if res.success() {
         Ok(())
     } else {
-        let r = format!("adding {ns_name} fails");
+        let r = anyhow!("adding {ns_name} fails");
         log::warn!("{r}");
-        Err(r.into())
+        Err(r)
     }
 }
 
-pub async fn add_addrs_guest(
-    ns_name: &str,
-    info: &NetnsInfo,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn add_addrs_guest(ns_name: &str, info: &NetnsInfo) -> Result<()> {
     add_addr_dev(
         (info.ip_vn.clone() + "/16").as_ref(),
         veth_from_ns(&ns_name, false).as_ref(),
@@ -531,7 +564,7 @@ pub async fn config_ns(
     ns_name: &str,
     f: fn(&str, bool) -> String,
     config_res: &mut ConfigRes,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<()> {
     // rtnetlink sucks. just use the command line
     let _ = add_netns(ns_name).await;
     let _ = add_veth_pair(ns_name).await;
@@ -603,14 +636,49 @@ pub async fn config_ns(
     Ok(())
 }
 
-pub async fn config_network() -> Result<ConfigRes, Box<dyn std::error::Error>> {
+pub async fn config_network() -> Result<ConfigRes> {
     let mut res = ConfigRes::default();
 
     for ns in TASKS {
         config_ns(&ns, veth_from_ns, &mut res).await?;
     }
 
+    res.root_inode = get_pid1_netns_inode().await?;
+
     Ok(res)
+}
+
+pub async fn get_pid1_netns_inode() -> Result<u64> {
+    let netns_link = tokio::fs::read_link(Path::new("/proc/1/ns/net"))
+        .await
+        .context("Failed to read symlink target of root network namespace")?;
+    let inode_str = netns_link
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get file name from symlink target"))?
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Failed to convert OsStr to &str"))?
+        .trim_start_matches("net:[");
+
+    inode_str
+        .trim_end_matches(']')
+        .parse::<u64>()
+        .map_err(|_| anyhow::anyhow!("Failed to parse inode number as u64"))
+}
+
+pub async fn get_self_netns_inode() -> Result<u64> {
+    let netns_link = tokio::fs::read_link(Path::new("/proc/self/ns/net")).await?;
+
+    let inode_str = netns_link
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get file name from symlink target"))?
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Failed to convert OsStr to &str"))?
+        .trim_start_matches("net:[");
+
+    inode_str
+        .trim_end_matches(']')
+        .parse::<u64>()
+        .map_err(|_| anyhow::anyhow!("Failed to parse inode number as u64"))
 }
 
 pub static TASKS: [&str; 5] = ["base_p", "i2p", "clean_ip1", "clean_ipv6", "lokins"];

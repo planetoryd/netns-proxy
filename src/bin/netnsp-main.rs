@@ -1,4 +1,5 @@
 #![feature(setgroups)]
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use flexi_logger::FileSpec;
 use libc;
@@ -14,9 +15,9 @@ use std::{
 };
 use sysinfo::{Gid, Pid, PidExt, ProcessExt, System, SystemExt};
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncWriteExt, AsyncReadExt},
     process::{Child, Command},
-    task::JoinSet,
+    task::JoinSet, fs::File,
 };
 
 #[derive(Parser)]
@@ -45,7 +46,7 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     let mut set = JoinSet::new();
 
     // this is very safe
@@ -93,18 +94,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             netns_proxy::kill_suspected();
         }
         Some(Commands::Exec { mut cmd, ns }) => {
-            let got_ns_ = String::from_utf8(
-                Command::new("ip")
-                    .args(["netns", "identify"])
-                    .arg(sysinfo::get_current_pid()?.to_string())
-                    .output()
-                    .await?
-                    .stdout,
-            )?;
-            let got_ns = got_ns_.trim();
-            log::info!("current ns {}", got_ns);
+            let path = "./netnsp.json";
+            let mut file = File::open(path).await?;
+            let mut contents = String::new();
+            file.read_to_string(&mut contents).await?;
 
-            if !got_ns.is_empty() {
+            let config: netns_proxy::ConfigRes = serde_json::from_str(&contents)?;
+            let curr_inode = netns_proxy::get_self_netns_inode().await?;
+            if curr_inode != config.root_inode {
                 log::error!("ACCESS DENIED");
                 std::process::exit(1);
             }
@@ -127,7 +124,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let got_ns_ = String::from_utf8(
                 Command::new("ip")
                     .args(["netns", "identify"])
-                    .arg(sysinfo::get_current_pid()?.to_string())
+                    .arg(
+                        sysinfo::get_current_pid()
+                            .map_err(anyhow::Error::msg)?
+                            .to_string(),
+                    )
                     .output()
                     .await?
                     .stdout,
@@ -168,14 +169,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sp.push("netnsp-sub");
                 let sp1 = sp.into_os_string();
                 // start daemons
+                let sysi = System::new_all();
+                let par = sysi
+                    .process(sysinfo::Pid::from_u32(getppid().as_raw() as u32))
+                    .unwrap();
+                let puid = par.user_id().unwrap().deref();
+                let pu = *puid;
+                let pgid1 = par.group_id().unwrap();
+                let pgid = pgid1.deref();
+                let pg = *pgid;
 
                 for ns in netns_proxy::TASKS {
                     let spx = sp1.clone();
 
                     set.spawn(async move {
                         let spx = spx.clone();
+
                         log::info!("wait on {:?} {ns}", spx);
-                        let mut cmd = Command::new(spx.clone()).arg(ns).spawn().unwrap();
+                        let mut cmd = Command::new(spx.clone())
+                            .arg(ns)
+                            .arg(pu.to_string())
+                            .arg(pg.to_string())
+                            .spawn()
+                            .unwrap();
                         let task = cmd.wait();
                         let res = task.await;
                         (ns, res)
