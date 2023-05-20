@@ -237,7 +237,7 @@ pub async fn inner_daemon(
         _ => {}
     }
 
-    let prxy_ipv4 = "socks5://".to_owned() + &ns_config.ip_vh + ":" + &tun_target_port.to_string();
+    let base_prxy_v4 = "socks5://".to_owned() + &ns_config.ip_vh + ":" + &tun_target_port.to_string();
     // let prxy_ipv6: SocketAddrV6 =
     //     SocketAddrV6::new(ns_config.ip6_vh.parse()?, tun_target_port, 0, 0);
     // let prxy_ipv6 = "socks5://".to_owned() + &prxy_ipv6.to_string();
@@ -291,7 +291,7 @@ pub async fn inner_daemon(
         "base_p" => {
             let mut tun2 = std::process::Command::new("tun2socks");
             tun2.uid(ui.into()).gid(gi.into()).groups(&[gi.into()]);
-            tun2.args(&["-device", tun, "-proxy", &prxy_ipv4]);
+            tun2.args(&["-device", tun, "-proxy", &base_prxy_v4]);
             let mut tun2_async: Command = tun2.into();
             tun2_async.stdout(Stdio::piped());
             let mut tun2h = tun2_async.spawn()?;
@@ -338,7 +338,7 @@ pub async fn inner_daemon(
 
             let mut tun2 = std::process::Command::new("tun2socks");
             tun2.uid(ui.into()).gid(gi.into()).groups(&[gi.into()]);
-            tun2.args(&["-device", tun, "-proxy", &prxy_ipv4]);
+            tun2.args(&["-device", tun, "-proxy", "127.0.0.1:1080"]);
             let mut tun2_async: Command = tun2.into();
             tun2_async.stdout(Stdio::piped());
             let mut tun2h = tun2_async.spawn()?;
@@ -376,7 +376,7 @@ pub async fn inner_daemon(
             gost.uid(ui.into()).gid(gi.into()).groups(&[gi.into()]);
             gost.args(&[
                 "-L=socks5://localhost:1080",
-                ("-F=".to_owned() + &prxy_ipv4).as_ref(),
+                ("-F=".to_owned() + &base_prxy_v4).as_ref(),
                 &("-F=".to_owned() + proxy1),
             ]);
             let mut gost_async: Command = gost.into();
@@ -397,7 +397,7 @@ pub async fn inner_daemon(
             gost.uid(ui.into()).gid(gi.into()).groups(&[gi.into()]);
             gost.args(&[
                 "-L=socks5://localhost:1080",
-                ("-F=".to_owned() + &prxy_ipv4).as_ref(),
+                ("-F=".to_owned() + &base_prxy_v4).as_ref(),
                 &("-F=".to_owned() + proxy6),
             ]);
             let mut gost_async: Command = gost.into();
