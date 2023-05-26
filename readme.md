@@ -13,7 +13,6 @@ it configures a few network namespaces i need, and starts `tun2socks` in some of
 do:
 
 - set your firewall to allow 10.0.0.0/8
-- run [REPO/initial.sh](./initial.sh)
 - read the code
 - install the following, make them available in $PATH
   - [tun2socks](https://github.com/xjasonlyu/tun2socks)
@@ -36,29 +35,25 @@ why:
 ```bash
 cargo b
 ./initial.sh # set capabilities
-./setsuid.sh # runs this every build
-./target/debug/netnsp-main # run it under the project root directory
+./setsuid.sh # run this every build
+./target/debug/netnsp-main # configures the OS, and supervises the daemons. run it under the project root directory
 ./target/debug/netnsp-main exec --ns base_p # enter a shell in netns.
 ```
 
-make it SUID, and with `netns-main exec --ns target_ns` it can start a process with everything unchanged but netns
+with `netns-main exec --ns target_ns` it can start a process with everything unchanged but netns
 
 minimally obtrusive, while `sudo` messes with a lot of things
 
 by default it starts `fish`
 
-- you can use it to enter netns, but (probably) programs can't use it to escape a netns
-
 ## available NetNSes
-
-some are todos
 
 1. `base_p`, configured for the base proxy. intended to be a basis, crossing firewalls
     - you need a socks5 proxy in the root namespace, listening on `0.0.0.0:9909` 
 2. `clean_ip1` and `clean_ipv6`, for second-hops, as vpn exits tend to be ip-blacklisted
     - configure [secret.json](./secret.json)
-3. `i2p`, netns that can only access i2p
-4. `lokins`, not sure how to do this
+3. (todo) `i2p`, netns that can only access i2p
+4. (todo) `lokins`
 
 example `secret.json`
 
