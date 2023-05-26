@@ -19,6 +19,8 @@ do:
   - [tun2socks](https://github.com/xjasonlyu/tun2socks)
   - [gost](https://github.com/go-gost/gost)
   - [dnsproxy](https://github.com/AdguardTeam/dnsproxy)
+  - iproute2
+  - fish
 
 why:
 
@@ -28,6 +30,35 @@ why:
     - so this is not a particular sandbox for specific flatpak-apps
     - so you can do package updates
 - everything JUST works, the execution environment is untampered.
+
+## usage
+
+```bash
+cargo b
+./initial.sh # set capabilities
+./setsuid.sh # runs this every build
+./target/debug/netnsp-main # run it under the project root directory
+./target/debug/netnsp-main exec --ns base_p # enter a shell in netns.
+```
+
+make it SUID, and with `netns-main exec --ns target_ns` it can start a process with everything unchanged but netns
+
+minimally obtrusive, while `sudo` messes with a lot of things
+
+by default it starts `fish`
+
+- you can use it to enter netns, but (probably) programs can't use it to escape a netns
+
+## available NetNSes
+
+some are todos
+
+1. `base_p`, configured for the base proxy. intended to be a basis, crossing firewalls
+    - you need a socks5 proxy in the root namespace, listening on `0.0.0.0:9909` 
+2. `clean_ip1` and `clean_ipv6`, for second-hops, as vpn exits tend to be ip-blacklisted
+    - configure [secret.json](./secret.json)
+3. `i2p`, netns that can only access i2p
+4. `lokins`, not sure how to do this
 
 example `secret.json`
 
@@ -39,15 +70,8 @@ example `secret.json`
 }
 ```
 
-## make it SUID, and the exec feature
-
-make it SUID, and with `netns-proxy exec --ns target_ns` it can start a process with everything unchanged but netns
-
-minimally obtrusive, while `sudo` messes with a lot of things
-
-by default it starts `fish`
-
-- you can use it to enter netns, but (probably) programs cant use it to escape a netns
+- `netnsp-main` may be run repeatedly without issues. ignore the errors and warnings
+    - in case of altered OS config state, try to reboot, or manually remove the NetNSes and `netnsp-main stop` to kill orphan processes
 
 ## security
 
@@ -66,17 +90,9 @@ using the tarball of mullvadbrowser seems better than other packagings, for now.
 options
 
 1. run mullvad-browser in `base_p` and use proxy container addon for second-hop 
-  - this is subject to random webrtc leaks and such. anyway more defenses against shitcode the better
+    - this is subject to random webrtc leaks and such. anyway more defenses against shitcode the better
 2. run browser in `clean_ip1`
 
-## available NetNSes
-
-some are todos
-
-1. `base_p`, configured for the base proxy. intended to be a basis, crossing firewalls
-2. `clean_ip1` and `clean_ipv6`, for second-hops, as vpn exits tend to be ip-blacklisted
-3. `i2p`, netns that can only access i2p
-4. `lokins`, not sure how to do this
 
 ## alternatives
 
