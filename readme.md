@@ -32,6 +32,16 @@ why:
 
 ## usage
 
+install build depedencies through your package manager
+
+```
+libnftnl
+libmnl
+```
+
+then
+
+
 ```bash
 cargo b
 ./initial.sh # set capabilities
@@ -74,6 +84,17 @@ example `secret.json`
 - when `exec`-ing, it checks if current netns matches the recorded inode number
 - if it matches, the process is in the root netns, it proceeds to enter the desired netns
 
+## use with Flatpak
+
+> It's possible to use it with Flatpaks, since it is maximally non-obtrusive anyway. 
+>
+> I'm not sure about the security implications. 
+
+```bash
+./target/debug/netnsp-main exec --ns base_p # enter a shell in netns.
+flatpak run tld.app.some
+```
+
 ## use with mullvad-browser
 
 0. enter netns with `netnsp-main exec --ns base_p`
@@ -101,4 +122,13 @@ options
 - if only flatpak/bubblewrap supports NetNSes 
   - https://github.com/flatpak/flatpak/issues/1202
   - https://github.com/containers/bubblewrap/issues/361
+- LXC. for me, netns is enough, and sandboxing is better done by other tooling.
 
+## tip
+
+- use [opensnitch firewall](https://github.com/evilsocket/opensnitch) as the second layer of defense, in case you do anything wrong, like launching an app outside netns.
+
+## random
+
+- https://github.com/nixpak/nixpak
+- https://sr.ht/~fgaz/nix-bubblewrap/
