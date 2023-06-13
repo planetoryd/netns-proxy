@@ -32,16 +32,6 @@ why:
 
 ## usage
 
-install build depedencies through your package manager
-
-```
-libnftnl
-libmnl
-```
-
-then
-
-
 ```bash
 cargo b
 ./initial.sh # set capabilities
