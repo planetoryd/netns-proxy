@@ -19,7 +19,7 @@ do:
   - [gost](https://github.com/go-gost/gost)
   - [dnsproxy](https://github.com/AdguardTeam/dnsproxy)
   - iproute2
-  - fish
+  - fish (optional)
 
 why:
 
