@@ -2,7 +2,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use flexi_logger::FileSpec;
-use libc;
 use netns_proxy::TASKS;
 use nix::{
     sched::CloneFlags,
@@ -13,12 +12,14 @@ use std::{
     ops::Deref,
     os::{fd::AsRawFd, unix::process::CommandExt},
 };
-use sysinfo::{Gid, Pid, PidExt, ProcessExt, System, SystemExt};
 use tokio::{
-    io::{AsyncWriteExt, AsyncReadExt},
+    fs::File,
+    io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
-    task::JoinSet, fs::File,
+    task::JoinSet,
 };
+
+use procfs::process::Process;
 
 #[derive(Parser)]
 #[command(
@@ -101,6 +102,16 @@ async fn main() -> Result<()> {
 
             let config: netns_proxy::ConfigRes = serde_json::from_str(&contents)?;
             let curr_inode = netns_proxy::get_self_netns_inode().await?;
+            let pid = nix::unistd::getpid();
+
+            let parent_pid = nix::unistd::getppid();
+            let parent_process = match Process::new(parent_pid.into()) {
+                Ok(process) => process,
+                Err(_) => panic!("cannot access parent process"),
+            };
+            let puid = parent_process.status()?.euid;
+            let pgid = parent_process.status()?.egid;
+
             if curr_inode != config.root_inode {
                 log::error!("ACCESS DENIED");
                 std::process::exit(1);
@@ -109,32 +120,31 @@ async fn main() -> Result<()> {
             if cmd.is_none() {
                 cmd = Some("fish".to_owned());
             }
-            let sysi = System::new_all();
-            let par = sysi
-                .process(sysinfo::Pid::from_u32(getppid().as_raw() as u32))
-                .unwrap();
-            let puid = par.user_id().unwrap().deref();
-            let pgid1 = par.group_id().unwrap();
-            let pgid = pgid1.deref();
+
+            log::info!(
+                "uid: {:?}, gid: {:?}, pid: {:?}",
+                nix::unistd::getresuid()?,
+                nix::unistd::getresgid()?,
+                pid
+            );
             nix::sched::setns(
                 netns_proxy::nsfd(&ns)?.as_raw_fd(),
                 CloneFlags::CLONE_NEWNET,
             )?;
+            log::info!("setns succeeded");
 
             let got_ns_ = String::from_utf8(
                 Command::new("ip")
                     .args(["netns", "identify"])
-                    .arg(
-                        sysinfo::get_current_pid()
-                            .map_err(anyhow::Error::msg)?
-                            .to_string(),
-                    )
+                    .arg(pid.to_string())
+                    .uid(0)
                     .output()
                     .await?
                     .stdout,
             )?;
+
             let got_ns = got_ns_.trim();
-            log::info!("current ns {}", got_ns);
+            log::info!("current ns '{}'", got_ns);
 
             if got_ns != ns {
                 log::error!("entering netns failed, {} != {}", got_ns, ns);
@@ -142,8 +152,8 @@ async fn main() -> Result<()> {
             }
 
             netns_proxy::drop_privs1(
-                nix::unistd::Gid::from_raw(*pgid),
-                nix::unistd::Uid::from_raw(*puid),
+                nix::unistd::Gid::from_raw(pgid),
+                nix::unistd::Uid::from_raw(puid),
             )
             .await?;
 
@@ -169,15 +179,15 @@ async fn main() -> Result<()> {
                 sp.push("netnsp-sub");
                 let sp1 = sp.into_os_string();
                 // start daemons
-                let sysi = System::new_all();
-                let par = sysi
-                    .process(sysinfo::Pid::from_u32(getppid().as_raw() as u32))
-                    .unwrap();
-                let puid = par.user_id().unwrap().deref();
-                let pu = *puid;
-                let pgid1 = par.group_id().unwrap();
-                let pgid = pgid1.deref();
-                let pg = *pgid;
+                let pid = nix::unistd::getpid();
+
+                let parent_pid = nix::unistd::getppid();
+                let parent_process = match Process::new(parent_pid.into()) {
+                    Ok(process) => process,
+                    Err(_) => panic!("cannot access parent process"),
+                };
+                let puid = parent_process.status()?.euid;
+                let pgid = parent_process.status()?.egid;
 
                 for ns in netns_proxy::TASKS {
                     let spx = sp1.clone();
@@ -188,8 +198,9 @@ async fn main() -> Result<()> {
                         log::info!("wait on {:?} {ns}", spx);
                         let mut cmd = Command::new(spx.clone())
                             .arg(ns)
-                            .arg(pu.to_string())
-                            .arg(pg.to_string())
+                            .arg(puid.to_string())
+                            .arg(pgid.to_string())
+                            .uid(0)
                             .spawn()
                             .unwrap();
                         let task = cmd.wait();

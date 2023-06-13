@@ -201,11 +201,8 @@ pub async fn inner_daemon(
     let got_ns_ = String::from_utf8(
         Command::new("ip")
             .args(["netns", "identify"])
-            .arg(
-                sysinfo::get_current_pid()
-                    .map_err(anyhow::Error::msg)?
-                    .to_string(),
-            )
+            .arg(nix::unistd::getpid().to_string())
+            .uid(0)
             .output()
             .await?
             .stdout,
@@ -237,7 +234,8 @@ pub async fn inner_daemon(
         _ => {}
     }
 
-    let base_prxy_v4 = "socks5://".to_owned() + &ns_config.ip_vh + ":" + &tun_target_port.to_string();
+    let base_prxy_v4 =
+        "socks5://".to_owned() + &ns_config.ip_vh + ":" + &tun_target_port.to_string();
     // let prxy_ipv6: SocketAddrV6 =
     //     SocketAddrV6::new(ns_config.ip6_vh.parse()?, tun_target_port, 0, 0);
     // let prxy_ipv6 = "socks5://".to_owned() + &prxy_ipv6.to_string();
@@ -246,23 +244,26 @@ pub async fn inner_daemon(
     let r_ui: u32;
     let r_gi: u32;
 
-    if let core::result::Result::Ok(log_name) = env::var("SUDO_USER") { // run from sudo
+    if let core::result::Result::Ok(log_name) = env::var("SUDO_USER") {
+        // run from sudo
         let log_user = users::get_user_by_name(&log_name).unwrap();
         r_ui = log_user.uid();
         r_gi = log_user.primary_group_id();
-    } else if uid.is_some() && gid.is_some() { // supplied
+    } else if uid.is_some() && gid.is_some() {
+        // supplied
         r_gi = gid.unwrap().parse()?;
         r_ui = uid.unwrap().parse()?;
-    } else { // as child process of some non-root
-        let sysi = System::new_all();
-        let par = sysi
-            .process(sysinfo::Pid::from_u32(getppid().as_raw() as u32))
-            .unwrap();
-        let puid = par.user_id().unwrap().deref();
-        let pgid1 = par.group_id().unwrap();
-        let pgid = pgid1.deref();
-        r_gi = *pgid;
-        r_ui = *puid;
+    } else {
+        // as child process of some non-root
+        // let pid = nix::unistd::getpid();
+
+        let parent_pid = nix::unistd::getppid();
+        let parent_process = match procfs::process::Process::new(parent_pid.into()) {
+            core::result::Result::Ok(process) => process,
+            Err(_) => panic!("cannot access parent process"),
+        };
+        r_ui = parent_process.status()?.euid;
+        r_gi = parent_process.status()?.egid;
     }
 
     let gi = Gid::from_raw(r_gi);
@@ -332,7 +333,10 @@ pub async fn inner_daemon(
             // netns that can only access i2p
         }
         "clean_ip1" => {
-            let proxy1 = &secret.proxies[ns_name][0];
+            let proxy1 = &secret
+                .proxies
+                .get(ns_name)
+                .ok_or(anyhow!("not configured"))?[0];
             assert!(!proxy1.is_empty());
             log::debug!("clean proxy, {proxy1}");
 
@@ -389,7 +393,10 @@ pub async fn inner_daemon(
             )?;
         }
         "clean_ipv6" => {
-            let proxy6 = &secret.proxies[ns_name][0];
+            let proxy6 = &secret
+                .proxies
+                .get(ns_name)
+                .ok_or(anyhow!("not configured"))?[0];
             assert!(!proxy6.is_empty());
             log::debug!("IPv6 proxy, {proxy6}");
 
@@ -509,12 +516,12 @@ pub async fn drop_privs(name: &str) -> Result<()> {
 pub async fn drop_privs1(gi: Gid, ui: Uid) -> Result<()> {
     log::trace!("GID to {gi}");
     nix::unistd::setresgid(gi, gi, gi)?;
-    log::trace!("change groups");
+    // log::trace!("change groups");
     // setgroups(&[gi])?;
     log::trace!("UID to {ui}");
     nix::unistd::setresuid(ui, ui, ui)?;
 
-    log::info!("dropped privs");
+    log::info!("dropped privs to resuid={ui} resgid={gi}");
 
     Ok(())
 }
@@ -649,16 +656,13 @@ pub async fn config_network() -> Result<ConfigRes> {
 }
 
 pub async fn get_pid1_netns_inode() -> Result<u64> {
-    let netns_link = tokio::fs::read_link(Path::new("/proc/1/ns/net"))
-        .await
-        .context("Failed to read symlink target of root network namespace")?;
+    let netns_link = tokio::fs::read_link(Path::new("/proc/1/ns/net")).await?;
     let inode_str = netns_link
         .file_name()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get file name from symlink target"))?
+        .unwrap()
         .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Failed to convert OsStr to &str"))?
+        .unwrap()
         .trim_start_matches("net:[");
-
     inode_str
         .trim_end_matches(']')
         .parse::<u64>()
@@ -672,7 +676,7 @@ pub async fn get_self_netns_inode() -> Result<u64> {
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("Failed to get file name from symlink target"))?
         .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Failed to convert OsStr to &str"))?
+        .unwrap()
         .trim_start_matches("net:[");
 
     inode_str

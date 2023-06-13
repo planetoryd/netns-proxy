@@ -12,13 +12,17 @@ async fn main() -> Result<()> {
     let nsname = args.next().unwrap();
     p.push(nsname.clone());
 
-    netns_proxy::inner_daemon(
+    if let Err(err) = netns_proxy::inner_daemon(
         p.to_string_lossy().into_owned(),
         &nsname,
         args.next(),
         args.next(),
     )
-    .await?;
+    .await
+    {
+        log::error!("{}; {}", nsname, err);
+        std::process::exit(1);
+    };
 
     Ok(())
 }

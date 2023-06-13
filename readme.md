@@ -132,3 +132,9 @@ options
 
 - https://github.com/nixpak/nixpak
 - https://sr.ht/~fgaz/nix-bubblewrap/
+
+you probably need application state isolation, for different identities.
+
+so that, for example, IPFS does not use the same peerID with and without VPN.
+
+that achieves anonymity, even though IPFS has no anonymity whatever.

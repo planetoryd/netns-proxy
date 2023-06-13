@@ -21,3 +21,9 @@ serde_json = "1.0.96"
 anyhow = { version = "1.0.71", features = ["backtrace"] }
 libc = "0.2.143"
 nftnl = "0.6.2"
+procfs = "0.15.1"
+
+[profile.release]
+strip = true  
+opt-level = "z" # bottleneck is size, not cpu
+lto = true
