@@ -33,6 +33,10 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt},
     process::Command,
 };
+pub mod ip_gen;
+
+use ip_gen::gen_ip;
+
 pub const NETNS_PATH: &str = "/run/netns/";
 // Standard procedure
 // Creates various netns, base-vpn, socks, i2p, lokinet, un-firewalled
@@ -577,22 +581,18 @@ pub async fn config_ns(
     let _ = add_veth_pair(ns_name).await;
 
     // Get a subnet in 10.0 for the veth pair
-    let subnet_veth = IpNetwork::new(
-        ipgen::ip(f(&ns_name, true).as_str(), "10.0.0.0/8".parse().unwrap())?,
-        16,
-    )?
-    .to_string();
-    let subnet6_veth = IpNetwork::new(
-        ipgen::ip(f(&ns_name, true).as_str(), "fc00::/16".parse().unwrap())?, // XXX I believe ipgen has a bug
-        125,
-    )?
-    .to_string();
+    let subnet_veth = gen_ip("10.0.0.0/8".parse().unwrap(), ns_name.to_string(), None, 16)
+        .0
+        .to_string();
+    let subnet6_veth = gen_ip("fc00::/16".parse().unwrap(), ns_name.to_string(), None, 125)
+        .0
+        .to_string();
 
-    let ip_vh = ipgen::ip(f(&ns_name, true).as_str(), subnet_veth.parse()?)?;
-    let ip_vn = ipgen::ip(f(&ns_name, false).as_str(), subnet_veth.parse()?)?;
+    let ip_vh = gen_ip("10.0.0.0/8".parse().unwrap(), ns_name.to_string(), Some("vh".to_string()), 16).1.unwrap();
+    let ip_vn = gen_ip("10.0.0.0/8".parse().unwrap(), ns_name.to_string(), Some("vn".to_string()), 16).1.unwrap();
 
-    let ip6_vh = ipgen::ip(f(&ns_name, true).as_str(), subnet6_veth.parse()?)?;
-    let ip6_vn = ipgen::ip(f(&ns_name, false).as_str(), subnet6_veth.parse()?)?;
+    let ip6_vh = gen_ip("fc00::/16".parse().unwrap(), ns_name.to_string(), Some("ip6vh".to_string()), 125).1.unwrap();
+    let ip6_vn = gen_ip("fc00::/16".parse().unwrap(), ns_name.to_string(), Some("ip6vn".to_string()), 125).1.unwrap();
 
     let info = NetnsInfo {
         subnet_veth: subnet_veth.clone(),
@@ -646,6 +646,11 @@ pub async fn config_ns(
 pub async fn config_network() -> Result<ConfigRes> {
     let mut res = ConfigRes::default();
 
+    // robust
+    // 1. initial config state: add all configs
+    // 2. half-configured state: some lines fail and the rest of config is resumed
+    // 3. already configured: all lines fail
+    // 4. other weird state, just reboot
     for ns in TASKS {
         config_ns(&ns, veth_from_ns, &mut res).await?;
     }
