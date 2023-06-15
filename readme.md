@@ -17,9 +17,8 @@ do:
 - install the following, make them available in $PATH
   - [tun2socks](https://github.com/xjasonlyu/tun2socks)
   - [gost](https://github.com/go-gost/gost)
-  - [dnsproxy](https://github.com/AdguardTeam/dnsproxy)
+  - [dnsproxy](https://github.com/AdguardTeam/dnsproxy) 
   - iproute2
-  - fish (optional)
 
 why:
 
@@ -29,6 +28,7 @@ why:
     - so this is not a particular sandbox for specific flatpak-apps
     - so you can do package updates
 - everything JUST works, the execution environment is untampered.
+- it's hard to do this safely with only nftables (as far as I know. the interfaces go down and traffic may leak)
 
 ## usage
 
@@ -36,8 +36,8 @@ why:
 cargo b
 ./initial.sh # set capabilities
 ./setsuid.sh # run this every build
-./target/debug/netnsp-main # configures the OS, and supervises the daemons. run it under the project root directory
-./target/debug/netnsp-main exec --ns base_p # enter a shell in netns.
+netnsp-main # configures the OS, and supervises the daemons. run it under the project root directory
+netnsp-main exec --ns base_p # enter a shell in netns.
 ```
 
 with `netns-main exec --ns target_ns` it can start a process with everything unchanged but netns
@@ -81,7 +81,7 @@ example `secret.json`
 > I'm not sure about the security implications. 
 
 ```bash
-./target/debug/netnsp-main exec --ns base_p # enter a shell in netns.
+netnsp-main exec --ns base_p # enter a shell in netns.
 flatpak run tld.app.some
 ```
 

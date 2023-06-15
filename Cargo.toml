@@ -24,6 +24,6 @@ procfs = "0.15.1"
 blake3 = "1.4.0"
 
 [profile.release]
-strip = true  
+strip = true
 opt-level = "z" # bottleneck is size, not cpu
 lto = true

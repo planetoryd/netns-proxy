@@ -581,18 +581,40 @@ pub async fn config_ns(
     let _ = add_veth_pair(ns_name).await;
 
     // Get a subnet in 10.0 for the veth pair
-    let subnet_veth = gen_ip("10.0.0.0/8".parse().unwrap(), ns_name.to_string(), None, 16)
-        .0
-        .to_string();
-    let subnet6_veth = gen_ip("fc00::/16".parse().unwrap(), ns_name.to_string(), None, 125)
-        .0
-        .to_string();
+    let subnet_veth =
+        gen_ip("10.0.0.0/8".parse().unwrap(), ns_name.to_string(), None, 16).to_string();
+    let subnet6_veth =
+        gen_ip("fc00::/16".parse().unwrap(), ns_name.to_string(), None, 125).to_string();
 
-    let ip_vh = gen_ip("10.0.0.0/8".parse().unwrap(), ns_name.to_string(), Some("vh".to_string()), 16).1.unwrap();
-    let ip_vn = gen_ip("10.0.0.0/8".parse().unwrap(), ns_name.to_string(), Some("vn".to_string()), 16).1.unwrap();
+    let ip_vh = gen_ip(
+        "10.0.0.0/8".parse().unwrap(),
+        ns_name.to_string(),
+        Some("vh".to_string()),
+        16,
+    )
+    .ip();
+    let ip_vn = gen_ip(
+        "10.0.0.0/8".parse().unwrap(),
+        ns_name.to_string(),
+        Some("vn".to_string()),
+        16,
+    )
+    .ip();
 
-    let ip6_vh = gen_ip("fc00::/16".parse().unwrap(), ns_name.to_string(), Some("ip6vh".to_string()), 125).1.unwrap();
-    let ip6_vn = gen_ip("fc00::/16".parse().unwrap(), ns_name.to_string(), Some("ip6vn".to_string()), 125).1.unwrap();
+    let ip6_vh = gen_ip(
+        "fc00::/16".parse().unwrap(),
+        ns_name.to_string(),
+        Some("ip6vh".to_string()),
+        125,
+    )
+    .ip();
+    let ip6_vn = gen_ip(
+        "fc00::/16".parse().unwrap(),
+        ns_name.to_string(),
+        Some("ip6vn".to_string()),
+        125,
+    )
+    .ip();
 
     let info = NetnsInfo {
         subnet_veth: subnet_veth.clone(),
