@@ -22,6 +22,10 @@ libc = "0.2.143"
 nftnl = "0.6.2"
 procfs = "0.15.1"
 blake3 = "1.4.0"
+rtnetlink = "0.12.0"
+netlink-packet-route = "0.15.0"
+netns-rs = "0.1.0"
+tidy-tuntap = "0.3.1"
 
 [profile.release]
 strip = true

@@ -1,8 +1,8 @@
 #![feature(setgroups)]
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use flexi_logger::FileSpec;
-use netns_proxy::TASKS;
+use netns_proxy::{self_netns_identify, TASKS};
 use nix::{
     sched::CloneFlags,
     unistd::{getppid, getresuid},
@@ -133,17 +133,10 @@ async fn main() -> Result<()> {
             )?;
             log::info!("setns succeeded");
 
-            let got_ns_ = String::from_utf8(
-                Command::new("ip")
-                    .args(["netns", "identify"])
-                    .arg(pid.to_string())
-                    .uid(0)
-                    .output()
-                    .await?
-                    .stdout,
-            )?;
-
-            let got_ns = got_ns_.trim();
+            let got_ns = self_netns_identify()
+                .await?
+                .ok_or_else(|| anyhow!("netns-identify failed"))?
+                .0;
             log::info!("current ns '{}'", got_ns);
 
             if got_ns != ns {
@@ -221,7 +214,13 @@ async fn main() -> Result<()> {
                 }
             }
             Err(x) => {
-                log::error!("config network failed {x}")
+                log::error!("There is irrecoverable error in configuring. Try reseting the state, like rebooting");
+                let euid = nix::unistd::geteuid();
+                if !euid.is_root() {
+                    // the only way of checking if we have the perms is to try. so no mandating root.
+                    log::warn!("Your uid is {euid}. Do you have enough perms")
+                }
+                return Err(x);
             }
         },
     }

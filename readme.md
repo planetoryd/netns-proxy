@@ -18,7 +18,6 @@ do:
   - [tun2socks](https://github.com/xjasonlyu/tun2socks)
   - [gost](https://github.com/go-gost/gost)
   - [dnsproxy](https://github.com/AdguardTeam/dnsproxy) 
-  - iproute2
 
 why:
 
@@ -128,3 +127,5 @@ you probably need application state isolation, for different identities.
 so that, for example, IPFS does not use the same peerID with and without VPN.
 
 that achieves anonymity, even though IPFS has no anonymity whatever.
+
+It's possible to have network namespaces recursively, but directly running this script would run into file name conflicts. You need some kind of filesystem sandbox, or modify the script to use a different directory.

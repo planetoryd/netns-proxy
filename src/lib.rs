@@ -8,6 +8,7 @@ use futures::{FutureExt, TryFutureExt};
 use ipnetwork::IpNetwork;
 
 use anyhow::{anyhow, Context, Ok, Result};
+use netns_rs::{DefaultEnv, NetNs};
 use nix::{
     libc::{kill, SIGTERM},
     sched::CloneFlags,
@@ -17,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     borrow::Borrow,
     error::Error,
+    ffi::OsString,
     net::IpAddr,
     net::{Ipv4Addr, SocketAddrV6},
     ops::Deref,
@@ -67,6 +69,14 @@ pub struct NetnsInfo {
     pub ip6_vn: String,
 }
 
+use futures::stream::TryStreamExt;
+use netlink_packet_route::{rtnl::link::LinkMessage, IFF_UP};
+use rtnetlink::Handle;
+
+pub struct Configurer {
+    handle: Handle,
+}
+
 pub fn kill_suspected() {
     let s = System::new_all();
     for (pid, process) in s.processes() {
@@ -93,69 +103,217 @@ pub fn veth_from_ns(nsname: &str, host: bool) -> String {
     }
 }
 
-pub async fn set_up(name: &str) -> Result<()> {
-    let res = Command::new("ip")
-        .args(["link", "set", name, "up"])
-        .output()
-        .await?
-        .status;
-    if res.success() {
+impl Configurer {
+    pub fn new() -> Self {
+        use rtnetlink::new_connection;
+        let (connection, handle, _) = new_connection().unwrap();
+        tokio::spawn(connection);
+
+        Self { handle }
+    }
+    pub async fn get_link(&self, name: &str) -> Result<LinkMessage> {
+        let mut links = self
+            .handle
+            .link()
+            .get()
+            .match_name(name.to_owned())
+            .execute();
+        if let Some(link) = links.try_next().await? {
+            Ok(link)
+        } else {
+            Err(anyhow!("link message None"))
+        }
+    }
+    pub async fn set_up(&self, name: &str) -> Result<()> {
+        let mut links = self
+            .handle
+            .link()
+            .get()
+            .match_name(name.to_owned())
+            .execute();
+        if let Some(link) = links.try_next().await? {
+            let is_up = link.header.flags & IFF_UP != 0;
+            if is_up {
+                Ok(())
+            } else {
+                self.handle
+                    .link()
+                    .set(link.header.index)
+                    .up()
+                    .execute()
+                    .await
+                    .map_err(anyhow::Error::from)
+            }
+        } else {
+            Err(anyhow!("link message None"))
+        }
+    }
+    pub async fn add_veth_pair(&self, ns_name: &str) -> Result<bool> {
+        let rh = self.get_link(&veth_from_ns(ns_name, true)).await;
+
+        if rh.is_err() {
+            let r1 = self
+                .handle
+                .link()
+                .add()
+                .veth(veth_from_ns(ns_name, true), veth_from_ns(ns_name, false))
+                .execute()
+                .await
+                .map_err(|e| anyhow!("adding {ns_name} veth pair fails. {e}"));
+            return match r1 {
+                Err(e) => {
+                    let rh = self.get_link(&veth_from_ns(ns_name, false)).await;
+                    if rh.is_ok() {
+                        log::warn!(
+                            "Are you running from a sub-netns. {} exists",
+                            &veth_from_ns(ns_name, false)
+                        );
+                    }
+                    Err(e)
+                }
+                _ => Ok(false), // veths dont exist, adding suceeded
+            };
+        } else {
+            Ok(true) // they already exist, and it skipped adding
+        }
+    }
+    pub async fn add_addr_dev(&self, addr: IpNetwork, dev: &str) -> Result<()> {
+        let mut links = self
+            .handle
+            .link()
+            .get()
+            .match_name(dev.to_string())
+            .execute();
+        if let Some(link) = links.try_next().await? {
+            let mut get_addr = self
+                .handle
+                .address()
+                .get()
+                .set_link_index_filter(link.header.index)
+                .set_prefix_length_filter(addr.prefix())
+                .set_address_filter(addr.ip())
+                .execute();
+            if let Some(_addrmsg) = get_addr.try_next().await? {
+                Ok(())
+            } else {
+                self.handle
+                    .address()
+                    .add(link.header.index, addr.ip(), addr.prefix())
+                    .execute()
+                    .await
+                    .map_err(anyhow::Error::from)
+            }
+        } else {
+            Err(anyhow!("link message None"))
+        }
+    }
+    pub async fn ip_setns(&self, ns_name: &str, dev: &str) -> Result<()> {
+        let fd = nsfd(ns_name)?;
+        let mut links = self
+            .handle
+            .link()
+            .get()
+            .match_name(dev.to_owned())
+            .execute();
+        let linkmsg = links.try_next().await;
+        match linkmsg {
+            core::result::Result::Ok(Some(link)) => self
+                .handle
+                .link()
+                .set(link.header.index)
+                .setns_by_fd(fd.as_raw_fd())
+                .execute()
+                .await
+                .map_err(anyhow::Error::from),
+            _ => {
+                // should be present in the netns
+                // omit checks here. netns-sub should check them
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn add_netns(ns_name: &str) -> Result<()> {
+        use rtnetlink::NetworkNamespace;
+        if ns_exists(ns_name)? {
+            Ok(())
+        } else {
+            NetworkNamespace::add(ns_name.to_string())
+                .await
+                .map_err(anyhow::Error::from)
+        }
+    }
+    pub async fn ip_add_route(
+        &self,
+        dev: &str,
+        dst: Option<IpNetwork>,
+        v4: Option<bool>,
+    ) -> Result<()> {
+        let mut links = self
+            .handle
+            .link()
+            .get()
+            .match_name(dev.to_owned())
+            .execute();
+        if let Some(link) = links.try_next().await? {
+            let index = link.header.index;
+            let req = self.handle.route().add().output_interface(index);
+            match dst {
+                Some(IpNetwork::V4(ip)) => req
+                    .v4()
+                    .destination_prefix(ip.ip(), ip.prefix())
+                    .execute()
+                    .await
+                    .map_err(anyhow::Error::from),
+                Some(IpNetwork::V6(ip)) => req
+                    .v6()
+                    .destination_prefix(ip.ip(), ip.prefix())
+                    .execute()
+                    .await
+                    .map_err(anyhow::Error::from),
+                _ => {
+                    if v4.is_some() && v4.unwrap() {
+                        req.v4().execute().await.map_err(anyhow::Error::from)
+                    } else {
+                        req.v6().execute().await.map_err(anyhow::Error::from)
+                    }
+                }
+            }
+        } else {
+            Err(anyhow!("link message None"))
+        }
+    }
+
+    pub async fn add_addrs_guest(&self, ns_name: &str, info: &NetnsInfo) -> Result<()> {
+        self.add_addr_dev(
+            (info.ip_vn.clone() + "/16").parse()?,
+            veth_from_ns(&ns_name, false).as_ref(),
+        )
+        .await
+        .ok();
+        self.add_addr_dev(
+            (info.ip6_vn.clone() + "/125").parse()?,
+            veth_from_ns(&ns_name, false).as_ref(),
+        )
+        .await
+        .ok();
+
         Ok(())
-    } else {
-        Err(anyhow!("setting {name} up fails"))
     }
 }
 
-pub async fn add_veth_pair(ns_name: &str) -> Result<()> {
-    let res = Command::new("ip")
-        .args([
-            "link",
-            "add",
-            veth_from_ns(ns_name, true).as_ref(),
-            "type",
-            "veth",
-            "peer",
-            "name",
-            veth_from_ns(ns_name, false).as_ref(),
-        ])
-        .output()
-        .await?
-        .status;
-    if res.success() {
-        Ok(())
-    } else {
-        Err(anyhow!("adding {ns_name} veth pair fails"))
-    }
-}
+nix::ioctl_write_int!(tunsetowner, 'T', 204);
+nix::ioctl_write_int!(tunsetpersist, 'T', 203);
 
-pub async fn add_addr_dev(addr: &str, dev: &str) -> Result<()> {
-    let res = Command::new("ip")
-        .args(["addr", "add", addr, "dev", dev])
-        .output()
-        .await?
-        .status;
-    if res.success() {
-        Ok(())
-    } else {
-        let r = anyhow!("adding {addr} to {dev} fails");
-        log::warn!("{r}");
-        Err(r)
-    }
-}
+// prepare a TUN for tun2socks
+pub fn tun_ops(tun: tidy_tuntap::Tun) -> Result<()> {
+    let fd = tun.as_raw_fd();
 
-pub async fn ip_setns(ns_name: &str, dev: &str) -> Result<()> {
-    let res = Command::new("ip")
-        .args(["link", "set", dev, "netns", ns_name])
-        .output()
-        .await?
-        .status;
-    if res.success() {
-        Ok(())
-    } else {
-        let r = anyhow!("moving {dev} to {ns_name} fails");
-        log::warn!("{r}");
-        Err(r)
-    }
+    // as tested, the line below is needless.
+    // unsafe { tunsetowner(fd, 1000)? }; 
+    unsafe { tunsetpersist(fd, 1)? }; // works if uncommented
+    
+    Ok(())
 }
 
 pub async fn inner_daemon(
@@ -165,7 +323,7 @@ pub async fn inner_daemon(
     gid: Option<String>,
 ) -> Result<()> {
     let tun_target_port = 9909;
-
+    use tidy_tuntap::{flags, Tun};
     unsafe {
         log::trace!("set logger");
         // logger = Some(
@@ -202,21 +360,15 @@ pub async fn inner_daemon(
     log::info!("netns-proxy of {ns_path}, daemon started");
     nix::sched::setns(nsfd(ns_name)?.as_raw_fd(), CloneFlags::CLONE_NEWNET)?;
 
-    let got_ns_ = String::from_utf8(
-        Command::new("ip")
-            .args(["netns", "identify"])
-            .arg(nix::unistd::getpid().to_string())
-            .uid(0)
-            .output()
-            .await?
-            .stdout,
-    )?;
-    let got_ns = got_ns_.trim();
-    let tun = "s_tun";
-    log::info!("current ns {}", got_ns);
+    let got_ns = self_netns_identify()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("failed to identify netns"))?;
 
-    if got_ns != ns_name {
-        log::error!("entering netns failed, {} != {}", got_ns, ns_name);
+    let tun_name = "s_tun";
+    log::info!("current ns {}", got_ns.0);
+
+    if got_ns.0 != ns_name {
+        log::error!("entering netns failed, {} != {}", got_ns.0, ns_name);
         exit(1);
     }
 
@@ -224,19 +376,26 @@ pub async fn inner_daemon(
     // get lo up and check netns
     log::debug!("get interface lo");
     let ns_config = config.netns_info.get(ns_name).unwrap();
+    let configurer = Configurer::new();
 
-    set_up("lo").await?;
-    add_addrs_guest(ns_name, ns_config).await?;
+    configurer.set_up("lo").await?;
+    configurer.add_addrs_guest(ns_name, ns_config).await?;
 
-    let mut ip_args = "tuntap add mode tun dev".split(' ').collect::<Vec<&str>>();
-    ip_args.push(tun);
-    let ss = Command::new("ip").args(ip_args).output().await?.status;
-    match ss.code() {
-        Some(e) => {
-            log::warn!("tun add fail {}", e)
-        }
-        _ => {}
+    let tun = Tun::new(tun_name, false).unwrap(); // prepare a TUN for tun2socks, as root.
+                                                  // the TUN::new here creates a non-persistent TUN
+                                                  // empirically, TUN::new does not error when there is existing TUN with the same name, and says the dev to be up
+
+    let flags = tun.flags().unwrap();
+    log::info!("got TUN {}, flags {:?}", tun_name, flags);
+
+    if !flags.intersects(flags::Flags::IFF_UP) {
+        log::info!("bring TUN up, {}", tun_name);
+        tun.bring_up()?;
+        let flags = tun.flags().unwrap();
+        anyhow::ensure!(flags.intersects(flags::Flags::IFF_UP));
     }
+
+    tun_ops(tun)?; // drop File
 
     let base_prxy_v4 =
         "socks5://".to_owned() + &ns_config.ip_vh + ":" + &tun_target_port.to_string();
@@ -296,7 +455,7 @@ pub async fn inner_daemon(
         "base_p" => {
             let mut tun2 = std::process::Command::new("tun2socks");
             tun2.uid(ui.into()).gid(gi.into()).groups(&[gi.into()]);
-            tun2.args(&["-device", tun, "-proxy", &base_prxy_v4]);
+            tun2.args(&["-device", tun_name, "-proxy", &base_prxy_v4]);
             let mut tun2_async: Command = tun2.into();
             tun2_async.stdout(Stdio::piped());
             let mut tun2h = tun2_async.spawn()?;
@@ -305,9 +464,12 @@ pub async fn inner_daemon(
             let (tx, rx) = tokio::sync::oneshot::channel();
             tokio::spawn(watch_log(reader, tx, "tun2socks"));
             rx.await?;
-            set_up(tun).await?;
-            set_up(&veth_from_ns(ns_name, false)).await?;
-            ip_add_route(tun, None).await.ok();
+            configurer.set_up(tun_name).await?;
+            configurer.set_up(&veth_from_ns(ns_name, false)).await?;
+            configurer
+                .ip_add_route(tun_name, None, Some(true))
+                .await
+                .ok();
 
             let mut dns = std::process::Command::new("dnsproxy");
             dns.uid(ui.into()).gid(gi.into()).groups(&[gi.into()]);
@@ -346,7 +508,7 @@ pub async fn inner_daemon(
 
             let mut tun2 = std::process::Command::new("tun2socks");
             tun2.uid(ui.into()).gid(gi.into()).groups(&[gi.into()]);
-            tun2.args(&["-device", tun, "-proxy", "127.0.0.1:1080"]);
+            tun2.args(&["-device", tun_name, "-proxy", "127.0.0.1:1080"]);
             let mut tun2_async: Command = tun2.into();
             tun2_async.stdout(Stdio::piped());
             let mut tun2h = tun2_async.spawn()?;
@@ -355,10 +517,16 @@ pub async fn inner_daemon(
             let (tx, rx) = tokio::sync::oneshot::channel();
             tokio::spawn(watch_log(reader, tx, "clean_ip1_tun"));
             rx.await?;
-            set_up(tun).await?;
-            set_up(&veth_from_ns(ns_name, false)).await?;
-            ip_add_route(tun, None).await.ok();
-            ip_add_route6(tun, Some("::/0")).await.ok();
+            configurer.set_up(tun_name).await?;
+            configurer.set_up(&veth_from_ns(ns_name, false)).await?;
+            configurer
+                .ip_add_route(tun_name, None, Some(true))
+                .await
+                .ok();
+            configurer
+                .ip_add_route(tun_name, Some("::/0".parse()?), None)
+                .await
+                .ok();
             // outputs to stdout. no logs kept
 
             let mut dns = std::process::Command::new("dnsproxy");
@@ -416,7 +584,7 @@ pub async fn inner_daemon(
 
             let mut tun2 = std::process::Command::new("tun2socks");
             tun2.uid(ui.into()).gid(gi.into()).groups(&[gi.into()]);
-            tun2.args(&["-device", tun, "-proxy", "127.0.0.1:1080"]);
+            tun2.args(&["-device", tun_name, "-proxy", "127.0.0.1:1080"]);
             let mut tun2_async: Command = tun2.into();
             tun2_async.stdout(Stdio::piped());
             let mut tun2h = tun2_async.spawn()?;
@@ -425,10 +593,16 @@ pub async fn inner_daemon(
             let (tx, rx) = tokio::sync::oneshot::channel();
             tokio::spawn(watch_log(reader, tx, "clean_ipv6_tun,"));
             rx.await?;
-            set_up(tun).await?;
-            set_up(&veth_from_ns(ns_name, false)).await?;
-            ip_add_route(tun, None).await.ok();
-            ip_add_route6(tun, Some("::/0")).await.ok();
+            configurer.set_up(tun_name).await?;
+            configurer.set_up(&veth_from_ns(ns_name, false)).await?;
+            configurer
+                .ip_add_route(tun_name, None, Some(true))
+                .await
+                .ok();
+            configurer
+                .ip_add_route(tun_name, Some("::/0".parse()?), None)
+                .await
+                .ok();
 
             // outputs to stdout. no logs kept
             let mut dns = std::process::Command::new("dnsproxy");
@@ -462,42 +636,6 @@ pub async fn inner_daemon(
     };
 
     Ok(())
-}
-
-pub async fn ip_add_route(dev: &str, mut dst: Option<&str>) -> Result<()> {
-    if dst.is_none() {
-        dst = Some("default");
-    }
-    let res = Command::new("ip")
-        .args(["route", "add", dst.unwrap(), "dev", dev])
-        .output()
-        .await?
-        .status;
-    if res.success() {
-        Ok(())
-    } else {
-        let r = anyhow!("adding route to {dev} fails");
-        log::warn!("{r}");
-        Err(r)
-    }
-}
-
-pub async fn ip_add_route6(dev: &str, mut dst: Option<&str>) -> Result<()> {
-    if dst.is_none() {
-        dst = Some("default");
-    }
-    let res = Command::new("ip")
-        .args(["-6", "route", "add", dst.unwrap(), "dev", dev])
-        .output()
-        .await?
-        .status;
-    if res.success() {
-        Ok(())
-    } else {
-        let r = anyhow!("adding route to {dev} fails");
-        log::warn!("{r}");
-        Err(r)
-    }
 }
 
 pub async fn drop_privs(name: &str) -> Result<()> {
@@ -537,36 +675,15 @@ pub fn nsfd(ns_name: &str) -> Result<std::fs::File> {
     Ok(r)
 }
 
-pub async fn add_netns(ns_name: &str) -> Result<()> {
-    let res = Command::new("ip")
-        .args(["netns", "add", ns_name])
-        .output()
-        .await?
-        .status;
-    if res.success() {
-        Ok(())
-    } else {
-        let r = anyhow!("adding {ns_name} fails");
-        log::warn!("{r}");
-        Err(r)
+pub fn ns_exists(ns_name: &str) -> Result<bool> {
+    let mut p = PathBuf::from(NETNS_PATH);
+    p.push(ns_name);
+    let r = p.try_exists().map_err(anyhow::Error::from)?;
+    if r {
+        anyhow::ensure!(p.is_file());
     }
-}
-
-pub async fn add_addrs_guest(ns_name: &str, info: &NetnsInfo) -> Result<()> {
-    add_addr_dev(
-        (info.ip_vn.clone() + "/16").as_ref(),
-        veth_from_ns(&ns_name, false).as_ref(),
-    )
-    .await
-    .ok();
-    add_addr_dev(
-        (info.ip6_vn.clone() + "/125").as_ref(),
-        veth_from_ns(&ns_name, false).as_ref(),
-    )
-    .await
-    .ok();
-
-    Ok(())
+    Ok(r)
+    // throws error if abnormality beyond exists-or-not appears
 }
 
 // Trys to add an netns. If it exists, remove it.
@@ -575,10 +692,11 @@ pub async fn config_ns(
     ns_name: &str,
     f: fn(&str, bool) -> String,
     config_res: &mut ConfigRes,
+    configurer: &Configurer,
 ) -> Result<()> {
     // rtnetlink sucks. just use the command line
-    let _ = add_netns(ns_name).await;
-    let _ = add_veth_pair(ns_name).await;
+    Configurer::add_netns(ns_name).await?;
+    let vpair_skipped = configurer.add_veth_pair(ns_name).await?;
 
     // Get a subnet in 10.0 for the veth pair
     let subnet_veth =
@@ -625,39 +743,45 @@ pub async fn config_ns(
         ip6_vn: ip6_vn.to_string(),
     };
 
-    add_addr_dev(
-        (info.ip_vh.clone() + "/16").as_ref(),
-        f(&ns_name, true).as_ref(),
-    )
-    .await
-    .ok();
-    add_addr_dev(
-        (info.ip6_vh.clone() + "/125").as_ref(),
-        f(&ns_name, true).as_ref(),
-    )
-    .await
-    .ok();
-    let _ = set_up(&f(&ns_name, true)).await;
+    configurer
+        .add_addr_dev(
+            (info.ip_vh.clone() + "/16").parse()?,
+            f(&ns_name, true).as_ref(),
+        )
+        .await?;
+    configurer
+        .add_addr_dev(
+            (info.ip6_vh.clone() + "/125").parse()?,
+            f(&ns_name, true).as_ref(),
+        )
+        .await?;
+    configurer.set_up(&f(&ns_name, true)).await?;
 
-    add_addr_dev(
-        (info.ip_vn.clone() + "/16").as_ref(),
-        f(&ns_name, false).as_ref(),
-    )
-    .await
-    .ok();
-    add_addr_dev(
-        (info.ip6_vn.clone() + "/125").as_ref(),
-        f(&ns_name, false).as_ref(),
-    )
-    .await
-    .ok();
-    let _ = set_up(&f(&ns_name, true)).await;
+    if !vpair_skipped {
+        configurer
+            .add_addr_dev(
+                (info.ip_vn.clone() + "/16").parse()?,
+                f(&ns_name, false).as_ref(),
+            )
+            .await?;
+        configurer
+            .add_addr_dev(
+                (info.ip6_vn.clone() + "/125").parse()?,
+                f(&ns_name, false).as_ref(),
+            )
+            .await?;
+        configurer.set_up(&f(&ns_name, true)).await?;
+    } else {
+        // ensure it does not exist
+        let linkmsg_veth_ns = configurer.get_link(&f(&ns_name, false)).await;
+        anyhow::ensure!(linkmsg_veth_ns.is_err())
+    }
 
     log::info!("veth subnet {subnet_veth}, {subnet6_veth}, host {ip_vh}, {ip6_vh}, guest {ip_vn}, {ip6_vn}");
 
     assert!(!ip_vh.is_global());
     assert!(!ip6_vh.is_global());
-    ip_setns(ns_name, &f(ns_name, false)).await.ok();
+    configurer.ip_setns(ns_name, &f(ns_name, false)).await?;
     config_res.netns_info.insert(ns_name.to_owned(), info);
     // brilliant me, File::open(p)?.as_raw_fd() got the file closed before use, fixed it
 
@@ -668,13 +792,9 @@ pub async fn config_ns(
 pub async fn config_network() -> Result<ConfigRes> {
     let mut res = ConfigRes::default();
 
-    // robust
-    // 1. initial config state: add all configs
-    // 2. half-configured state: some lines fail and the rest of config is resumed
-    // 3. already configured: all lines fail
-    // 4. other weird state, just reboot
+    let configrer = Configurer::new();
     for ns in TASKS {
-        config_ns(&ns, veth_from_ns, &mut res).await?;
+        config_ns(&ns, veth_from_ns, &mut res, &configrer).await?;
     }
 
     res.root_inode = get_pid1_netns_inode().await?;
@@ -683,33 +803,76 @@ pub async fn config_network() -> Result<ConfigRes> {
 }
 
 pub async fn get_pid1_netns_inode() -> Result<u64> {
-    let netns_link = tokio::fs::read_link(Path::new("/proc/1/ns/net")).await?;
-    let inode_str = netns_link
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .trim_start_matches("net:[");
-    inode_str
-        .trim_end_matches(']')
-        .parse::<u64>()
-        .map_err(|_| anyhow::anyhow!("Failed to parse inode number as u64"))
+    use procfs::process::Process;
+    let pid1_process = Process::new(1)?;
+    let nslist = pid1_process.namespaces()?;
+    let pid1_net_ns = nslist
+        .get(&OsString::from("net"))
+        .ok_or_else(|| anyhow::anyhow!("PID 1 net namespace not found"))?;
+
+    Ok(pid1_net_ns.identifier)
 }
 
 pub async fn get_self_netns_inode() -> Result<u64> {
-    let netns_link = tokio::fs::read_link(Path::new("/proc/self/ns/net")).await?;
+    use procfs::process::Process;
+    let selfproc = Process::myself()?;
+    let nslist = selfproc.namespaces()?;
+    let selfns = nslist.get(&OsString::from("net"));
+    match selfns {
+        None => anyhow::bail!("self net ns file missing"),
+        Some(ns) => Ok(ns.identifier),
+    }
+}
 
-    let inode_str = netns_link
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get file name from symlink target"))?
-        .to_str()
-        .unwrap()
-        .trim_start_matches("net:[");
+pub async fn get_self_netns() -> Result<netns_rs::NetNs> {
+    use procfs::process::Process;
+    let selfproc = Process::myself()?;
+    let nslist = selfproc.namespaces()?;
+    let selfns = nslist.get(&OsString::from("net"));
+    match selfns {
+        None => anyhow::bail!("self net ns file missing"),
+        Some(ns) => {
+            use netns_rs::get_from_path;
+            let netns_ = get_from_path(&ns.path)?;
+            Ok(netns_)
+        }
+    }
+}
 
-    inode_str
-        .trim_end_matches(']')
-        .parse::<u64>()
-        .map_err(|_| anyhow::anyhow!("Failed to parse inode number as u64"))
+// None for non-persistent ns
+pub async fn self_netns_identify() -> Result<Option<(String, NetNs)>> {
+    use netns_rs::get_from_path;
+
+    let selfns = get_self_netns().await?;
+    let path = Path::new(NETNS_PATH);
+    for entry in path.read_dir()? {
+        if let core::result::Result::Ok(entry) = entry {
+            let ns = get_from_path(entry.path())?;
+            if ns == selfns {
+                // identified to be x netns
+                // ==> there is a file under netns path, readable and matches proc netns
+                return Ok(Some((
+                    ns.path()
+                        .file_name()
+                        .ok_or_else(|| anyhow::anyhow!("OsStr"))?
+                        .to_string_lossy()
+                        .into_owned(),
+                    ns,
+                )));
+            }
+        }
+        // some iter may fail and get ignored but that should be fine
+    }
+    Ok(None)
+}
+
+use netns_rs::Env;
+struct NsEnv;
+
+impl Env for NsEnv {
+    fn persist_dir(&self) -> PathBuf {
+        NETNS_PATH.into()
+    }
 }
 
 pub static TASKS: [&str; 5] = ["base_p", "i2p", "clean_ip1", "clean_ipv6", "lokins"];
