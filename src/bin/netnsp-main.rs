@@ -2,7 +2,7 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use flexi_logger::FileSpec;
-use netns_proxy::{self_netns_identify, TASKS};
+use netns_proxy::{self_netns_identify, TASKS, NETNS_PATH};
 use nix::{
     sched::CloneFlags,
     unistd::{getppid, getresuid},
@@ -44,6 +44,7 @@ enum Commands {
         #[arg(short, long)]
         cmd: Option<String>,
     },
+    Id {},
 }
 
 #[tokio::main]
@@ -94,6 +95,12 @@ async fn main() -> Result<()> {
         Some(Commands::Stop {}) => {
             netns_proxy::kill_suspected();
         }
+        Some(Commands::Id {}) => { 
+            let got_ns = self_netns_identify()
+                .await? 
+                .ok_or_else(|| anyhow!("no matches under the given netns directory"))?;
+            println!("{:?}", got_ns);
+        }
         Some(Commands::Exec { mut cmd, ns }) => {
             let path = "./netnsp.json";
             let mut file = File::open(path).await?;
@@ -135,7 +142,7 @@ async fn main() -> Result<()> {
 
             let got_ns = self_netns_identify()
                 .await?
-                .ok_or_else(|| anyhow!("netns-identify failed"))?
+                .ok_or_else(|| anyhow!("no matches under the given netns directory"))?
                 .0;
             log::info!("current ns '{}'", got_ns);
 

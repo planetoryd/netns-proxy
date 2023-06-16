@@ -876,7 +876,7 @@ pub async fn self_netns_identify() -> Result<Option<(String, NetNs)>> {
         }
         // some iter may fail and get ignored but that should be fine
     }
-    Ok(None)
+    Ok(None) // means, "no matches under NETNS_PATH"
 }
 
 use netns_rs::Env;
