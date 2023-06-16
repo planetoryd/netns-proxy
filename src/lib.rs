@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     borrow::Borrow,
     error::Error,
-    ffi::OsString,
+    ffi::{CStr, OsString, CString},
     net::IpAddr,
     net::{Ipv4Addr, SocketAddrV6},
     ops::Deref,
@@ -310,9 +310,9 @@ pub fn tun_ops(tun: tidy_tuntap::Tun) -> Result<()> {
     let fd = tun.as_raw_fd();
 
     // as tested, the line below is needless.
-    // unsafe { tunsetowner(fd, 1000)? }; 
+    // unsafe { tunsetowner(fd, 1000)? };
     unsafe { tunsetpersist(fd, 1)? }; // works if uncommented
-    
+
     Ok(())
 }
 
@@ -638,6 +638,19 @@ pub async fn inner_daemon(
     Ok(())
 }
 
+fn set_initgroups(user: &nix::unistd::User, gid: u32) {
+    let gid = Gid::from_raw(gid);
+    let s = user.name.clone();
+    let c_str = CString::new(s).unwrap();
+    match nix::unistd::initgroups(&c_str, gid) {
+        std::result::Result::Ok(_) => log::debug!("Setting initgroups..."),
+        Err(e) => {
+            log::error!("Failed to set init groups: {:#?}", e);
+            exit(1);
+        }
+    }
+}
+
 pub async fn drop_privs(name: &str) -> Result<()> {
     log::trace!("drop privs, to {name}");
     let log_user = users::get_user_by_name(name).unwrap();
@@ -658,8 +671,8 @@ pub async fn drop_privs(name: &str) -> Result<()> {
 pub async fn drop_privs1(gi: Gid, ui: Uid) -> Result<()> {
     log::trace!("GID to {gi}");
     nix::unistd::setresgid(gi, gi, gi)?;
-    // log::trace!("change groups");
-    // setgroups(&[gi])?;
+    let user = nix::unistd::User::from_uid(ui).unwrap().unwrap();
+    set_initgroups(&user, gi.as_raw());
     log::trace!("UID to {ui}");
     nix::unistd::setresuid(ui, ui, ui)?;
 
