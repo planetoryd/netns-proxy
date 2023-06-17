@@ -2,7 +2,7 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use flexi_logger::FileSpec;
-use netns_proxy::{self_netns_identify, TASKS, NETNS_PATH};
+use netns_proxy::{self_netns_identify, NETNS_PATH, TASKS};
 use nix::{
     sched::CloneFlags,
     unistd::{getppid, getresuid},
@@ -95,9 +95,9 @@ async fn main() -> Result<()> {
         Some(Commands::Stop {}) => {
             netns_proxy::kill_suspected();
         }
-        Some(Commands::Id {}) => { 
+        Some(Commands::Id {}) => {
             let got_ns = self_netns_identify()
-                .await? 
+                .await?
                 .ok_or_else(|| anyhow!("no matches under the given netns directory"))?;
             println!("{:?}", got_ns);
         }
@@ -154,8 +154,7 @@ async fn main() -> Result<()> {
             netns_proxy::drop_privs1(
                 nix::unistd::Gid::from_raw(pgid),
                 nix::unistd::Uid::from_raw(puid),
-            )
-            .await?;
+            )?;
 
             let mut proc = std::process::Command::new(cmd.unwrap());
 
@@ -170,7 +169,7 @@ async fn main() -> Result<()> {
                 let serialized = serde_json::to_string_pretty(&r)?;
 
                 let mut file = tokio::fs::File::create("./netnsp.json").await?;
-                log::info!("result generated in json");
+                log::info!("config result generated in ./netnsp.json. note that this file is freshly generated each run.");
 
                 file.write_all(serialized.as_bytes()).await?;
 
@@ -179,7 +178,7 @@ async fn main() -> Result<()> {
                 sp.push("netnsp-sub");
                 let sp1 = sp.into_os_string();
                 // start daemons
-                let pid = nix::unistd::getpid();
+                // let pid = nix::unistd::getpid();
 
                 let parent_pid = nix::unistd::getppid();
                 let parent_process = match Process::new(parent_pid.into()) {

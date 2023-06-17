@@ -18,6 +18,9 @@ do:
   - [tun2socks](https://github.com/xjasonlyu/tun2socks)
   - [gost](https://github.com/go-gost/gost)
   - [dnsproxy](https://github.com/AdguardTeam/dnsproxy) 
+- for building
+  - libnftnl
+  - libmnl
 
 why:
 

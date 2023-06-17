@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 use std::{
     borrow::Borrow,
     error::Error,
-    ffi::{CStr, OsString, CString},
+    ffi::{CStr, CString, OsString},
+    fmt::format,
     net::IpAddr,
     net::{Ipv4Addr, SocketAddrV6},
     ops::Deref,
@@ -343,15 +344,17 @@ pub async fn inner_daemon(
         );
     }
 
-    let path = "./netnsp.json";
+    let path = Path::new("./netnsp.json");
     let mut file = File::open(path).await?;
     let mut contents = String::new();
     file.read_to_string(&mut contents).await?;
 
     let config: ConfigRes = serde_json::from_str(&contents)?;
 
-    let path = "./secret.json";
-    let mut file = File::open(path).await?;
+    let path = Path::new("./secret.json");
+    let mut file = File::open(path)
+        .await
+        .with_context(|| format!("can not open secrets.json at {:?}", path))?;
     let mut contents = String::new();
     file.read_to_string(&mut contents).await?;
 
@@ -375,15 +378,18 @@ pub async fn inner_daemon(
     // as for now, the code above works, the new process is in the netns, checked on 4/24
     // get lo up and check netns
     log::debug!("get interface lo");
-    let ns_config = config.netns_info.get(ns_name).unwrap();
+    let ns_config = config
+        .netns_info
+        .get(ns_name)
+        .ok_or(anyhow::anyhow!("Netns info not available for {ns_name}"))?;
     let configurer = Configurer::new();
 
     configurer.set_up("lo").await?;
     configurer.add_addrs_guest(ns_name, ns_config).await?;
 
-    let tun = Tun::new(tun_name, false).unwrap(); // prepare a TUN for tun2socks, as root.
-                                                  // the TUN::new here creates a non-persistent TUN
-                                                  // empirically, TUN::new does not error when there is existing TUN with the same name, and says the dev to be up
+    let tun = Tun::new(tun_name, false)?; // prepare a TUN for tun2socks, as root.
+                                          // the TUN::new here creates a non-persistent TUN
+                                          // empirically, TUN::new does not error when there is existing TUN with the same name, and says the dev to be up
 
     let flags = tun.flags().unwrap();
     log::info!("got TUN {}, flags {:?}", tun_name, flags);
@@ -651,7 +657,7 @@ fn set_initgroups(user: &nix::unistd::User, gid: u32) {
     }
 }
 
-pub async fn drop_privs(name: &str) -> Result<()> {
+pub fn drop_privs(name: &str) -> Result<()> {
     log::trace!("drop privs, to {name}");
     let log_user = users::get_user_by_name(name).unwrap();
     let gi = Gid::from_raw(log_user.primary_group_id());
@@ -668,7 +674,8 @@ pub async fn drop_privs(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn drop_privs1(gi: Gid, ui: Uid) -> Result<()> {
+pub fn drop_privs1(gi: Gid, ui: Uid) -> Result<()> {
+    log::trace!("groups, {:?}", nix::unistd::getgroups()?);
     log::trace!("GID to {gi}");
     nix::unistd::setresgid(gi, gi, gi)?;
     let user = nix::unistd::User::from_uid(ui).unwrap().unwrap();
@@ -812,6 +819,10 @@ pub async fn config_network() -> Result<ConfigRes> {
 
     res.root_inode = get_pid1_netns_inode().await?;
 
+    let i_names = TASKS.map(|n| veth_from_ns(n, true));
+    let inames = i_names.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
+    nft::apply_block_forwad(&inames)?;
+
     Ok(res)
 }
 
@@ -880,6 +891,8 @@ pub async fn self_netns_identify() -> Result<Option<(String, NetNs)>> {
 }
 
 use netns_rs::Env;
+
+mod nft;
 struct NsEnv;
 
 impl Env for NsEnv {
