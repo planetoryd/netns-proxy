@@ -16,7 +16,6 @@ do:
 - read the code
 - install the following, make them available in $PATH
   - [tun2socks](https://github.com/xjasonlyu/tun2socks)
-  - [gost](https://github.com/go-gost/gost)
   - [dnsproxy](https://github.com/AdguardTeam/dnsproxy) 
 - for building
   - libnftnl
@@ -59,15 +58,17 @@ by default it starts `fish`
 
 example `secret.json`
 
+- Create a persistent netns named `test` with proxied internet.
+
 ```json
 {
-  "proxies": {
-    "clean_ipv6": ["socks5://example.com:8080"]
+  "params": {
+    "test": {}
   }
 }
 ```
 
-- `netnsp-main` may be run repeatedly without issues. ignore the errors and warnings
+- `netnsp-main` may be run repeatedly without issues.
     - in case of altered OS config state, try to reboot, or manually remove the NetNSes and `netnsp-main stop` to kill orphan processes
 
 ## security

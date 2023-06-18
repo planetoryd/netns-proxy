@@ -14,7 +14,7 @@ const TABLE_NAME: &str = "netnsp";
 const FO_CHAIN: &str = "block-forward";
 
 pub fn apply_block_forwad(veth_list: &[&str]) -> Result<()> {
-    log::info!("applying nft rules for {:?}", veth_list);
+    log::info!("applying nft rules for {:?}. warning, table netnsp is overwritten each time", veth_list);
 
     let mut batch = Batch::new();
     let table = Table::new(&CString::new(TABLE_NAME).unwrap(), ProtoFamily::Inet);

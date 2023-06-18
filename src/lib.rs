@@ -16,7 +16,7 @@ use nix::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    borrow::Borrow,
+    borrow::{Borrow, Cow},
     error::Error,
     ffi::{CStr, CString, OsString},
     fmt::format,
@@ -55,12 +55,39 @@ pub struct ConfigRes {
     pub root_inode: u64,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct Secret {
-    pub proxies: HashMap<String, Vec<String>>, // socks proxies per netns
+    // netns_name, params
+    pub params: HashMap<String, NetnsParams>,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct NetnsParams {
+    // the program to be run along
+    // it is run as non-root, but not sandboxed too.
+    pub cmd: Option<NetnsParamCmd>,
+    // the port which the socks5 proxy is at
+    // defaults to 9909
+    pub hport: Option<u32>,
+    // whether you want to chain proxies
+    // set to true and Tun2socks will direct traffic to socks5://localhost:1080
+    // set to false and traffic will be directed to socks5:://veth_host:hport
+    #[serde(default)]
+    pub chain: bool,
+    // if you have an ipv6 only proxy
+    // this would force all DNS to go ipv6
+    #[serde(default)]
+    pub ipv6: bool,
+    pub dns_argv: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct NetnsParamCmd {
+    pub program: String,
+    pub argv: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct NetnsInfo {
     pub subnet_veth: String,
     pub subnet6_veth: String,
@@ -68,6 +95,55 @@ pub struct NetnsInfo {
     pub ip6_vh: String,
     pub ip_vn: String,
     pub ip6_vn: String,
+}
+
+pub fn substitute_argv<'a>(n_info: &'a NetnsInfo, argv: &mut Vec<String>) {
+    let mut sub_map: HashMap<String, &String> = HashMap::new();
+    sub_map.insert(format!("${}", "subnet_veth"), &n_info.subnet_veth);
+    sub_map.insert(format!("${}", "subnet6_veth"), &n_info.subnet6_veth);
+    sub_map.insert(format!("${}", "ip_vh"), &n_info.ip_vh);
+    sub_map.insert(format!("${}", "ip6_vh"), &n_info.ip6_vh);
+    sub_map.insert(format!("${}", "ip_vn"), &n_info.ip_vn);
+    sub_map.insert(format!("${}", "ip6_vn"), &n_info.ip6_vn);
+
+    for s in argv.iter_mut() {
+        let mut s_ = s.to_owned();
+        for (key, value) in &sub_map {
+            s_ = s_.replace(key, value);
+        }
+        *s = s_;
+    }
+}
+
+#[test]
+fn test_substitute_argv() {
+    let n_info = NetnsInfo {
+        subnet_veth: "eth0".to_string(),
+        subnet6_veth: "eth1".to_string(),
+        ip_vh: "192.168.0.1".to_string(),
+        ip6_vh: "2001:db8::1".to_string(),
+        ip_vn: "192.168.0.2".to_string(),
+        ip6_vn: "2001:db8::2".to_string(),
+    };
+
+    let mut argv = vec![
+        "ping".to_string(),
+        "-c".to_string(),
+        "1".to_string(),
+        "$ip_vnxx".to_string(),
+    ];
+
+    substitute_argv(&n_info, &mut argv);
+
+    assert_eq!(
+        argv,
+        vec![
+            "ping".to_string(),
+            "-c".to_string(),
+            "1".to_string(),
+            "192.168.0.2xx".to_string(),
+        ]
+    );
 }
 
 use futures::stream::TryStreamExt;
@@ -244,6 +320,8 @@ impl Configurer {
                 .map_err(anyhow::Error::from)
         }
     }
+
+    // one of dst and v4 must be Some
     pub async fn ip_add_route(
         &self,
         dev: &str,
@@ -273,10 +351,14 @@ impl Configurer {
                     .await
                     .map_err(anyhow::Error::from),
                 _ => {
-                    if v4.is_some() && v4.unwrap() {
-                        req.v4().execute().await.map_err(anyhow::Error::from)
+                    if v4.is_some() {
+                        if v4.unwrap() {
+                            req.v4().execute().await.map_err(anyhow::Error::from)
+                        } else {
+                            req.v6().execute().await.map_err(anyhow::Error::from)
+                        }
                     } else {
-                        req.v6().execute().await.map_err(anyhow::Error::from)
+                        unreachable!()
                     }
                 }
             }
@@ -317,13 +399,74 @@ pub fn tun_ops(tun: tidy_tuntap::Tun) -> Result<()> {
     Ok(())
 }
 
+async fn watch_log(
+    mut reader: tokio::io::Lines<tokio::io::BufReader<impl tokio::io::AsyncRead + Unpin>>,
+    tx: Option<tokio::sync::oneshot::Sender<bool>>,
+    pre: String,
+) -> Result<()> {
+    if let Some(line) = reader.next_line().await? {
+        if tx.is_some() {
+            tx.unwrap().send(true).unwrap();
+        }
+        log::debug!("{pre} {}", line);
+        while let Some(line) = reader.next_line().await? {
+            log::trace!("{pre} {}", line);
+        }
+    }
+    Ok(())
+}
+
+async fn watch_both(
+    chil: &mut tokio::process::Child,
+    pre: String,
+    tx: Option<tokio::sync::oneshot::Sender<bool>>,
+) -> Result<()> {
+    let stdout = chil.stdout.take().unwrap();
+    let stderr = chil.stderr.take().unwrap();
+    let reader = tokio::io::BufReader::new(stdout).lines();
+    let reader2 = tokio::io::BufReader::new(stderr).lines();
+    tokio::spawn(watch_log(reader, tx, pre.clone()));
+    tokio::spawn(watch_log(reader2, None, pre));
+
+    Ok(())
+}
+
+pub async fn enter_ns_by_name(ns_name: &str) -> Result<()> {
+    nix::sched::setns(nsfd(ns_name)?.as_raw_fd(), CloneFlags::CLONE_NEWNET)?;
+    let got_ns = self_netns_identify().await?.ok_or_else(|| {
+        anyhow::anyhow!("failed to identify netns. no matches under the given netns directory")
+    })?;
+
+    anyhow::ensure!(got_ns.0 == ns_name);
+    log::info!("current ns {} (named and persistent)", got_ns.0);
+
+    Ok(())
+}
+
+pub fn enter_ns_by_pid(pi: i32) -> Result<()> {
+    let process = procfs::process::Process::new(pi)?;
+    let o: OsString = OsString::from("net");
+    let nss = process.namespaces()?;
+    let proc_ns = nss
+        .get(&o)
+        .ok_or(anyhow!("ns/net not found for given pid"))?;
+    let r = std::fs::File::open(&proc_ns.path)?;
+    nix::sched::setns(r.as_raw_fd(), CloneFlags::CLONE_NEWNET)?;
+    let self_inode = get_self_netns_inode()?;
+    anyhow::ensure!(proc_ns.identifier == self_inode);
+    log::info!("current ns is from pid {}", pi);
+
+    Ok(())
+}
+
 pub async fn inner_daemon(
     ns_path: String,
     ns_name: &str,
     uid: Option<String>,
     gid: Option<String>,
+    pid: Option<String>,
 ) -> Result<()> {
-    let tun_target_port = 9909;
+    let mut tun_target_port = 9909;
     use tidy_tuntap::{flags, Tun};
     unsafe {
         log::trace!("set logger");
@@ -348,6 +491,7 @@ pub async fn inner_daemon(
     let mut file = File::open(path).await?;
     let mut contents = String::new();
     file.read_to_string(&mut contents).await?;
+    drop(file); // drop it for safety
 
     let config: ConfigRes = serde_json::from_str(&contents)?;
 
@@ -357,31 +501,27 @@ pub async fn inner_daemon(
         .with_context(|| format!("can not open secrets.json at {:?}", path))?;
     let mut contents = String::new();
     file.read_to_string(&mut contents).await?;
+    drop(file);
 
     let secret: Secret = serde_json::from_str(&contents)?;
 
-    log::info!("netns-proxy of {ns_path}, daemon started");
-    nix::sched::setns(nsfd(ns_name)?.as_raw_fd(), CloneFlags::CLONE_NEWNET)?;
+    log::info!("netns-proxy of {ns_path}, sub-process started");
 
-    let got_ns = self_netns_identify()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("failed to identify netns"))?;
-
-    let tun_name = "s_tun";
-    log::info!("current ns {}", got_ns.0);
-
-    if got_ns.0 != ns_name {
-        log::error!("entering netns failed, {} != {}", got_ns.0, ns_name);
-        exit(1);
+    // get into a process' netns
+    if let Some(pi) = pid {
+        let pi: i32 = pi.parse()?;
+        enter_ns_by_pid(pi)?;
+    } else {
+        enter_ns_by_name(ns_name).await?;
     }
 
-    // as for now, the code above works, the new process is in the netns, checked on 4/24
-    // get lo up and check netns
-    log::debug!("get interface lo");
+    let tun_name = "s_tun";
+
     let ns_config = config
         .netns_info
         .get(ns_name)
         .ok_or(anyhow::anyhow!("Netns info not available for {ns_name}"))?;
+
     let configurer = Configurer::new();
 
     configurer.set_up("lo").await?;
@@ -402,13 +542,6 @@ pub async fn inner_daemon(
     }
 
     tun_ops(tun)?; // drop File
-
-    let base_prxy_v4 =
-        "socks5://".to_owned() + &ns_config.ip_vh + ":" + &tun_target_port.to_string();
-    // let prxy_ipv6: SocketAddrV6 =
-    //     SocketAddrV6::new(ns_config.ip6_vh.parse()?, tun_target_port, 0, 0);
-    // let prxy_ipv6 = "socks5://".to_owned() + &prxy_ipv6.to_string();
-    // log::debug!("proxy ipv6 {}", prxy_ipv6);
 
     let r_ui: u32;
     let r_gi: u32;
@@ -435,184 +568,70 @@ pub async fn inner_daemon(
         r_gi = parent_process.status()?.egid;
     }
 
+    // the uid and gid for non-privileged processes
     let gi = Gid::from_raw(r_gi);
     let ui = Uid::from_raw(r_ui);
 
     assert!(!ui.is_root());
-    log::debug!("{gi}, {ui}");
+    assert!(gi.as_raw() != 0);
+    log::debug!("unprileged processes will be run with, gid {gi}, uid {ui}");
 
-    async fn watch_log(
-        mut reader: tokio::io::Lines<tokio::io::BufReader<impl tokio::io::AsyncRead + Unpin>>,
-        tx: tokio::sync::oneshot::Sender<bool>,
-        pre: &str,
-    ) -> Result<()> {
-        if let Some(line) = reader.next_line().await? {
-            tx.send(true).unwrap();
-            log::debug!("{pre} {}", line);
-            while let Some(line) = reader.next_line().await? {
-                log::trace!("{pre} {}", line);
-            }
-        }
-
-        Ok(())
+    let params = &secret.params[ns_name];
+    if let Some(tp) = params.hport {
+        tun_target_port = tp;
+    }
+    let mut proc_set = tokio::task::JoinSet::new();
+    let mut base_prxy_v4 =
+        "socks5://".to_owned() + &ns_config.ip_vh + ":" + &tun_target_port.to_string();
+    if params.hport.is_some() {
+        base_prxy_v4 = format!("socks5://{}:{}", &ns_config.ip_vh, params.hport.unwrap());
+    }
+    if params.chain {
+        // so, this takes precedence
+        base_prxy_v4 = format!("socks5://127.0.0.1:1080")
     }
 
-    match ns_name {
-        "base_p" => {
-            let mut tun2 = std::process::Command::new("tun2socks");
-            tun2.uid(ui.into()).gid(gi.into()).groups(&[gi.into()]);
-            tun2.args(&["-device", tun_name, "-proxy", &base_prxy_v4]);
-            let mut tun2_async: Command = tun2.into();
-            tun2_async.stdout(Stdio::piped());
-            let mut tun2h = tun2_async.spawn()?;
-            let stdout = tun2h.stdout.take().unwrap();
-            let reader = tokio::io::BufReader::new(stdout).lines();
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            tokio::spawn(watch_log(reader, tx, "tun2socks"));
-            rx.await?;
-            configurer.set_up(tun_name).await?;
-            configurer.set_up(&veth_from_ns(ns_name, false)).await?;
-            configurer
-                .ip_add_route(tun_name, None, Some(true))
-                .await
-                .ok();
+    // Tun2socks
+    let mut tun2 = std::process::Command::new("tun2socks");
+    tun2.uid(ui.into()).gid(gi.into()).groups(&[gi.into()]);
+    tun2.args(&["-device", tun_name, "-proxy", &base_prxy_v4]);
+    let mut tun2_async: Command = tun2.into();
+    tun2_async.stdout(Stdio::piped());
+    let mut tun2h = tun2_async.spawn()?;
+    let stdout = tun2h.stdout.take().unwrap();
+    let reader = tokio::io::BufReader::new(stdout).lines();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let pre = format!("{}/tun2socks", ns_name);
+    tokio::spawn(watch_log(reader, Some(tx), pre));
+    rx.await?;
+    configurer.set_up(tun_name).await?;
+    configurer.set_up(&veth_from_ns(ns_name, false)).await?;
+    configurer
+        .ip_add_route(tun_name, None, Some(true))
+        .await
+        .ok();
+    configurer
+        .ip_add_route(tun_name, None, Some(false))
+        .await
+        .ok();
+    proc_set.spawn((async move || {
+        tun2h
+            .wait()
+            .map_err(|e| anyhow::Error::from(e))
+            .map_ok(|o| (o, "tun2socks".to_owned()))
+            .await
+    })());
 
-            let mut dns = std::process::Command::new("dnsproxy");
-            dns.uid(ui.into()).gid(gi.into()).groups(&[gi.into()]);
-            dns.args(&[
-                "-l",
-                "127.0.0.1",
-                "-l",
-                "127.0.0.53", // systemd-resolved
-                "-l",
-                "::1",
-                "-p",
-                "53",
-                "-u",
-                "tcp://1.1.1.1:53",
-                "--cache",
-            ]);
-            let mut dns_async: Command = dns.into();
-            // dns_async.kill_on_drop(true);
-            let mut dnsh = dns_async.spawn()?;
+    // Dnsproxy
+    let mut dns = std::process::Command::new("dnsproxy");
+    dns.uid(ui.into()).gid(gi.into()).groups(&[gi.into()]);
 
-            tokio::try_join!(
-                tun2h.wait().map_err(|e| e.into()),
-                dnsh.wait().map_err(|e| e.into())
-            )?;
-        }
-        "i2p" => {
-            // netns that can only access i2p
-        }
-        "clean_ip1" => {
-            let proxy1 = &secret
-                .proxies
-                .get(ns_name)
-                .ok_or(anyhow!("not configured"))?[0];
-            assert!(!proxy1.is_empty());
-            log::debug!("clean proxy, {proxy1}");
-
-            let mut tun2 = std::process::Command::new("tun2socks");
-            tun2.uid(ui.into()).gid(gi.into()).groups(&[gi.into()]);
-            tun2.args(&["-device", tun_name, "-proxy", "127.0.0.1:1080"]);
-            let mut tun2_async: Command = tun2.into();
-            tun2_async.stdout(Stdio::piped());
-            let mut tun2h = tun2_async.spawn()?;
-            let stdout = tun2h.stdout.take().unwrap();
-            let reader = tokio::io::BufReader::new(stdout).lines();
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            tokio::spawn(watch_log(reader, tx, "clean_ip1_tun"));
-            rx.await?;
-            configurer.set_up(tun_name).await?;
-            configurer.set_up(&veth_from_ns(ns_name, false)).await?;
-            configurer
-                .ip_add_route(tun_name, None, Some(true))
-                .await
-                .ok();
-            configurer
-                .ip_add_route(tun_name, Some("::/0".parse()?), None)
-                .await
-                .ok();
-            // outputs to stdout. no logs kept
-
-            let mut dns = std::process::Command::new("dnsproxy");
-            dns.uid(ui.into()).gid(gi.into()).groups(&[gi.into()]);
-            dns.args(&[
-                "-l",
-                "127.0.0.1",
-                "-l",
-                "127.0.0.53", // systemd-resolved
-                "-l",
-                "::1",
-                "-p",
-                "53",
-                "-u",
-                "tcp://1.1.1.1:53",
-                "--cache",
-            ]);
-            let mut dns_async: Command = dns.into();
-            dns_async.kill_on_drop(true);
-            let mut dnsh = dns_async.spawn()?;
-
-            let mut gost = std::process::Command::new("gost");
-            gost.uid(ui.into()).gid(gi.into()).groups(&[gi.into()]);
-            gost.args(&[
-                "-L=socks5://localhost:1080",
-                ("-F=".to_owned() + &base_prxy_v4).as_ref(),
-                &("-F=".to_owned() + proxy1),
-            ]);
-            let mut gost_async: Command = gost.into();
-            let mut gosth = gost_async.spawn()?;
-
-            tokio::try_join!(
-                tun2h.wait().map_err(|e| e.into()),
-                dnsh.wait().map_err(|e| e.into()),
-                gosth.wait().map_err(|e| e.into())
-            )?;
-        }
-        "clean_ipv6" => {
-            let proxy6 = &secret
-                .proxies
-                .get(ns_name)
-                .ok_or(anyhow!("not configured"))?[0];
-            assert!(!proxy6.is_empty());
-            log::debug!("IPv6 proxy, {proxy6}");
-
-            let mut gost = std::process::Command::new("gost");
-            gost.uid(ui.into()).gid(gi.into()).groups(&[gi.into()]);
-            gost.args(&[
-                "-L=socks5://localhost:1080",
-                ("-F=".to_owned() + &base_prxy_v4).as_ref(),
-                &("-F=".to_owned() + proxy6),
-            ]);
-            let mut gost_async: Command = gost.into();
-            let mut gosth = gost_async.spawn()?;
-
-            let mut tun2 = std::process::Command::new("tun2socks");
-            tun2.uid(ui.into()).gid(gi.into()).groups(&[gi.into()]);
-            tun2.args(&["-device", tun_name, "-proxy", "127.0.0.1:1080"]);
-            let mut tun2_async: Command = tun2.into();
-            tun2_async.stdout(Stdio::piped());
-            let mut tun2h = tun2_async.spawn()?;
-            let stdout = tun2h.stdout.take().unwrap();
-            let reader = tokio::io::BufReader::new(stdout).lines();
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            tokio::spawn(watch_log(reader, tx, "clean_ipv6_tun,"));
-            rx.await?;
-            configurer.set_up(tun_name).await?;
-            configurer.set_up(&veth_from_ns(ns_name, false)).await?;
-            configurer
-                .ip_add_route(tun_name, None, Some(true))
-                .await
-                .ok();
-            configurer
-                .ip_add_route(tun_name, Some("::/0".parse()?), None)
-                .await
-                .ok();
-
-            // outputs to stdout. no logs kept
-            let mut dns = std::process::Command::new("dnsproxy");
-            dns.uid(ui.into()).gid(gi.into()).groups(&[gi.into()]);
+    if let Some(dv) = &params.dns_argv {
+        dns.args(dv);
+    } else {
+        // dnsproxy is behind the proxy
+        // DNSSEC or such is unnecessary.
+        if params.ipv6 {
             dns.args(&[
                 "-l",
                 "127.0.0.1",
@@ -626,20 +645,63 @@ pub async fn inner_daemon(
                 "tcp://[2620:119:35::35]:53",
                 "--cache",
             ]);
-            let mut dns_async: Command = dns.into();
-            dns_async.kill_on_drop(true);
-            let mut dnsh = dns_async.spawn()?;
+        } else {
+            dns.args(&[
+                "-l",
+                "127.0.0.1",
+                "-l",
+                "127.0.0.53", // systemd-resolved
+                "-l",
+                "::1",
+                "-p",
+                "53",
+                "-u",
+                "tcp://1.1.1.1:53",
+                "--cache",
+            ]);
+        }
+    }
+    let mut dns_async: Command = dns.into();
+    dns_async.stdout(Stdio::piped());
+    dns_async.stderr(Stdio::piped());
+    let mut dnsh = dns_async.spawn()?;
+    let pre = format!("{}/dnsproxy", ns_name);
+    watch_both(&mut dnsh, pre, None).await?;
+    proc_set.spawn((async move || {
+        dnsh.wait()
+            .map_err(|e| anyhow::Error::from(e))
+            .map_ok(|o| (o, "dnsproxy".to_owned()))
+            .await
+    })());
 
-            tokio::try_join!(
-                tun2h.wait().map_err(|e| e.into()),
-                dnsh.wait().map_err(|e| e.into()),
-                gosth.wait().map_err(|e| e.into())
-            )?;
-        }
-        _ => {
-            log::warn!("no matches found, exiting");
-        }
-    };
+    // User-supplied process
+    if let Some(cmd) = &params.cmd {
+        let mut uproc = std::process::Command::new(&cmd.program);
+        let mut cmd_c: NetnsParamCmd = cmd.to_owned();
+        substitute_argv(&ns_config, &mut cmd_c.argv);
+
+        uproc.uid(ui.into()).gid(gi.into()).groups(&[gi.into()]);
+        uproc.args(&cmd_c.argv);
+        let mut uproc_async: Command = uproc.into();
+        uproc_async.stdout(Stdio::piped());
+        uproc_async.stderr(Stdio::piped());
+        let mut uproch = uproc_async.spawn()?;
+        let pre = format!("{}/cmd", ns_name);
+        watch_both(&mut uproch, pre, None).await?;
+
+        proc_set.spawn((async move || {
+            uproch
+                .wait()
+                .map_err(|e| anyhow::Error::from(e))
+                .map_ok(|o| (o, format!("{}, argv {:?}", cmd_c.program, cmd_c.argv)))
+                .await
+        })());
+    }
+
+    while let Some(r) = proc_set.join_next().await {
+        let r = r??;
+        log::warn!("\"{}\" exited with {}", r.1, r.0)
+    }
 
     Ok(())
 }
@@ -809,17 +871,20 @@ pub async fn config_ns(
     Ok(())
 }
 
-pub async fn config_network() -> Result<ConfigRes> {
+pub async fn config_network(ns_names: Vec<String>) -> Result<ConfigRes> {
     let mut res = ConfigRes::default();
 
     let configrer = Configurer::new();
-    for ns in TASKS {
+    for ns in &ns_names {
         config_ns(&ns, veth_from_ns, &mut res, &configrer).await?;
     }
 
     res.root_inode = get_pid1_netns_inode().await?;
 
-    let i_names = TASKS.map(|n| veth_from_ns(n, true));
+    let i_names: Vec<String> = ns_names
+        .into_iter()
+        .map(|n| veth_from_ns(&n, true))
+        .collect();
     let inames = i_names.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
     nft::apply_block_forwad(&inames)?;
 
@@ -837,7 +902,7 @@ pub async fn get_pid1_netns_inode() -> Result<u64> {
     Ok(pid1_net_ns.identifier)
 }
 
-pub async fn get_self_netns_inode() -> Result<u64> {
+pub fn get_self_netns_inode() -> Result<u64> {
     use procfs::process::Process;
     let selfproc = Process::myself()?;
     let nslist = selfproc.namespaces()?;
@@ -900,5 +965,3 @@ impl Env for NsEnv {
         NETNS_PATH.into()
     }
 }
-
-pub static TASKS: [&str; 5] = ["base_p", "i2p", "clean_ip1", "clean_ipv6", "lokins"];

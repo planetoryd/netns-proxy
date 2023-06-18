@@ -17,11 +17,12 @@ async fn main() -> Result<()> {
         &nsname,
         args.next(),
         args.next(),
+        args.next()
     )
     .await
     {
         log::error!("{}; {}", nsname, err);
-        std::process::exit(1);
+        return Err(err);
     };
 
     Ok(())

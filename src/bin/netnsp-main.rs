@@ -2,7 +2,7 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use flexi_logger::FileSpec;
-use netns_proxy::{self_netns_identify, NETNS_PATH, TASKS};
+use netns_proxy::{enter_ns_by_pid, self_netns_identify, NETNS_PATH, enter_ns_by_name};
 use nix::{
     sched::CloneFlags,
     unistd::{getppid, getresuid},
@@ -11,6 +11,7 @@ use std::{
     env,
     ops::Deref,
     os::{fd::AsRawFd, unix::process::CommandExt},
+    path::Path,
 };
 use tokio::{
     fs::File,
@@ -43,6 +44,8 @@ enum Commands {
         ns: String,
         #[arg(short, long)]
         cmd: Option<String>,
+        #[arg(short, long)]
+        pid: Option<i32>,
     },
     Id {},
 }
@@ -78,17 +81,7 @@ async fn main() -> Result<()> {
         tokio::signal::ctrl_c().await.unwrap();
         log::warn!("Received Ctrl+C");
         let i = nix::unistd::getpgrp();
-        // for some obscure reason the sigterm is only sent to the parent when you hit ctrl c
-        // do a clean exit
-        Command::new("pkill")
-            .arg("-c")
-            .arg("-g")
-            .arg(i.as_raw().to_string())
-            .spawn()
-            .unwrap()
-            .wait()
-            .await
-            .unwrap();
+        // TODO: kill all sub processes in case of crash
     });
 
     match cli.command {
@@ -101,15 +94,15 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| anyhow!("no matches under the given netns directory"))?;
             println!("{:?}", got_ns);
         }
-        Some(Commands::Exec { mut cmd, ns }) => {
+        Some(Commands::Exec { mut cmd, ns, pid }) => {
             let path = "./netnsp.json";
             let mut file = File::open(path).await?;
             let mut contents = String::new();
             file.read_to_string(&mut contents).await?;
 
             let config: netns_proxy::ConfigRes = serde_json::from_str(&contents)?;
-            let curr_inode = netns_proxy::get_self_netns_inode().await?;
-            let pid = nix::unistd::getpid();
+            let curr_inode = netns_proxy::get_self_netns_inode()?;
+            let self_pid = nix::unistd::getpid();
 
             let parent_pid = nix::unistd::getppid();
             let parent_process = match Process::new(parent_pid.into()) {
@@ -127,28 +120,16 @@ async fn main() -> Result<()> {
             if cmd.is_none() {
                 cmd = Some("fish".to_owned());
             }
-
             log::info!(
                 "uid: {:?}, gid: {:?}, pid: {:?}",
                 nix::unistd::getresuid()?,
                 nix::unistd::getresgid()?,
-                pid
+                self_pid
             );
-            nix::sched::setns(
-                netns_proxy::nsfd(&ns)?.as_raw_fd(),
-                CloneFlags::CLONE_NEWNET,
-            )?;
-            log::info!("setns succeeded");
-
-            let got_ns = self_netns_identify()
-                .await?
-                .ok_or_else(|| anyhow!("no matches under the given netns directory"))?
-                .0;
-            log::info!("current ns '{}'", got_ns);
-
-            if got_ns != ns {
-                log::error!("entering netns failed, {} != {}", got_ns, ns);
-                std::process::exit(1);
+            if let Some(pi) = pid {
+                enter_ns_by_pid(pi)?;
+            } else {
+                enter_ns_by_name(&ns).await?;
             }
 
             netns_proxy::drop_privs1(
@@ -156,7 +137,7 @@ async fn main() -> Result<()> {
                 nix::unistd::Uid::from_raw(puid),
             )?;
 
-            let mut proc = std::process::Command::new(cmd.unwrap());
+            let proc = std::process::Command::new(cmd.unwrap());
 
             // proc.args(&[""]);
 
@@ -164,71 +145,84 @@ async fn main() -> Result<()> {
             let mut t = cmd_async.spawn()?;
             t.wait().await?;
         }
-        None => match netns_proxy::config_network().await {
-            Ok(r) => {
-                let serialized = serde_json::to_string_pretty(&r)?;
+        None => {
+            let path = Path::new("./secret.json");
+            let mut file = File::open(path).await?;
+            let mut contents = String::new();
+            file.read_to_string(&mut contents).await?;
 
-                let mut file = tokio::fs::File::create("./netnsp.json").await?;
-                log::info!("config result generated in ./netnsp.json. note that this file is freshly generated each run.");
+            let secret: netns_proxy::Secret = serde_json::from_str(&contents)?;
+            let ns_names: Vec<String> = secret.params.into_keys().collect();
+            let ns_names1 = ns_names.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
 
-                file.write_all(serialized.as_bytes()).await?;
+            match netns_proxy::config_network(ns_names.clone()).await {
+                Ok(r) => {
+                    let serialized = serde_json::to_string_pretty(&r)?;
 
-                let mut sp = env::current_exe()?;
-                sp.pop();
-                sp.push("netnsp-sub");
-                let sp1 = sp.into_os_string();
-                // start daemons
-                // let pid = nix::unistd::getpid();
+                    let mut file = tokio::fs::File::create("./netnsp.json").await?;
+                    log::info!("config result generated in ./netnsp.json. note that this file is freshly generated each run.");
 
-                let parent_pid = nix::unistd::getppid();
-                let parent_process = match Process::new(parent_pid.into()) {
-                    Ok(process) => process,
-                    Err(_) => panic!("cannot access parent process"),
-                };
-                let puid = parent_process.status()?.euid;
-                let pgid = parent_process.status()?.egid;
+                    file.write_all(serialized.as_bytes()).await?;
 
-                for ns in netns_proxy::TASKS {
-                    let spx = sp1.clone();
+                    let mut sp = env::current_exe()?;
+                    sp.pop();
+                    sp.push("netnsp-sub");
+                    let sp1 = sp.into_os_string();
+                    // start daemons
+                    // let pid = nix::unistd::getpid();
 
-                    set.spawn(async move {
-                        let spx = spx.clone();
+                    let parent_pid = nix::unistd::getppid();
+                    let parent_process = match Process::new(parent_pid.into()) {
+                        Ok(process) => process,
+                        Err(_) => panic!("cannot access parent process"),
+                    };
+                    let puid = parent_process.status()?.euid;
+                    let pgid = parent_process.status()?.egid;
 
-                        log::info!("wait on {:?} {ns}", spx);
-                        let mut cmd = Command::new(spx.clone())
-                            .arg(ns)
-                            .arg(puid.to_string())
-                            .arg(pgid.to_string())
-                            .uid(0)
-                            .spawn()
-                            .unwrap();
-                        let task = cmd.wait();
-                        let res = task.await;
-                        (ns, res)
-                    });
+                    let ns_names2 = ns_names.clone();
+                    for name in ns_names2 {
+                        let spx = sp1.clone();
+
+                        set.spawn(async move {
+                            let spx = spx.clone();
+
+                            log::info!("wait on {:?}, ns {}", spx, &name);
+
+                            let mut cmd = Command::new(spx.clone())
+                                .arg(&name)
+                                .arg(puid.to_string())
+                                .arg(pgid.to_string())
+                                .uid(0)
+                                .spawn()
+                                .unwrap();
+                            let task = cmd.wait();
+                            let res = task.await;
+                            (name, res)
+                        });
+                    }
+
+                    while let Some(res) = set.join_next().await {
+                        let idx = res.unwrap();
+                        log::error!(
+                            "{} exited, with {:?}. re-cap, {}/{} running",
+                            idx.0,
+                            idx.1,
+                            set.len(),
+                            ns_names1.len()
+                        );
+                    }
                 }
-
-                while let Some(res) = set.join_next().await {
-                    let idx = res.unwrap();
-                    log::error!(
-                        "{} exited, with {:?}. re-cap, {}/{} running",
-                        idx.0,
-                        idx.1,
-                        set.len(),
-                        TASKS.len()
-                    );
+                Err(x) => {
+                    log::error!("There is irrecoverable error in configuring. Try reseting the state, like rebooting");
+                    let euid = nix::unistd::geteuid();
+                    if !euid.is_root() {
+                        // the only way of checking if we have the perms is to try. so no mandating root.
+                        log::warn!("Your uid is {euid}. Do you have enough perms")
+                    }
+                    return Err(x);
                 }
             }
-            Err(x) => {
-                log::error!("There is irrecoverable error in configuring. Try reseting the state, like rebooting");
-                let euid = nix::unistd::geteuid();
-                if !euid.is_root() {
-                    // the only way of checking if we have the perms is to try. so no mandating root.
-                    log::warn!("Your uid is {euid}. Do you have enough perms")
-                }
-                return Err(x);
-            }
-        },
+        }
     }
 
     Ok(())
