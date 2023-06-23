@@ -1,91 +1,153 @@
-use mnl;
-use nftnl::{
-    nft_expr, nftnl_sys::libc, Batch, Chain, FinalizedBatch, MsgType, ProtoFamily, Rule, Table,
+use ipnetwork::{IpNetwork, Ipv4Network};
+use rustables::{
+    data_type::ip_to_vec,
+    expr::{
+        Bitwise, Cmp, CmpOp, Counter, ExpressionList, HighLevelPayload, ICMPv6HeaderField,
+        IPv4HeaderField, IcmpCode, Immediate, Meta, MetaType, NetworkHeaderField,
+        TransportHeaderField, VerdictKind,
+    },
+    iface_index, list_chains_for_table, list_rules_for_chain, list_tables, Batch, Chain,
+    ChainPolicy, Hook, HookClass, MsgType, ProtocolFamily, Rule, Table,
 };
 use std::{
-    ffi::{self, CString},
-    io,
+    collections::{HashMap, HashSet},
     net::Ipv4Addr,
 };
 
 use anyhow::{Ok, Result};
 
-const TABLE_NAME: &str = "netnsp";
-const FO_CHAIN: &str = "block-forward";
+pub const TABLE_NAME: &str = "netnsp";
+pub const FO_CHAIN: &str = "block-forward";
 
-pub fn apply_block_forwad(veth_list: &[&str]) -> Result<()> {
-    log::info!("applying nft rules for {:?}. warning, table netnsp is overwritten each time", veth_list);
-
-    let mut batch = Batch::new();
-    let table = Table::new(&CString::new(TABLE_NAME).unwrap(), ProtoFamily::Inet);
-    batch.add(&table, MsgType::Del); // remove it first. otherwise it gets duplicates
-    batch.add(&table, MsgType::Add);
-    let mut fo_chain = Chain::new(&CString::new(FO_CHAIN).unwrap(), &table);
-    fo_chain.set_policy(nftnl::Policy::Accept); // we don't drop all packets by default. the decision is up to the user
-    fo_chain.set_hook(nftnl::Hook::Forward, 0);
-    // target the packets that would be forwarded, priority doesn't matter because it will be traversed eventually
-    batch.add(&fo_chain, MsgType::Add);
-
-    for s in veth_list {
-        batch.add(&drop_interface_rule(s, &fo_chain)?, MsgType::Add);
-    }
-
-    let finalized_batch = batch.finalize();
-
-    // Send the entire batch and process any returned messages.
-    send_and_process(&finalized_batch)?;
-
-    Ok(())
+#[derive(Default, Debug)]
+pub struct NftProposal {
+    // name -> table. indexed
+    tables: HashMap<String, PTable>,
 }
 
-fn send_and_process(batch: &FinalizedBatch) -> Result<()> {
-    // Create a netlink socket to netfilter.
-    let socket = mnl::Socket::new(mnl::Bus::Netfilter)?;
-    // Send all the bytes in the batch.
-    socket.send_all(batch)?;
+#[derive(Default, Debug)]
+pub struct PTable {
+    table: Table,
+    chains: HashMap<String, PChain>,
+}
 
-    // Try to parse the messages coming back from netfilter. This part is still very unclear.
-    let portid = socket.portid();
-    let mut buffer = vec![0; nftnl::nft_nlmsg_maxsize() as usize];
-    let very_unclear_what_this_is_for = 2;
-    while let Some(message) = socket_recv(&socket, &mut buffer[..])? {
-        match mnl::cb_run(message, very_unclear_what_this_is_for, portid)? {
-            mnl::CbResult::Stop => {
-                break;
+#[derive(Default, Debug)]
+pub struct PChain {
+    chain: Chain,
+    rules: HashSet<Rule>,
+    // I think they are not ordered
+}
+
+// it's actually quite awkward to spend so much effort synchronizing the nft state and local state.
+
+// ensure those rules exist
+// if not, incrementally update
+pub fn ensure_rules(proposal: NftProposal) -> Result<()> {
+    let ts: Vec<Table> = list_tables()?;
+    let e_set: HashSet<&String> = ts.iter().flat_map(|table| table.get_name()).collect();
+    // do a quick scan for consistency, and if diff is small, update incrementally, else remove & re-add
+    let mut batch: Batch = Batch::new();
+    for (name, ta) in proposal.tables {
+        if e_set.contains(&name) {
+            // the comparison isn't that strict / careful. mostly against misconfig, not adversaries
+            let chains = list_chains_for_table(&ta.table)?;
+            let c_set: HashSet<&String> =
+                chains.iter().flat_map(|table| table.get_name()).collect();
+            for (c_name, ca) in ta.chains {
+                if c_set.contains(&c_name) {
+                    let mut rules: Vec<Rule> = list_rules_for_chain(&ca.chain)?;
+                    for r in rules.iter_mut() {
+                        r.essentialize();
+                    }
+                    let exi_set: HashSet<&Rule> = HashSet::from_iter(rules.iter());
+                    let expec_set: HashSet<&Rule> = HashSet::from_iter(ca.rules.iter());
+                    if exi_set.is_subset(&expec_set) {
+                        // add all the missing rules
+                        let add_diff = &expec_set - &exi_set;
+                        for expr in add_diff.iter() {
+                            batch.add(*expr, MsgType::Add);
+                        }
+                        log::trace!(
+                            "incrementally adding {} new rules to chain {}",
+                            add_diff.len(),
+                            c_name
+                        )
+                    } else {
+                        // remove and re-add
+                        // we take full-control of a chain
+                        log::trace!("chain {} contaminated, re-adding", c_name);
+                        for rule in rules {
+                            batch.add(&rule, MsgType::Del);
+                        }
+                        for rule in &ca.rules {
+                            batch.add(rule, MsgType::Add);
+                        }
+                    }
+                } else {
+                    // add chain
+                    log::trace!("adding new chain {}", c_name);
+                    batch.add(&ca.chain, MsgType::Add);
+                    for rule in &ca.rules {
+                        batch.add(rule, MsgType::Add);
+                    }
+                }
             }
-            mnl::CbResult::Ok => (),
+            // do nothing to other chains if they exist
+        } else {
+            log::trace!("adding new table {}", name);
+            batch.add(&ta.table, MsgType::Add);
+            for (_c_name, ca) in ta.chains.iter() {
+                batch.add(&ca.chain, MsgType::Add);
+                for rule in &ca.rules {
+                    batch.add(rule, MsgType::Add);
+                }
+            }
+            // add table
         }
     }
+    // do nothing to other tables if any
+    log::trace!("ensure_rules, batch.send");
+    batch.send()?;
+
     Ok(())
 }
 
-fn socket_recv<'a>(socket: &mnl::Socket, buf: &'a mut [u8]) -> Result<Option<&'a [u8]>> {
-    let ret = socket.recv(buf)?;
-    if ret > 0 {
-        Ok(Some(&buf[..ret]))
-    } else {
-        Ok(None)
+pub fn apply_block_forwad(veth_list: &[&str]) -> Result<()> {
+    log::info!("applying nft rules to block forwarding of {:?}", veth_list);
+    let table = Table::new(ProtocolFamily::Inet).with_name(TABLE_NAME.to_owned());
+    let chain = Chain::new(&table)
+        .with_name(FO_CHAIN)
+        .with_hook(Hook::new(rustables::HookClass::Forward, 0))
+        .with_policy(rustables::ChainPolicy::Accept);
+    let mut rules: HashSet<Rule> = HashSet::new();
+
+    for v in veth_list {
+        rules.insert(drop_interface_rule(v, &chain)?);
     }
+
+    let prop = NftProposal {
+        tables: HashMap::from_iter([(
+            TABLE_NAME.to_owned(),
+            PTable {
+                table,
+                chains: HashMap::from([(FO_CHAIN.to_owned(), PChain { chain, rules })]),
+            },
+        )]),
+    };
+
+    ensure_rules(prop)?;
+
+    Ok(())
 }
 
-fn drop_interface_rule<'L>(name: &str, chain: &'L Chain) -> Result<Rule<'L>> {
-    let mut r = Rule::new(&chain);
-    let i = iface_index(name)?;
+pub fn drop_interface_rule(i_name: &str, chain: &Chain) -> Result<Rule> {
+    let mut r = Rule::new(&chain)?;
+    let i = iface_index(i_name)?;
 
-    r.add_expr(&nft_expr!(meta iif));
-    r.add_expr(&nft_expr!(cmp == i));
-    r.add_expr(&nft_expr!(verdict drop));
+    r = r
+        .with_expr(Meta::new(MetaType::Iif))
+        .with_expr(Cmp::new(CmpOp::Eq, i.to_le_bytes()))
+        .with_expr(Immediate::new_verdict(VerdictKind::Drop));
 
     Ok(r)
-}
-
-// Look up the interface index for a given interface name.
-fn iface_index(name: &str) -> Result<libc::c_uint> {
-    let c_name = CString::new(name)?;
-    let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
-    if index == 0 {
-        Err(io::Error::last_os_error().into())
-    } else {
-        Ok(index)
-    }
 }

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::env::args;
+use netns_proxy::configurer::NETNS_PATH;
 
 // this will run inside netns
 
@@ -7,7 +8,7 @@ use std::env::args;
 async fn main() -> Result<()> {
     let mut args = args();
 
-    let mut p = std::path::PathBuf::from(netns_proxy::NETNS_PATH);
+    let mut p = std::path::PathBuf::from(NETNS_PATH);
     args.next().unwrap();
     let nsname = args.next().unwrap();
     p.push(nsname.clone());

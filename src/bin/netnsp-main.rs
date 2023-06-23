@@ -2,16 +2,17 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use flexi_logger::FileSpec;
-use netns_proxy::{enter_ns_by_pid, self_netns_identify, NETNS_PATH, enter_ns_by_name};
+use netns_proxy::watcher::fs_watcher;
 use nix::{
     sched::CloneFlags,
     unistd::{getppid, getresuid},
 };
 use std::{
+    collections::HashMap,
     env,
     ops::Deref,
     os::{fd::AsRawFd, unix::process::CommandExt},
-    path::Path,
+    path::{Path, PathBuf},
 };
 use tokio::{
     fs::File,
@@ -19,6 +20,8 @@ use tokio::{
     process::{Child, Command},
     task::JoinSet,
 };
+
+use netns_proxy::configurer::*;
 
 use procfs::process::Process;
 
@@ -32,6 +35,9 @@ use procfs::process::Process;
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+    /// configure each profile as a persistent net namespace. pre means before using apps.
+    #[arg(short, long)]
+    pre: bool,
 }
 
 #[derive(Subcommand)]
@@ -65,14 +71,28 @@ async fn main() -> Result<()> {
     //             .unwrap(),
     //     );
     // }
-
+    #[cfg(debug_assertions)]
     unsafe {
         netns_proxy::logger = Some(
-            flexi_logger::Logger::try_with_env_or_str("error,netnsp_main=debug,netns_proxy=debug")
-                .unwrap()
-                .log_to_stdout()
-                .start()
-                .unwrap(),
+            flexi_logger::Logger::try_with_env_or_str(
+                "error,netnsp_main=trace,netns_proxy=trace,netnsp_sub=trace",
+            )
+            .unwrap()
+            .log_to_stdout()
+            .start()
+            .unwrap(),
+        );
+    }
+    #[cfg(not(debug_assertions))]
+    unsafe {
+        netns_proxy::logger = Some(
+            flexi_logger::Logger::try_with_env_or_str(
+                "error,netnsp_main=info,netns_proxy=warn,netnsp_sub=info",
+            )
+            .unwrap()
+            .log_to_stdout()
+            .start()
+            .unwrap(),
         );
     }
     let cli = Cli::parse();
@@ -80,7 +100,8 @@ async fn main() -> Result<()> {
     tokio::spawn(async {
         tokio::signal::ctrl_c().await.unwrap();
         log::warn!("Received Ctrl+C");
-        let i = nix::unistd::getpgrp();
+        std::process::exit(0);
+        // let i = nix::unistd::getpgrp();
         // TODO: kill all sub processes in case of crash
     });
 
@@ -100,8 +121,8 @@ async fn main() -> Result<()> {
             let mut contents = String::new();
             file.read_to_string(&mut contents).await?;
 
-            let config: netns_proxy::ConfigRes = serde_json::from_str(&contents)?;
-            let curr_inode = netns_proxy::get_self_netns_inode()?;
+            let config: ConfigRes = serde_json::from_str(&contents)?;
+            let curr_inode = get_self_netns_inode()?;
             let self_pid = nix::unistd::getpid();
 
             let parent_pid = nix::unistd::getppid();
@@ -132,7 +153,7 @@ async fn main() -> Result<()> {
                 enter_ns_by_name(&ns).await?;
             }
 
-            netns_proxy::drop_privs1(
+            drop_privs1(
                 nix::unistd::Gid::from_raw(pgid),
                 nix::unistd::Uid::from_raw(puid),
             )?;
@@ -146,81 +167,82 @@ async fn main() -> Result<()> {
             t.wait().await?;
         }
         None => {
-            let path = Path::new("./secret.json");
-            let mut file = File::open(path).await?;
-            let mut contents = String::new();
-            file.read_to_string(&mut contents).await?;
+            // Run as a daemon
+            use netns_proxy::util;
+            use netns_proxy::watcher;
+            let mut state = NetnspState::load(Default::default()).await?;
 
-            let secret: netns_proxy::Secret = serde_json::from_str(&contents)?;
-            let ns_names: Vec<String> = secret.params.into_keys().collect();
-            let ns_names1 = ns_names.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
+            let hold = state.profile_names();
+            let ns_names1 = util::convert_strings_to_strs(&hold);
+            let configrer = Configurer::new();
 
-            match netns_proxy::config_network(ns_names.clone()).await {
-                Ok(r) => {
-                    let serialized = serde_json::to_string_pretty(&r)?;
+            if cli.pre {
+                match config_network(state.profile_names(), &configrer, &mut state).await {
+                    Ok(_) => {
+                        state.dump().await?;
 
-                    let mut file = tokio::fs::File::create("./netnsp.json").await?;
-                    log::info!("config result generated in ./netnsp.json. note that this file is freshly generated each run.");
+                        let mut sp = env::current_exe()?;
+                        sp.pop();
+                        sp.push("netnsp-sub");
+                        let sp1 = sp.into_os_string();
+                        // start daemons
+                        let parent_pid = nix::unistd::getppid();
+                        let parent_process = match Process::new(parent_pid.into()) {
+                            Ok(process) => process,
+                            Err(_) => panic!("cannot access parent process"),
+                        };
+                        let puid = parent_process.status()?.euid;
+                        let pgid = parent_process.status()?.egid;
 
-                    file.write_all(serialized.as_bytes()).await?;
+                        for name in state.profile_names() {
+                            let spx = sp1.clone();
 
-                    let mut sp = env::current_exe()?;
-                    sp.pop();
-                    sp.push("netnsp-sub");
-                    let sp1 = sp.into_os_string();
-                    // start daemons
-                    // let pid = nix::unistd::getpid();
+                            set.spawn(async move {
+                                let spx = spx.clone();
 
-                    let parent_pid = nix::unistd::getppid();
-                    let parent_process = match Process::new(parent_pid.into()) {
-                        Ok(process) => process,
-                        Err(_) => panic!("cannot access parent process"),
-                    };
-                    let puid = parent_process.status()?.euid;
-                    let pgid = parent_process.status()?.egid;
+                                log::info!("wait on {:?}, ns {}", spx, &name);
 
-                    let ns_names2 = ns_names.clone();
-                    for name in ns_names2 {
-                        let spx = sp1.clone();
+                                let mut cmd = Command::new(spx.clone())
+                                    .arg(&name)
+                                    .arg(puid.to_string())
+                                    .arg(pgid.to_string())
+                                    .uid(0)
+                                    .spawn()
+                                    .unwrap();
+                                let task = cmd.wait();
+                                let res = task.await;
+                                (name, res)
+                            });
+                        }
 
-                        set.spawn(async move {
-                            let spx = spx.clone();
-
-                            log::info!("wait on {:?}, ns {}", spx, &name);
-
-                            let mut cmd = Command::new(spx.clone())
-                                .arg(&name)
-                                .arg(puid.to_string())
-                                .arg(pgid.to_string())
-                                .uid(0)
-                                .spawn()
-                                .unwrap();
-                            let task = cmd.wait();
-                            let res = task.await;
-                            (name, res)
-                        });
+                        while let Some(res) = set.join_next().await {
+                            let idx = res.unwrap();
+                            log::error!(
+                                "{} exited, with {:?}. re-cap, {}/{} running",
+                                idx.0,
+                                idx.1,
+                                set.len(),
+                                ns_names1.len()
+                            );
+                        }
                     }
-
-                    while let Some(res) = set.join_next().await {
-                        let idx = res.unwrap();
-                        log::error!(
-                            "{} exited, with {:?}. re-cap, {}/{} running",
-                            idx.0,
-                            idx.1,
-                            set.len(),
-                            ns_names1.len()
-                        );
+                    Err(x) => {
+                        log::error!("There is irrecoverable error in configuring. Try reseting the state, like rebooting");
+                        let euid = nix::unistd::geteuid();
+                        if !euid.is_root() {
+                            // the only way of checking if we have the perms is to try. so no mandating root.
+                            log::warn!("Your uid is {euid}. Do you have enough perms")
+                        }
+                        return Err(x);
                     }
                 }
-                Err(x) => {
-                    log::error!("There is irrecoverable error in configuring. Try reseting the state, like rebooting");
-                    let euid = nix::unistd::geteuid();
-                    if !euid.is_root() {
-                        // the only way of checking if we have the perms is to try. so no mandating root.
-                        log::warn!("Your uid is {euid}. Do you have enough perms")
-                    }
-                    return Err(x);
-                }
+            }
+
+            let watcher = watcher::WatcherState::create(configrer, state).await?;
+            let w_t = watcher.start();
+            // exit when either of them exits, because it shouldn't.
+            tokio::select! {
+                _ = tokio::spawn(w_t) => {}
             }
         }
     }

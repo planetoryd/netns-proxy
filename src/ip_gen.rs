@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Context, Ok, Result};
 use blake3::{hash, Hash};
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
-use nftnl::expr::ToSlice;
 use std::{borrow::Borrow, net::*};
 
 pub fn gen_bytes(mut name: String) -> Hash {
