@@ -13,12 +13,15 @@
 // TODO: validate what is being started by checking GetAppState
 
 use anyhow::{Ok, Result};
-use futures::StreamExt;
+use futures::{Future, StreamExt};
 use inotify::{EventMask, WatchDescriptor, WatchMask};
 use nix::sched::CloneFlags;
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
+use std::pin::Pin;
 use std::{
-    cell::Ref,
+    cell::{Cell, Ref},
     collections::{HashMap, HashSet},
     ffi::OsString,
     os::fd::AsRawFd,
@@ -27,12 +30,12 @@ use std::{
     result::Result as stdRes,
     sync::Arc,
 };
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::{io::AsyncReadExt, sync::RwLock, task::JoinSet};
 use zbus::{dbus_interface, dbus_proxy, Connection};
 
-use crate::{
-    configurer::{self, get_self_netns_inode, ConfigRes, NetnsInfo, NetnspState},
-    get_non_priv_user,
+use crate::configurer::{
+    self, enter_ns_by_pid, get_self_netns_inode, ConfigRes, NetnsInfo, NetnspState, nsfd, nsfd_by_path,
 };
 use ini;
 
@@ -66,33 +69,34 @@ pub type ActiveProfiles = HashMap<i32, ProfileState>;
 pub struct ProfileState {
     // root-most process that is to be in the netns
     pub pid: i32,
-    // eg. com.github.tchx84.Flatseal
-    pub flatpak_app_id: String,
-    // Netns Profile in effect
-    pub profile: String,
+    // eg. com.github.tchx84.Flatseal, if for flatpak
+    pub app_id: String,
     // Profile in demand, as configured
     pub default_pofile: String,
-    // if configured
-    pub net: Option<NetnsInfo>,
+    pub net: NetnsInfo,
 }
 
 pub struct WatcherState {
     netnsp: NetnspState,
-    daemons: RwLock<JoinSet<(String, Result<()>)>>,
+    daemons: RwLock<JoinSet<(String, anyhow::Result<()>)>>,
     configurer: configurer::Configurer,
+    send_task: UnboundedSender<Pin<Box<dyn Future<Output = (String, Result<()>)> + Send>>>,
+    recv_task: UnboundedReceiver<Pin<Box<dyn Future<Output = (String, Result<()>)> + Send>>>,
 }
 
 impl WatcherState {
     pub async fn create(
         configurer: configurer::Configurer,
-        state: NetnspState
+        state: NetnspState,
     ) -> Result<WatcherState> {
         log::info!("watcher started");
-
+        let (send_task, recv_task) = unbounded_channel();
         let mut n = WatcherState {
             netnsp: state,
             daemons: RwLock::new(JoinSet::new()),
             configurer,
+            send_task,
+            recv_task,
         };
         n.auth().await?;
 
@@ -118,34 +122,140 @@ impl WatcherState {
 
         Ok(())
     }
-    pub async fn start(self) -> Result<()> {
+    pub async fn start(mut self) -> Result<()> {
         // start all watching coroutines
-        let arc = Arc::new(self);
-        let mut takeit = arc.daemons.write().await;
+
+        self.cleanup()?;
+
+        let mut arc = Arc::new(self);
         let arc1 = arc.clone();
-        (*takeit).spawn(async move {
-            let ownit = arc1;
-            let res = fs_watcher(&ownit).await;
+        let f = async move {
+            let mut ownit: Arc<WatcherState> = arc1;
+            let m = unsafe { Arc::get_mut_unchecked(&mut ownit) };
+            let res = fs_watcher(m).await;
             ("fs_watcher".to_owned(), res)
-        });
+        };
+        // circumventing borrow checker
+        let m = unsafe { Arc::get_mut_unchecked(&mut arc) };
+        m.send_task.send(Box::pin(f)).ok().unwrap();
+
+        loop {
+            tokio::select! {
+                maybe_task = m.recv_task.recv() => {
+                    log::trace!("received new daemon");
+                    if let Some(task) = maybe_task {
+
+                         m.daemons.write().await.spawn(task);
+                    }
+                },
+                maybe_res =  {
+                    let f1 = async {
+                        let mut joinset = m.daemons.write().await;
+                        joinset.join_next().await
+                    };
+                    f1
+                } => {
+                    if let Some(res) = maybe_res {
+                        let res = res?;
+                        log::error!("{:?}", res);
+                    }
+                }
+            }
+        }
 
         Ok(())
     }
-    pub async fn apply_profile_by_pid(&self, pid: i32, base_name: &str) -> Result<()> {
-        let ex = self.netnsp.res.flatpak.as_ref().unwrap().get(&pid);
-        if ex.is_some() {
-            anyhow::bail!("unexpected repeated profile application")
-        }
+    pub fn get_flatpak_profile_state(&mut self, pid: i32) -> Option<&mut ProfileState> {
+        self.netnsp.res.flatpak.as_mut().unwrap().get_mut(&pid)
+    }
+    pub async fn apply_profile_by_pid(&mut self, pid: i32) -> Result<()> {
+        let ps = self.netnsp.res.flatpak.as_ref().unwrap().get(&pid).unwrap();
+        anyhow::ensure!(!ps.default_pofile.is_empty());
         let process = procfs::process::Process::new(pid)?;
         let o: OsString = OsString::from("net");
         let nss = process.namespaces()?;
         let proc_ns = nss
             .get(&o)
             .ok_or(anyhow::anyhow!("ns/net not found for given pid"))?;
-        let r = std::fs::File::open(&proc_ns.path)?;
-        configurer::config_pre_enter_ns(base_name, configurer::veth_from_base, &self.configurer, r.as_raw_fd())
-            .await?;
-        // let inames = ;
+        let r = nsfd_by_path(&proc_ns.path.as_path())?;
+        configurer::config_pre_enter_ns(&ps.net, &self.configurer, r.as_raw_fd()).await?;
+
+        // may be flatpak app_id or that of other sandbox systems
+        let task_name = format!("netnsp-sub of {}", ps.net.base_name);
+
+        let mut path = std::env::current_exe()?;
+        path.pop();
+        path.push("netnsp-sub");
+
+        let default_pofile = ps.default_pofile.to_owned();
+
+        let tsk = async move {
+            (
+                task_name,
+                async move {
+                    use crate::util::get_non_priv_user;
+                    let (puid, pgid) = get_non_priv_user(None, None)?;
+                    use nix::fcntl::{open, OFlag};
+                    use nix::sys::stat::Mode;
+                    let process = procfs::process::Process::new(pid)?;
+                    let o: OsString = OsString::from("net");
+                    let nss = process.namespaces()?;
+                    let proc_ns = nss
+                        .get(&o)
+                        .ok_or(anyhow::anyhow!("ns/net not found for given pid"))?;
+                    let fd = open(&proc_ns.path, OFlag::O_RDONLY, Mode::empty()).unwrap();
+                    let mut cmd: tokio::process::Child = tokio::process::Command::new(path.clone())
+                        .arg(default_pofile)
+                        .arg(puid.to_string())
+                        .arg(pgid.to_string())
+                        .arg(fd.to_string())
+                        .arg(pid.to_string())
+                        .uid(0)
+                        .spawn()
+                        .unwrap();
+                    let task = cmd.wait();
+                    let proc_finish = async {
+                        let f = unsafe { pidfd::PidFd::open(pid, 0)?.into_future() };
+                        f.await?;
+                        log::debug!("process {} exited", pid);
+                        Ok(())
+                    };
+
+                    tokio::select! {
+                        res = task => {
+                            if res.is_err() {
+                                return res.map(|_| ()).map_err(anyhow::Error::from);
+                            }
+                        },
+                        _ = proc_finish => {
+                            let r = kill(Pid::from_raw(cmd.id().unwrap().try_into().unwrap()),Signal::SIGTERM);
+                            log::debug!("sigterm to netnsp-sub, {:?}", r);
+                        }
+                    };
+
+                    Ok(())
+                }
+                .await,
+            )
+        };
+
+        self.send_task.send(Box::pin(tsk)).ok().unwrap();
+        Ok(())
+    }
+    pub fn cleanup(&mut self) -> Result<()> {
+        // on my machine, dead processes' pids get removed from /proc
+        if let Some(flat) = self.netnsp.res.flatpak.as_mut() {
+            use procfs::process::*;
+            let allproc: ProcessesIter = all_processes()?;
+            let res = allproc.into_iter().filter_map(|p| p.ok()).map(|p| p.pid);
+            let exiset: HashSet<i32> = HashSet::from_iter(res);
+            let ite = flat.keys().map(|x| *x);
+            let confset: HashSet<i32> = HashSet::from_iter(ite);
+            // all that exists in Conf but not in Exi
+            let to_remove = &confset - &exiset;
+            flat.retain(|k, _v| !to_remove.contains(k));
+        }
+
         Ok(())
     }
 }
@@ -192,22 +302,21 @@ async fn read_pid_file_from_dir(dir_path: &Path) -> Result<Option<String>> {
 async fn process_event<'a>(
     ev: inotify::Event<std::ffi::OsString>,
     flatpak_dir: &PathBuf,
-    watcher: &WatcherState,
+    watcher: &mut WatcherState,
     once_set: &mut HashSet<u32>,
 ) -> Result<()> {
     // it may be an instance dir, or elses
     if let Some(fname) = ev.name.clone() {
         let fname = fname.to_string_lossy().into_owned();
-        if ev
-            .mask
-            .intersects(EventMask::ISDIR | EventMask::CLOSE_NOWRITE)
-        {
-            let instance = fname.parse::<u32>();
-
-            if let stdRes::Ok(iid) = instance {
-                if !once_set.contains(&iid) {
-                    // do this once per instance start
+        let instance = fname.parse::<u32>();
+        if let stdRes::Ok(iid) = instance {
+            if !once_set.contains(&iid) {
+                if ev
+                    .mask
+                    .intersects(EventMask::ISDIR | EventMask::CLOSE_NOWRITE)
+                {
                     once_set.insert(iid);
+                    // so that, once an instance has such an event, all subsequent events are ignored for it.
                     let mut instance_dir = flatpak_dir.clone();
                     instance_dir.push(fname.clone());
 
@@ -237,6 +346,7 @@ async fn process_event<'a>(
                     let profile_or_not = watcher.netnsp.conf.flatpak.get(flatpak_id);
 
                     if let Some(profile_name) = profile_or_not {
+                        let profile_name = profile_name.to_owned();
                         let pid_f = read_pid_file_from_dir(&instance_dir).await?;
                         if pid_f.is_none() {
                             log::error!("unexpected, pid_f is none, {:?}", &ev);
@@ -250,10 +360,30 @@ async fn process_event<'a>(
                             if children.len() != 1 {
                                 log::info!("unexpected number of threads, {:?}", proc);
                             }
-                            let the_child_pid = children[0]; // pid of the process, in unshared netns
-                            watcher
-                                .apply_profile_by_pid(the_child_pid as i32, flatpak_id)
-                                .await?;
+                            let the_child_pid = children[0] as i32; // pid of the process, in unshared netns
+                            let ifany = watcher.get_flatpak_profile_state(the_child_pid);
+                            let mut base_name4flatpak = flatpak_id.to_owned();
+                            base_name4flatpak.push_str(&the_child_pid.to_string());
+                            match ifany {
+                                Some(prof) => {
+                                    prof.default_pofile = profile_name;
+                                }
+                                None => {
+                                    let neti =
+                                        watcher.netnsp.new_netinfo(base_name4flatpak).await?;
+                                    watcher.netnsp.res.flatpak.as_mut().unwrap().insert(
+                                        the_child_pid,
+                                        ProfileState {
+                                            pid: the_child_pid,
+                                            app_id: profile_name.to_owned(),
+                                            default_pofile: profile_name,
+                                            net: neti,
+                                        },
+                                    );
+                                }
+                            }
+                            watcher.netnsp.dump().await?;
+                            watcher.apply_profile_by_pid(the_child_pid as i32).await?;
                         }
                     } else {
                         log::info!(
@@ -321,9 +451,11 @@ async fn process_event<'a>(
 // but, `info` file links the flatpak id and the process
 
 // for flatpak and more
-pub async fn fs_watcher<'a>(watcher: &WatcherState) -> Result<()> {
+pub async fn fs_watcher<'a>(watcher: &mut WatcherState) -> Result<()> {
+    use crate::util::get_non_priv_user;
     let (uid, _) = get_non_priv_user(None, None)?;
     let flatpak_dir = PathBuf::from(format!("/run/user/{}/.flatpak/", uid));
+    log::debug!("flatpak watcher started");
     let mut inoti = inotify::Inotify::init()?;
     inoti
         .watches()
@@ -343,7 +475,7 @@ pub async fn fs_watcher<'a>(watcher: &WatcherState) -> Result<()> {
         // pid file -> bwrap --args 41 com.github.tchx84.Flatseal
         match event_or_error {
             stdRes::Ok(ev) => {
-                println!("event: {:?}", &ev);
+                // log::trace!("event: {:?}", &ev);
                 let ino = stream.into_inotify();
                 match process_event(ev, &flatpak_dir, watcher, &mut once_set).await {
                     anyhow::Result::Ok(_) => {}

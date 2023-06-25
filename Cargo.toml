@@ -21,7 +21,6 @@ serde_json = "1.0.96"
 anyhow = { version = "1.0.71", features = ["backtrace"] }
 libc = "0.2.143"
 procfs = "0.15.1"
-blake3 = "1.4.0"
 rtnetlink = "0.12.0"
 netlink-packet-route = "0.15.0"
 netns-rs = "0.1.0"
@@ -31,6 +30,8 @@ zbus = { version = "3.13.1", features = ["tokio"] }
 inotify = "0.10.1"
 rust-ini = "0.19.0"
 rustables = { branch = "netnsp", git = "https://github.com/planetoryd/rustables" }
+either = "1.8.1"
+pidfd = "0.2.4"
 
 [profile.release]
 strip = true

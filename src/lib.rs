@@ -2,6 +2,7 @@
 #![feature(async_closure)]
 #![feature(exit_status_error)]
 #![feature(setgroups)]
+#![feature(get_mut_unchecked)]
 use flexi_logger::FileSpec;
 
 use futures::{FutureExt, TryFutureExt};
@@ -19,7 +20,7 @@ use std::{
     borrow::{Borrow, Cow},
     ffi::{CStr, CString, OsString},
     net::{Ipv4Addr, SocketAddrV6},
-    os::{unix::process::CommandExt, fd::RawFd},
+    os::{fd::RawFd, unix::process::CommandExt},
     path::{Path, PathBuf},
     process::{exit, Stdio},
 };
@@ -33,14 +34,11 @@ use tokio::{
     process::Command,
 };
 pub mod configurer;
-pub mod ip_gen;
 mod nft;
 pub mod util;
 pub mod watcher;
 
 use configurer::*;
-
-use ip_gen::gen_ip;
 
 
 // Standard procedure
@@ -48,7 +46,6 @@ use ip_gen::gen_ip;
 // Kill other running processes, suspected
 // Fork, setns, drop privs, start daemons
 pub static mut logger: Option<flexi_logger::LoggerHandle> = None;
-
 
 pub fn substitute_argv<'a>(n_info: &'a NetnsInfo, argv: &mut Vec<String>) {
     let mut sub_map: HashMap<String, &String> = HashMap::new();
@@ -71,12 +68,15 @@ pub fn substitute_argv<'a>(n_info: &'a NetnsInfo, argv: &mut Vec<String>) {
 #[test]
 fn test_substitute_argv() {
     let n_info = NetnsInfo {
+        base_name: "x".to_owned(),
         subnet_veth: "eth0".to_string(),
         subnet6_veth: "eth1".to_string(),
         ip_vh: "192.168.0.1".to_string(),
         ip6_vh: "2001:db8::1".to_string(),
         ip_vn: "192.168.0.2".to_string(),
         ip6_vn: "2001:db8::2".to_string(),
+        veth_base_name: "ss".to_owned(),
+        id: 2
     };
 
     let mut argv = vec![
@@ -117,15 +117,21 @@ pub fn kill_suspected() {
     }
 }
 
+// first four args must be Some()
 pub async fn inner_daemon(
-    ns_path: String,
-    ns_name: &str,
+    profile: Option<String>,
     uid: Option<String>,
     gid: Option<String>,
-    pid: Option<String>,
+    fd: Option<String>,
+    pid: Option<String>, // for non-persistent netns
 ) -> Result<()> {
     let mut tun_target_port = 9909;
     use tidy_tuntap::{flags, Tun};
+    // enters the netns
+    // add addrs to the veth
+    // makes a tun
+    // runs daemons
+
     unsafe {
         log::trace!("set logger");
         // logger = Some(
@@ -145,45 +151,34 @@ pub async fn inner_daemon(
         );
     }
 
-    let path = Path::new("./netnsp.json");
-    let mut file = File::open(path).await?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).await?;
-    drop(file); // drop it for safety
+    let profile = profile.unwrap();
+    let fd = fd.unwrap().parse()?;
 
-    let config: ConfigRes = serde_json::from_str(&contents)?;
+    let mut state = NetnspState::load(Default::default()).await?;
 
-    let path = Path::new("./secret.json");
-    let mut file = File::open(path)
-        .await
-        .with_context(|| format!("can not open secrets.json at {:?}", path))?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).await?;
-    drop(file);
+    let config: ConfigRes = state.res;
+    let secret: Secret = state.conf;
 
-    let secret: Secret = serde_json::from_str(&contents)?;
-
-    log::info!("netns-proxy of {ns_path}, sub-process started");
+    log::info!("netns-proxy of profile {profile}, sub-process started");
 
     // get into a process' netns
-    if let Some(pi) = pid {
-        let pi: i32 = pi.parse()?;
-        enter_ns_by_pid(pi)?;
-    } else {
-        enter_ns_by_name(ns_name).await?;
-    }
+    enter_ns_by_fd(fd)?;
 
     let tun_name = "s_tun";
 
-    let ns_config = config
-        .netns_info
-        .get(ns_name)
-        .ok_or(anyhow::anyhow!("Netns info not available for {ns_name}"))?;
+    let netconf = if pid.is_none() {
+        log::trace!("pid not supplied for netnsp-sub");
+        config.netns_info.get(&profile).unwrap()
+    } else {
+        // assumption: PIDs in the config do not collide
+        // which stands if we run it from the same PID namespace all along
+        config.try_get_netinfo(pid.as_ref().unwrap().parse()?)?
+    };
 
     let configurer = Configurer::new();
 
     configurer.set_up("lo").await?;
-    configurer.add_addrs_guest(ns_name, ns_config).await?;
+    configurer.add_addrs_guest(&netconf.veth_base_name, netconf).await?;
 
     let tun = Tun::new(tun_name, false)?; // prepare a TUN for tun2socks, as root.
                                           // the TUN::new here creates a non-persistent TUN
@@ -203,7 +198,7 @@ pub async fn inner_daemon(
 
     let r_ui: u32;
     let r_gi: u32;
-
+    use util::get_non_priv_user;
     (r_ui, r_gi) = get_non_priv_user(uid, gid)?;
 
     // the uid and gid for non-privileged processes
@@ -214,15 +209,17 @@ pub async fn inner_daemon(
     assert!(gi.as_raw() != 0);
     log::debug!("unprileged processes will be run with, gid {gi}, uid {ui}");
 
-    let params = &secret.params[ns_name];
+    let params = &secret.params[&profile];
     if let Some(tp) = params.hport {
         tun_target_port = tp;
     }
     let mut proc_set = tokio::task::JoinSet::new();
+    let ip_vh: IpNetwork = netconf.ip_vh.parse()?;
+    let ip_vh_ip = ip_vh.ip().to_string() ;
     let mut base_prxy_v4 =
-        "socks5://".to_owned() + &ns_config.ip_vh + ":" + &tun_target_port.to_string();
+        "socks5://".to_owned() + &ip_vh_ip + ":" + &tun_target_port.to_string();
     if params.hport.is_some() {
-        base_prxy_v4 = format!("socks5://{}:{}", &ns_config.ip_vh, params.hport.unwrap());
+        base_prxy_v4 = format!("socks5://{}:{}", &ip_vh_ip, params.hport.unwrap());
     }
     if params.chain {
         // so, this takes precedence
@@ -239,11 +236,12 @@ pub async fn inner_daemon(
     let stdout = tun2h.stdout.take().unwrap();
     let reader = tokio::io::BufReader::new(stdout).lines();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let pre = format!("{}/tun2socks", ns_name);
+    let pre = format!("{}/tun2socks", netconf.base_name);
     tokio::spawn(watch_log(reader, Some(tx), pre));
     rx.await?;
     configurer.set_up(tun_name).await?;
-    configurer.set_up(&veth_from_base(ns_name, false)).await?;
+    let vn = &veth_from_base(&netconf.veth_base_name, false);
+    configurer.set_up(&vn).await?;
     configurer
         .ip_add_route(tun_name, None, Some(true))
         .await
@@ -303,7 +301,7 @@ pub async fn inner_daemon(
     dns_async.stdout(Stdio::piped());
     dns_async.stderr(Stdio::piped());
     let mut dnsh = dns_async.spawn()?;
-    let pre = format!("{}/dnsproxy", ns_name);
+    let pre = format!("{}/dnsproxy", &netconf.base_name);
     watch_both(&mut dnsh, pre, None).await?;
     proc_set.spawn((async move || {
         dnsh.wait()
@@ -316,7 +314,7 @@ pub async fn inner_daemon(
     if let Some(cmd) = &params.cmd {
         let mut uproc = std::process::Command::new(&cmd.program);
         let mut cmd_c: NetnsParamCmd = cmd.to_owned();
-        substitute_argv(&ns_config, &mut cmd_c.argv);
+        substitute_argv(&netconf, &mut cmd_c.argv);
 
         uproc.uid(ui.into()).gid(gi.into()).groups(&[gi.into()]);
         uproc.args(&cmd_c.argv);
@@ -324,7 +322,7 @@ pub async fn inner_daemon(
         uproc_async.stdout(Stdio::piped());
         uproc_async.stderr(Stdio::piped());
         let mut uproch = uproc_async.spawn()?;
-        let pre = format!("{}/cmd", ns_name);
+        let pre = format!("{}/cmd", &netconf.base_name);
         watch_both(&mut uproch, pre, None).await?;
 
         proc_set.spawn((async move || {
@@ -338,7 +336,7 @@ pub async fn inner_daemon(
 
     while let Some(r) = proc_set.join_next().await {
         let r = r??;
-        log::warn!("\"{}\" exited with {}", r.1, r.0)
+        log::warn!("\"{}\" exited with {}, for {}", r.1, r.0, &netconf.base_name)
     }
 
     Ok(())

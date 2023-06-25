@@ -8,8 +8,8 @@ use futures::{FutureExt, TryFutureExt};
 use ipnetwork::IpNetwork;
 use tokio::io::AsyncWriteExt;
 
+use crate::watcher;
 use crate::watcher::ActiveProfiles;
-use crate::{gen_ip, watcher};
 use anyhow::{anyhow, Context, Ok, Result};
 use netns_rs::{DefaultEnv, NetNs};
 use nix::{
@@ -18,6 +18,8 @@ use nix::{
     unistd::{getppid, setgroups, Gid, Uid},
 };
 use serde::{Deserialize, Serialize};
+use std::net::Ipv6Addr;
+use std::os::fd::FromRawFd;
 use std::{
     borrow::{Borrow, Cow},
     ffi::{CStr, CString, OsString},
@@ -28,15 +30,16 @@ use std::{
 };
 use std::{collections::HashMap, time::Duration};
 use std::{env, os::fd::AsRawFd};
-use sysinfo::{self, PidExt, ProcessExt, System, SystemExt};
 use tokio::{
     self,
     fs::File,
     io::{AsyncBufReadExt, AsyncReadExt},
     process::Command,
 };
+
 pub const NETNS_PATH: &str = "/run/netns/";
 
+// generated info and state store
 #[derive(Serialize, Deserialize, Default)]
 pub struct ConfigRes {
     // resultant/generated info for each persistent/named netns
@@ -44,6 +47,10 @@ pub struct ConfigRes {
     // Flatpak instance pids to profile names. Transient.
     pub flatpak: Option<ActiveProfiles>,
     pub root_inode: u64,
+    // Counter, for any number x > counter such that x is never used
+    // which ensures non-collision within the scope of one ConfigRes
+    // currently not in use. I don't bother deleting it
+    pub counter: u16,
 }
 
 // It may contain secret proxy parameters, so let's just consider them a secret as a whole
@@ -60,13 +67,17 @@ pub struct NetnspState {
     pub res: ConfigRes,
     pub conf: Secret,
     pub paths: ConfPaths,
-    nft_refresh_once: bool,
+    nft_refresh_once: bool, // TODO
 }
 
 pub struct ConfPaths {
     conf: String,
     res: String,
 }
+
+// Each instance has a unique NetnsInfo
+// identified by pid OR persistent name
+pub type InstanceID = either::Either<i32, String>;
 
 impl Default for ConfPaths {
     fn default() -> Self {
@@ -77,15 +88,29 @@ impl Default for ConfPaths {
     }
 }
 
+impl ConfigRes {
+    pub fn try_get_netinfo(&self, pid: i32) -> Result<&NetnsInfo> {
+        Ok(&self
+            .flatpak
+            .as_ref()
+            .ok_or_else(|| anyhow!("no flatpak: HashMap"))?
+            .get(&pid)
+            .ok_or_else(|| anyhow!("Failed to retrieve net info for process {}", pid))?
+            .net)
+        // map1.get(key).or_else(|| map2.get(key)).unwrap_or(&"not found");
+    }
+}
+
 impl NetnspState {
     // for nftables
-    pub async fn get_all_link_names(&self) -> Result<Vec<String>> {
+    pub async fn get_link_names_persistent(&self) -> Result<Vec<String>> {
         let base_names: Vec<&String> = self
             .res
             .netns_info
-            .keys()
-            .chain(self.conf.flatpak.keys())
+            .iter()
+            .map(|x| &x.1.veth_base_name)
             .collect();
+
         let veth_host: Vec<String> = base_names
             .iter()
             .map(|base| veth_from_base(base, true))
@@ -94,7 +119,7 @@ impl NetnspState {
     }
     // do a full sync of firewall intention
     pub async fn apply_nft(&self) -> Result<()> {
-        let i_names = self.get_all_link_names().await?;
+        let i_names = self.get_link_names_persistent().await?;
         let inames = i_names.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
 
         nft::apply_block_forwad(&inames)?;
@@ -112,7 +137,7 @@ impl NetnspState {
         let mut batch: Batch = Batch::new();
         batch.add(&rule, MsgType::Add);
         batch.send()?;
-        
+
         Ok(())
     }
     pub async fn load(paths: ConfPaths) -> Result<Self> {
@@ -155,6 +180,77 @@ impl NetnspState {
         file.write_all(serialized.as_bytes()).await?;
         Ok(())
     }
+    pub fn get_avail_id(&self) -> Result<u16> {
+        const max: u16 = 255;
+        let mut ids: Vec<u16> = self
+            .res
+            .netns_info
+            .iter()
+            .map(|x| x.1.id)
+            .chain(
+                self.res
+                    .flatpak
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.1.net.id),
+            )
+            .collect();
+        ids.sort();
+        let mut i = 0;
+        while i + 1 < ids.len() {
+            if ids[i + 1] - ids[i] > 1 {
+                return Ok(ids[i] + 1);
+            }
+            i += 1;
+        }
+        if ids.len() > 0 {
+            if ids.last().unwrap() < &max {
+                return Ok(ids.last().unwrap() + 1);
+            }
+            Err(anyhow::anyhow!("no id avail"))
+        } else {
+            Ok(0)
+        }
+    }
+    // generate NetnsInfo for a new isntance, ie. non-duplicating IPs
+    pub async fn new_netinfo(&self, base_name: String) -> Result<NetnsInfo> {
+        let id: u16 = self.get_avail_id()?;
+        let id8: u8 = id.try_into()?;
+        let pre4: u8 = 24;
+        let pre6: u8 = 112;
+        let subnet_veth: IpNetwork = IpNetwork::new(Ipv4Addr::new(10, 27, id8, 0).into(), pre4)?;
+        let subnet6_veth: IpNetwork = IpNetwork::new(
+            Ipv6Addr::new(0xfc0f, 0x2cdd, 0xeeff, 0, 0, 0, id, 0).into(),
+            pre6,
+        )?;
+        let ip_vh: IpNetwork = IpNetwork::new(Ipv4Addr::new(10, 27, id8, 1).into(), pre4)?;
+        let ip_vn: IpNetwork = IpNetwork::new(Ipv4Addr::new(10, 27, id8, 2).into(), pre4)?;
+        let ip6_vh: IpNetwork = IpNetwork::new(
+            Ipv6Addr::new(0xfc0f, 0x2cdd, 0xeeff, 0, 0, 0, id, 1).into(),
+            pre6,
+        )?;
+        let ip6_vn: IpNetwork = IpNetwork::new(
+            Ipv6Addr::new(0xfc0f, 0x2cdd, 0xeeff, 0, 0, 0, id, 2).into(),
+            pre6,
+        )?;
+
+        Ok(NetnsInfo {
+            base_name: base_name.clone(),
+            subnet_veth: subnet_veth.to_string(),
+            subnet6_veth: subnet6_veth.to_string(),
+            ip_vh: ip_vh.to_string(),
+            ip_vn: ip_vn.to_string(),
+            ip6_vh: ip6_vh.to_string(),
+            ip6_vn: ip6_vn.to_string(),
+            veth_base_name: if base_name.len() < 12 {
+                base_name
+            } else {
+                "nsp".to_owned() + &self.res.counter.to_string()
+            },
+            id: id.into(),
+        })
+    }
 }
 
 // aka, Profiles
@@ -186,12 +282,15 @@ pub struct NetnsParamCmd {
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct NetnsInfo {
+    pub base_name: String, // has no length limit
     pub subnet_veth: String,
     pub subnet6_veth: String,
     pub ip_vh: String,
     pub ip6_vh: String,
     pub ip_vn: String,
     pub ip6_vn: String,
+    pub veth_base_name: String, // veth names have length limit
+    pub id: u16,                // unique
 }
 
 fn set_initgroups(user: &nix::unistd::User, gid: u32) {
@@ -238,11 +337,19 @@ pub fn drop_privs1(gi: Gid, ui: Uid) -> Result<()> {
     Ok(())
 }
 
-pub fn nsfd(ns_name: &str) -> Result<std::fs::File> {
+// fd will not have CLOEXEC
+pub fn nsfd(ns_name: &str) -> Result<RawFd> {
+    use nix::fcntl::{open, OFlag};
+    use nix::sys::stat::Mode;
     let mut p = PathBuf::from(NETNS_PATH);
     p.push(ns_name);
-    let r = std::fs::File::open(p)?;
-    Ok(r)
+    open(&p, OFlag::O_RDONLY, Mode::empty()).map_err(anyhow::Error::from)
+}
+
+pub fn nsfd_by_path(p: &Path) -> Result<RawFd> {
+    use nix::fcntl::{open, OFlag};
+    use nix::sys::stat::Mode;
+    open(p, OFlag::O_RDONLY, Mode::empty()).map_err(anyhow::Error::from)
 }
 
 pub fn ns_exists(ns_name: &str) -> Result<bool> {
@@ -266,227 +373,118 @@ pub struct Configurer {
 
 use crate::nft;
 
-// Trys to add an netns. If it exists, remove it.
-// Get the NS up.
-pub async fn config_ns(
-    ns_name: &str,
-    f: fn(&str, bool) -> String,
-    config_res: &mut ConfigRes,
+// in the root ns
+// creates a pair of veths, and moves one into netns
+// returns addrs
+// must be used without CLOEXEC
+pub async fn config_pre_enter_ns(
+    neti: &NetnsInfo,
     configurer: &Configurer,
+    fd: RawFd,
 ) -> Result<()> {
-    Configurer::add_netns(ns_name).await?;
-    let vpair_skipped = configurer.add_veth_pair(ns_name).await?;
-
-    // Get a subnet in 10.0 for the veth pair
-    let subnet_veth =
-        gen_ip("10.0.0.0/8".parse().unwrap(), ns_name.to_string(), None, 16).to_string();
-    let subnet6_veth =
-        gen_ip("fc00::/16".parse().unwrap(), ns_name.to_string(), None, 125).to_string();
-
-    let ip_vh = gen_ip(
-        "10.0.0.0/8".parse().unwrap(),
-        ns_name.to_string(),
-        Some("vh".to_string()),
-        16,
-    )
-    .ip();
-    let ip_vn = gen_ip(
-        "10.0.0.0/8".parse().unwrap(),
-        ns_name.to_string(),
-        Some("vn".to_string()),
-        16,
-    )
-    .ip();
-
-    let ip6_vh = gen_ip(
-        "fc00::/16".parse().unwrap(),
-        ns_name.to_string(),
-        Some("ip6vh".to_string()),
-        125,
-    )
-    .ip();
-    let ip6_vn = gen_ip(
-        "fc00::/16".parse().unwrap(),
-        ns_name.to_string(),
-        Some("ip6vn".to_string()),
-        125,
-    )
-    .ip();
-
-    let info = NetnsInfo {
-        subnet_veth: subnet_veth.clone(),
-        subnet6_veth: subnet6_veth.clone(),
-        ip_vh: ip_vh.to_string(),
-        ip6_vh: ip6_vh.to_string(),
-        ip_vn: ip_vn.to_string(),
-        ip6_vn: ip6_vn.to_string(),
-    };
+    configurer.add_veth_pair(&neti.veth_base_name).await?;
+    // we always get a fresh pair of veths after that
 
     configurer
         .add_addr_dev(
-            (info.ip_vh.clone() + "/16").parse()?,
-            f(&ns_name, true).as_ref(),
+            neti.ip_vh.parse()?,
+            &veth_from_base(&neti.veth_base_name, true).as_ref(),
         )
         .await?;
     configurer
         .add_addr_dev(
-            (info.ip6_vh.clone() + "/125").parse()?,
-            f(&ns_name, true).as_ref(),
+            neti.ip6_vh.parse()?,
+            &veth_from_base(&neti.veth_base_name, true).as_ref(),
         )
         .await?;
-    configurer.set_up(&f(&ns_name, true)).await?;
+    configurer
+        .set_up(&veth_from_base(&neti.veth_base_name, true))
+        .await?;
 
-    if !vpair_skipped {
-        configurer
-            .add_addr_dev(
-                (info.ip_vn.clone() + "/16").parse()?,
-                f(&ns_name, false).as_ref(),
-            )
-            .await?;
-        configurer
-            .add_addr_dev(
-                (info.ip6_vn.clone() + "/125").parse()?,
-                f(&ns_name, false).as_ref(),
-            )
-            .await?;
-        configurer.set_up(&f(&ns_name, true)).await?;
-    } else {
-        // ensure it does not exist
-        let linkmsg_veth_ns = configurer.get_link(&f(&ns_name, false)).await;
-        anyhow::ensure!(linkmsg_veth_ns.is_err())
-    }
+    configurer
+        .add_addr_dev(
+            neti.ip_vn.parse()?,
+            &veth_from_base(&neti.veth_base_name, false),
+        )
+        .await?;
+    configurer
+        .add_addr_dev(
+            neti.ip6_vn.parse()?,
+            &veth_from_base(&neti.veth_base_name, false),
+        )
+        .await?;
+    configurer
+        .set_up(&veth_from_base(&neti.veth_base_name, false))
+        .await?;
 
-    log::info!("veth subnet {subnet_veth}, {subnet6_veth}, host {ip_vh}, {ip6_vh}, guest {ip_vn}, {ip6_vn}");
+    // briefly enter the ns
+    // have to use a process, or tokio will be messed up
 
-    assert!(!ip_vh.is_global());
-    assert!(!ip6_vh.is_global());
-    configurer.ip_setns(ns_name, &f(ns_name, false)).await?;
-    config_res.netns_info.insert(ns_name.to_owned(), info);
+    let mut path = std::env::current_exe()?;
+    path.pop();
+    path.push("netnsp-sub");
 
-    log::trace!("ns {ns_name} configured");
+    let mut cmd: tokio::process::Child = tokio::process::Command::new(path.clone())
+        .arg(fd.to_string())
+        .arg(&neti.veth_base_name)
+        .uid(0)
+        .spawn()
+        .unwrap();
+    cmd.wait().await?;
+    
+    // move a veth into ns
+    configurer
+        .ip_setns_by_fd(fd, &veth_from_base(&neti.veth_base_name, false))
+        .await?;
+
+    log::trace!("ns {} configured", neti.base_name);
+    nix::unistd::close(fd)?;
     Ok(())
 }
 
-pub async fn config_pre_enter_ns(
-    base_name: &str,
-    veth_name: fn(&str, bool) -> String,
-    configurer: &Configurer,
-    fd: RawFd,
-) -> Result<NetnsInfo> {
-    let vpair_skipped = configurer.add_veth_pair(base_name).await?;
-
-    // Get a subnet in 10.0 for the veth pair
-    let subnet_veth = gen_ip(
-        "10.0.0.0/8".parse().unwrap(),
-        base_name.to_string(),
-        None,
-        16,
-    )
-    .to_string();
-    let subnet6_veth = gen_ip(
-        "fc00::/16".parse().unwrap(),
-        base_name.to_string(),
-        None,
-        125,
-    )
-    .to_string();
-
-    let ip_vh = gen_ip(
-        "10.0.0.0/8".parse().unwrap(),
-        base_name.to_string(),
-        Some("vh".to_string()),
-        16,
-    )
-    .ip();
-    let ip_vn = gen_ip(
-        "10.0.0.0/8".parse().unwrap(),
-        base_name.to_string(),
-        Some("vn".to_string()),
-        16,
-    )
-    .ip();
-
-    let ip6_vh = gen_ip(
-        "fc00::/16".parse().unwrap(),
-        base_name.to_string(),
-        Some("ip6vh".to_string()),
-        125,
-    )
-    .ip();
-    let ip6_vn = gen_ip(
-        "fc00::/16".parse().unwrap(),
-        base_name.to_string(),
-        Some("ip6vn".to_string()),
-        125,
-    )
-    .ip();
-
-    let info = NetnsInfo {
-        subnet_veth: subnet_veth.clone(),
-        subnet6_veth: subnet6_veth.clone(),
-        ip_vh: ip_vh.to_string(),
-        ip6_vh: ip6_vh.to_string(),
-        ip_vn: ip_vn.to_string(),
-        ip6_vn: ip6_vn.to_string(),
-    };
-
-    configurer
-        .add_addr_dev(
-            (info.ip_vh.clone() + "/16").parse()?,
-            veth_name(&base_name, true).as_ref(),
-        )
-        .await?;
-    configurer
-        .add_addr_dev(
-            (info.ip6_vh.clone() + "/125").parse()?,
-            veth_name(&base_name, true).as_ref(),
-        )
-        .await?;
-    configurer.set_up(&veth_name(&base_name, true)).await?;
-
-    if !vpair_skipped {
-        configurer
-            .add_addr_dev(
-                (info.ip_vn.clone() + "/16").parse()?,
-                veth_name(&base_name, false).as_ref(),
-            )
-            .await?;
-        configurer
-            .add_addr_dev(
-                (info.ip6_vn.clone() + "/125").parse()?,
-                veth_name(&base_name, false).as_ref(),
-            )
-            .await?;
-        configurer.set_up(&veth_name(&base_name, true)).await?;
+pub async fn config_in_ns(fd: RawFd, veth_base_name: String) -> Result<()> {
+    enter_ns_by_fd(fd)?;
+    let configurer = Configurer::new();
+    let rh = configurer
+        .get_link(&veth_from_base(&veth_base_name, false))
+        .await;
+    if rh.is_err() {
+        // do nothing, and later netnsp-main will move a veth in
     } else {
-        // ensure it does not exist
-        let linkmsg_veth_ns = configurer.get_link(&veth_name(&base_name, false)).await;
-        anyhow::ensure!(linkmsg_veth_ns.is_err())
+        configurer
+            .handle
+            .link()
+            .del(rh.unwrap().header.index) // the one in root ns
+            .execute()
+            .await
+            .map_err(|e| anyhow!("removing {veth_base_name} veth in guest ns fails. {e}"))?;
     }
-
-    log::info!("veth subnet {subnet_veth}, {subnet6_veth}, host {ip_vh}, {ip6_vh}, guest {ip_vn}, {ip6_vn}");
-
-    assert!(!ip_vh.is_global());
-    assert!(!ip6_vh.is_global());
-    // move a veth into ns
-    configurer
-        .ip_setns_by_fd(fd, &veth_name(base_name, false))
-        .await?;
-
-    log::trace!("ns {} configured", base_name);
-    Ok(info)
+    Ok(())
 }
 
-pub async fn config_network(
-    ns_names: Vec<String>,
-    configrer: &Configurer,
-    state: &mut NetnspState,
-) -> Result<()> {
+pub async fn config_network(configrer: &Configurer, state: &mut NetnspState) -> Result<()> {
+    let ns_names: Vec<String> = state.profile_names();
     for ns in &ns_names {
-        config_ns(&ns, veth_from_base, &mut state.res, &configrer).await?;
-    }
+        let netinfo_o;
+        let netinfo;
+        match state.res.netns_info.get(ns) {
+            None => {
+                netinfo_o = state.new_netinfo(ns.clone()).await?;
+                state
+                    .res
+                    .netns_info
+                    .insert(ns.to_owned(), netinfo_o.clone());
+                netinfo = &netinfo_o
+            }
+            Some(n) => netinfo = n,
+        }
 
+        Configurer::add_netns(&ns).await?;
+        let fd = nsfd(&ns)?;
+        config_pre_enter_ns(&netinfo, configrer, fd.as_raw_fd()).await?;
+    }
     state.res.root_inode = get_pid1_netns_inode().await?;
+    state.dump().await?;
     state.apply_nft().await?;
     Ok(())
 }
@@ -513,7 +511,7 @@ pub fn get_self_netns_inode() -> Result<u64> {
     }
 }
 
-pub async fn get_self_netns() -> Result<netns_rs::NetNs> {
+pub fn get_self_netns() -> Result<netns_rs::NetNs> {
     use procfs::process::Process;
     let selfproc = Process::myself()?;
     let nslist = selfproc.namespaces()?;
@@ -532,7 +530,7 @@ pub async fn get_self_netns() -> Result<netns_rs::NetNs> {
 pub async fn self_netns_identify() -> Result<Option<(String, NetNs)>> {
     use netns_rs::get_from_path;
 
-    let selfns = get_self_netns().await?;
+    let selfns = get_self_netns()?;
     let path = Path::new(NETNS_PATH);
     for entry in path.read_dir()? {
         if let core::result::Result::Ok(entry) = entry {
@@ -566,6 +564,10 @@ impl Env for NsEnv {
 }
 
 pub fn veth_from_base(basename: &str, host: bool) -> String {
+    let mut basename = basename.to_owned();
+    if basename.len() > 12 {
+        unreachable!()
+    }
     if host {
         format!("{basename}_vh")
     } else {
@@ -595,6 +597,7 @@ impl Configurer {
         }
     }
     pub async fn set_up(&self, name: &str) -> Result<()> {
+        log::trace!("get link {} up", name);
         let mut links = self
             .handle
             .link()
@@ -618,37 +621,47 @@ impl Configurer {
             Err(anyhow!("link message None"))
         }
     }
-    pub async fn add_veth_pair(&self, ns_name: &str) -> Result<bool> {
-        let rh = self.get_link(&veth_from_base(ns_name, true)).await;
+    pub async fn add_veth_pair(&self, base_name: &str) -> Result<bool> {
+        // netlink would error if name is too long
+        let rh = self.get_link(&veth_from_base(base_name, true)).await;
 
         if rh.is_err() {
-            let r1 = self
-                .handle
+            // do nothing
+        } else {
+            // remove them
+            self.handle
                 .link()
-                .add()
-                .veth(
-                    veth_from_base(ns_name, true),
-                    veth_from_base(ns_name, false),
-                )
+                .del(rh.unwrap().header.index) // the one in root ns
                 .execute()
                 .await
-                .map_err(|e| anyhow!("adding {ns_name} veth pair fails. {e}"));
-            return match r1 {
-                Err(e) => {
-                    let rh = self.get_link(&veth_from_base(ns_name, false)).await;
-                    if rh.is_ok() {
-                        log::warn!(
-                            "Are you running from a sub-netns. {} exists",
-                            &veth_from_base(ns_name, false)
-                        );
-                    }
-                    Err(e)
+                .map_err(|e| anyhow!("removing {base_name} veth in root ns fails. {e}"))?;
+            // also the one in ns
+            // but it will be done by other fn later
+        };
+        let r1 = self
+            .handle
+            .link()
+            .add()
+            .veth(
+                veth_from_base(base_name, true),
+                veth_from_base(base_name, false),
+            )
+            .execute()
+            .await
+            .map_err(|e| anyhow!("adding {base_name} veth pair fails. {e}"));
+        return match r1 {
+            Err(e) => {
+                let rh = self.get_link(&veth_from_base(base_name, false)).await;
+                if rh.is_ok() {
+                    log::warn!(
+                        "Are you running from a sub-netns. {} exists. Or, you killed netnsproxy process half-way",
+                        &veth_from_base(base_name, false)
+                    );
                 }
-                _ => Ok(false), // veths dont exist, adding suceeded
-            };
-        } else {
-            Ok(true) // they already exist, and it skipped adding
-        }
+                Err(e)
+            }
+            _ => Ok(false), // veths dont exist, adding suceeded
+        };
     }
     pub async fn add_addr_dev(&self, addr: IpNetwork, dev: &str) -> Result<()> {
         let mut links = self
@@ -669,6 +682,7 @@ impl Configurer {
             if let Some(_addrmsg) = get_addr.try_next().await? {
                 Ok(())
             } else {
+                // the desired IP has not been added
                 self.handle
                     .address()
                     .add(link.header.index, addr.ip(), addr.prefix())
@@ -789,16 +803,17 @@ impl Configurer {
         }
     }
 
-    pub async fn add_addrs_guest(&self, ns_name: &str, info: &NetnsInfo) -> Result<()> {
+    pub async fn add_addrs_guest(&self, base_name: &str, info: &NetnsInfo) -> Result<()> {
+        log::trace!("add addrs in guest ns");
         self.add_addr_dev(
-            (info.ip_vn.clone() + "/16").parse()?,
-            veth_from_base(&ns_name, false).as_ref(),
+            info.ip_vn.clone().parse()?,
+            veth_from_base(&base_name, false).as_ref(),
         )
         .await
         .ok();
         self.add_addr_dev(
-            (info.ip6_vn.clone() + "/125").parse()?,
-            veth_from_base(&ns_name, false).as_ref(),
+            info.ip6_vn.clone().parse()?,
+            veth_from_base(&base_name, false).as_ref(),
         )
         .await
         .ok();
@@ -854,7 +869,9 @@ pub async fn watch_both(
 }
 
 pub async fn enter_ns_by_name(ns_name: &str) -> Result<()> {
-    nix::sched::setns(nsfd(ns_name)?.as_raw_fd(), CloneFlags::CLONE_NEWNET)?;
+    let fd = nsfd(ns_name)?;
+    nix::sched::setns(fd, CloneFlags::CLONE_NEWNET)?;
+    nix::unistd::close(fd)?;
     let got_ns = self_netns_identify().await?.ok_or_else(|| {
         anyhow::anyhow!("failed to identify netns. no matches under the given netns directory")
     })?;
@@ -865,9 +882,11 @@ pub async fn enter_ns_by_name(ns_name: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn enter_ns_by_fd(ns_fd: RawFd) -> Result<()> {
+pub fn enter_ns_by_fd(ns_fd: RawFd) -> Result<()> {
     nix::sched::setns(ns_fd, CloneFlags::CLONE_NEWNET)?;
-
+    let stat = nix::sys::stat::fstat(ns_fd)?;
+    let selfi = get_self_netns_inode()?;
+    anyhow::ensure!(stat.st_ino == selfi);
     Ok(())
 }
 
@@ -885,30 +904,4 @@ pub fn enter_ns_by_pid(pi: i32) -> Result<RawFd> {
     log::info!("current ns is from pid {}", pi);
 
     Ok(r.as_raw_fd())
-}
-
-pub fn get_non_priv_user(uid: Option<String>, gid: Option<String>) -> Result<(u32, u32)> {
-    let r_ui: u32;
-    let r_gi: u32;
-    if let core::result::Result::Ok(log_name) = env::var("SUDO_USER") {
-        // run from sudo
-        let log_user = users::get_user_by_name(&log_name).unwrap();
-        r_ui = log_user.uid();
-        r_gi = log_user.primary_group_id();
-    } else if uid.is_some() && gid.is_some() {
-        // supplied
-        r_gi = gid.unwrap().parse()?;
-        r_ui = uid.unwrap().parse()?;
-    } else {
-        // as child process of some non-root
-        let parent_pid = nix::unistd::getppid();
-        let parent_process = match procfs::process::Process::new(parent_pid.into()) {
-            core::result::Result::Ok(process) => process,
-            Err(_) => panic!("cannot access parent process"),
-        };
-        r_ui = parent_process.status()?.euid;
-        r_gi = parent_process.status()?.egid;
-    }
-
-    Ok((r_ui, r_gi))
 }

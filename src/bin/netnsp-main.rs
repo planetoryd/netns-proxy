@@ -2,7 +2,8 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use flexi_logger::FileSpec;
-use netns_proxy::watcher::fs_watcher;
+use libc::openat;
+use netns_proxy::{util::get_non_priv_user, watcher::fs_watcher};
 use nix::{
     sched::CloneFlags,
     unistd::{getppid, getresuid},
@@ -10,8 +11,12 @@ use nix::{
 use std::{
     collections::HashMap,
     env,
+    fs::OpenOptions,
     ops::Deref,
-    os::{fd::AsRawFd, unix::process::CommandExt},
+    os::{
+        fd::AsRawFd,
+        unix::{prelude::OpenOptionsExt, process::CommandExt},
+    },
     path::{Path, PathBuf},
 };
 use tokio::{
@@ -172,12 +177,10 @@ async fn main() -> Result<()> {
             use netns_proxy::watcher;
             let mut state = NetnspState::load(Default::default()).await?;
 
-            let hold = state.profile_names();
-            let ns_names1 = util::convert_strings_to_strs(&hold);
             let configrer = Configurer::new();
 
             if cli.pre {
-                match config_network(state.profile_names(), &configrer, &mut state).await {
+                match config_network(&configrer, &mut state).await {
                     Ok(_) => {
                         state.dump().await?;
 
@@ -186,44 +189,34 @@ async fn main() -> Result<()> {
                         sp.push("netnsp-sub");
                         let sp1 = sp.into_os_string();
                         // start daemons
-                        let parent_pid = nix::unistd::getppid();
-                        let parent_process = match Process::new(parent_pid.into()) {
-                            Ok(process) => process,
-                            Err(_) => panic!("cannot access parent process"),
-                        };
-                        let puid = parent_process.status()?.euid;
-                        let pgid = parent_process.status()?.egid;
-
+                        let (puid, pgid) = get_non_priv_user(None, None)?;
                         for name in state.profile_names() {
                             let spx = sp1.clone();
 
                             set.spawn(async move {
                                 let spx = spx.clone();
+                                let mut path = PathBuf::from(NETNS_PATH);
+                                path.push(name.clone());
+
+                                use nix::fcntl::{open, OFlag};
+                                use nix::sys::stat::Mode;
+                                let fd = open(&path, OFlag::O_RDONLY, Mode::empty()).unwrap();
 
                                 log::info!("wait on {:?}, ns {}", spx, &name);
 
                                 let mut cmd = Command::new(spx.clone())
-                                    .arg(&name)
+                                    .arg(name.clone())
                                     .arg(puid.to_string())
                                     .arg(pgid.to_string())
-                                    .uid(0)
+                                    .arg(fd.to_string())
+                                    .uid(0) // run it as root
                                     .spawn()
                                     .unwrap();
                                 let task = cmd.wait();
                                 let res = task.await;
+
                                 (name, res)
                             });
-                        }
-
-                        while let Some(res) = set.join_next().await {
-                            let idx = res.unwrap();
-                            log::error!(
-                                "{} exited, with {:?}. re-cap, {}/{} running",
-                                idx.0,
-                                idx.1,
-                                set.len(),
-                                ns_names1.len()
-                            );
                         }
                     }
                     Err(x) => {
@@ -238,11 +231,27 @@ async fn main() -> Result<()> {
                 }
             }
 
+            let hold = state.profile_names();
             let watcher = watcher::WatcherState::create(configrer, state).await?;
             let w_t = watcher.start();
+
+            let persis_ns = async move {
+                let ns_names1 = util::convert_strings_to_strs(&hold);
+                while let Some(res) = set.join_next().await {
+                    let idx = res.unwrap();
+                    log::error!(
+                        "{} exited, with {:?}. re-cap, {}/{} running",
+                        idx.0,
+                        idx.1,
+                        set.len(),
+                        ns_names1.len()
+                    );
+                }
+            };
             // exit when either of them exits, because it shouldn't.
             tokio::select! {
                 _ = tokio::spawn(w_t) => {}
+                _ = tokio::spawn(persis_ns) => {}
             }
         }
     }
