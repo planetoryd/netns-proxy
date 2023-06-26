@@ -17,12 +17,8 @@ use nix::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    borrow::{Borrow, Cow},
-    ffi::{CStr, CString, OsString},
-    net::{Ipv4Addr, SocketAddrV6},
-    os::{fd::RawFd, unix::process::CommandExt},
-    path::{Path, PathBuf},
-    process::{exit, Stdio},
+    os::{unix::process::CommandExt},
+    process::{Stdio},
 };
 use std::{collections::HashMap, time::Duration};
 use std::{env, os::fd::AsRawFd};

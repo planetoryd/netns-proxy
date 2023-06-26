@@ -2,6 +2,9 @@ use std::env;
 
 use anyhow::Ok;
 use anyhow::Result;
+use nix::sys::signal::kill;
+use nix::sys::signal::Signal;
+use nix::unistd::Pid;
 use procfs::process::Process;
 
 pub fn convert_strings_to_strs(strings: &Vec<String>) -> Vec<&str> {
@@ -35,7 +38,7 @@ pub fn get_non_priv_user(uid: Option<String>, gid: Option<String>) -> Result<(u3
 }
 
 #[test]
-fn t_pidfd() -> Result<()>{
+fn t_pidfd() -> Result<()> {
     use pidfd::PidFuture;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -48,4 +51,36 @@ fn t_pidfd() -> Result<()>{
             println!("finished");
             Ok(())
         })
+}
+
+#[test]
+fn get_all_child_pids() -> Result<()> {
+    use procfs::process::Process;
+
+    let su = Process::new(942129)?;
+    let mt = su.task_main_thread()?;
+    dbg!(mt.children()?);
+    let chi: Vec<u32> = su
+        .tasks()?
+        .filter_map(|t| t.ok().and_then(|x| x.children().ok()))
+        .flatten()
+        .collect();
+
+    dbg!(chi);
+    Ok(())
+}
+
+pub fn kill_children(pid: i32) -> Result<()> {
+    let su = Process::new(pid)?;
+    let chi: Vec<u32> = su
+        .tasks()?
+        .filter_map(|t| t.ok().and_then(|x| x.children().ok()))
+        .flatten()
+        .collect();
+
+    for c in chi {
+        kill(Pid::from_raw(c.try_into()?), Signal::SIGTERM).map_err(anyhow::Error::from)?;
+    }
+
+    Ok(())
 }

@@ -35,8 +35,10 @@ use tokio::{io::AsyncReadExt, sync::RwLock, task::JoinSet};
 use zbus::{dbus_interface, dbus_proxy, Connection};
 
 use crate::configurer::{
-    self, enter_ns_by_pid, get_self_netns_inode, ConfigRes, NetnsInfo, NetnspState, nsfd, nsfd_by_path,
+    self, enter_ns_by_pid, get_self_netns_inode, nsfd, nsfd_by_path, ConfigRes, NetnsInfo,
+    NetnspState,
 };
+use crate::util::kill_children;
 use ini;
 
 struct NetnspDbus;
@@ -213,6 +215,7 @@ impl WatcherState {
                         .uid(0)
                         .spawn()
                         .unwrap();
+                    let cmdpid = cmd.id().unwrap().try_into().unwrap();
                     let task = cmd.wait();
                     let proc_finish = async {
                         let f = unsafe { pidfd::PidFd::open(pid, 0)?.into_future() };
@@ -228,8 +231,8 @@ impl WatcherState {
                             }
                         },
                         _ = proc_finish => {
-                            let r = kill(Pid::from_raw(cmd.id().unwrap().try_into().unwrap()),Signal::SIGTERM);
-                            log::debug!("sigterm to netnsp-sub, {:?}", r);
+                            kill_children(cmdpid)?;
+                            log::debug!("terminate netnsp-sub, {:?}", r);
                         }
                     };
 

@@ -181,7 +181,7 @@ impl NetnspState {
         Ok(())
     }
     pub fn get_avail_id(&self) -> Result<u16> {
-        const max: u16 = 255;
+        const MAX: u16 = 255;
         let mut ids: Vec<u16> = self
             .res
             .netns_info
@@ -205,7 +205,7 @@ impl NetnspState {
             i += 1;
         }
         if ids.len() > 0 {
-            if ids.last().unwrap() < &max {
+            if ids.last().unwrap() < &MAX {
                 return Ok(ids.last().unwrap() + 1);
             }
             Err(anyhow::anyhow!("no id avail"))
@@ -246,7 +246,7 @@ impl NetnspState {
             veth_base_name: if base_name.len() < 12 {
                 base_name
             } else {
-                "nsp".to_owned() + &self.res.counter.to_string()
+                "nsp".to_owned() + &id.to_string()
             },
             id: id.into(),
         })
@@ -346,6 +346,7 @@ pub fn nsfd(ns_name: &str) -> Result<RawFd> {
     open(&p, OFlag::O_RDONLY, Mode::empty()).map_err(anyhow::Error::from)
 }
 
+// fd will not have CLOEXEC
 pub fn nsfd_by_path(p: &Path) -> Result<RawFd> {
     use nix::fcntl::{open, OFlag};
     use nix::sys::stat::Mode;
@@ -890,7 +891,7 @@ pub fn enter_ns_by_fd(ns_fd: RawFd) -> Result<()> {
     Ok(())
 }
 
-pub fn enter_ns_by_pid(pi: i32) -> Result<RawFd> {
+pub fn enter_ns_by_pid(pi: i32) -> Result<()> {
     let process = procfs::process::Process::new(pi)?;
     let o: OsString = OsString::from("net");
     let nss = process.namespaces()?;
@@ -902,6 +903,5 @@ pub fn enter_ns_by_pid(pi: i32) -> Result<RawFd> {
     let self_inode = get_self_netns_inode()?;
     anyhow::ensure!(proc_ns.identifier == self_inode);
     log::info!("current ns is from pid {}", pi);
-
-    Ok(r.as_raw_fd())
+    Ok(())
 }
