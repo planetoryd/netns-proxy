@@ -1,30 +1,11 @@
 #![feature(setgroups)]
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
-use flexi_logger::FileSpec;
-use libc::openat;
-use netns_proxy::{util::get_non_priv_user, watcher::fs_watcher};
-use nix::{
-    sched::CloneFlags,
-    unistd::{getppid, getresuid},
-};
-use std::{
-    collections::HashMap,
-    env,
-    fs::OpenOptions,
-    ops::Deref,
-    os::{
-        fd::AsRawFd,
-        unix::{prelude::OpenOptionsExt, process::CommandExt},
-    },
-    path::{Path, PathBuf},
-};
-use tokio::{
-    fs::File,
-    io::{AsyncReadExt, AsyncWriteExt},
-    process::{Child, Command},
-    task::JoinSet,
-};
+
+use netns_proxy::util::get_non_priv_user;
+
+use std::{env, path::PathBuf};
+use tokio::{fs::File, io::AsyncReadExt, process::Command, task::JoinSet};
 
 use netns_proxy::configurer::*;
 
