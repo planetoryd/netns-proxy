@@ -15,6 +15,8 @@
 
 Network namespace is more secure than netfilter-only approaches.
 
+The default profile (like the `"base_p": {}` below) configures the associated NetNSes to be proxied by a socks5 proxy listening on `host_ip:9909`. Typically you can set your proxy to listen on `0.0.0.0:9909`, and secure it with a firewall.
+
 ## usage
 
 start it under a working directory with `secret.json` and `netnsp.json` (optionally) present.
@@ -41,7 +43,10 @@ start it under a working directory with `secret.json` and `netnsp.json` (optiona
 }
 ```
 
-example `secret.json`
+example `secret.json`. 
+
+1. It configures two profiles, and they will be instantiated as persistent NetNSes if you run `netnsp-main --pre`.
+2. It matches flatpak process with app ID as they start, which you can see by `flatpak list` or `flatpak ps`, and applies the profiles.
 
 ```bash
 cargo b
