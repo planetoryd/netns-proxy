@@ -8,8 +8,8 @@ use futures::{FutureExt, TryFutureExt};
 use ipnetwork::IpNetwork;
 use tokio::io::AsyncWriteExt;
 
-use crate::watcher;
 use crate::watcher::ActiveProfiles;
+use crate::{nft::FO_CHAIN, watcher};
 use anyhow::{anyhow, Context, Ok, Result};
 use netns_rs::{DefaultEnv, NetNs};
 use nix::{
@@ -67,7 +67,7 @@ pub struct NetnspState {
     pub res: ConfigRes,
     pub conf: Secret,
     pub paths: ConfPaths,
-    nft_refresh_once: bool, // TODO
+    nft_refresh_once: bool,
 }
 
 pub struct ConfPaths {
@@ -118,20 +118,25 @@ impl NetnspState {
         Ok(veth_host)
     }
     // do a full sync of firewall intention
-    pub async fn apply_nft(&self) -> Result<()> {
+    pub async fn apply_nft(&mut self) -> Result<()> {
         let i_names = self.get_link_names_persistent().await?;
         let inames = i_names.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
 
         nft::apply_block_forwad(&inames)?;
+        // added the tables and chains
+        self.nft_refresh_once = true;
+        // after that only individual rules need to be added for each flatpak
         Ok(())
     }
     // incrementally apply rules for an interface
     // may error if the a full sync hasn't been done beforehand
     pub async fn nft_for_interface(&self, name: &str) -> Result<()> {
         use rustables::*;
+        log::info!("add nft rule for {}", name);
         let table = Table::new(ProtocolFamily::Inet).with_name(nft::TABLE_NAME.to_owned());
         let chain = Chain::new(&table)
             .with_hook(Hook::new(HookClass::Forward, 0))
+            .with_name(FO_CHAIN)
             .with_policy(ChainPolicy::Accept);
         let rule = nft::drop_interface_rule(name, &chain)?;
         let mut batch: Batch = Batch::new();
@@ -398,9 +403,10 @@ pub async fn config_pre_enter_ns(
             &veth_from_base(&neti.veth_base_name, true).as_ref(),
         )
         .await?;
-    configurer
-        .set_up(&veth_from_base(&neti.veth_base_name, true))
-        .await?;
+    // it will be set up after nftables gets confgiured
+    // configurer
+    //     .set_up(&veth_from_base(&neti.veth_base_name, true))
+    //     .await?;
 
     configurer
         .add_addr_dev(
@@ -432,7 +438,7 @@ pub async fn config_pre_enter_ns(
         .spawn()
         .unwrap();
     cmd.wait().await?;
-    
+
     // move a veth into ns
     configurer
         .ip_setns_by_fd(fd, &veth_from_base(&neti.veth_base_name, false))
@@ -440,6 +446,15 @@ pub async fn config_pre_enter_ns(
 
     log::trace!("ns {} configured", neti.base_name);
     nix::unistd::close(fd)?;
+    Ok(())
+}
+
+// one last step of the above fn
+pub async fn config_pre_enter_ns_up(neti: &NetnsInfo, configurer: &Configurer) -> Result<()> {
+    configurer
+        .set_up(&veth_from_base(&neti.veth_base_name, true))
+        .await?;
+
     Ok(())
 }
 
@@ -463,7 +478,7 @@ pub async fn config_in_ns(fd: RawFd, veth_base_name: String) -> Result<()> {
     Ok(())
 }
 
-pub async fn config_network(configrer: &Configurer, state: &mut NetnspState) -> Result<()> {
+pub async fn config_network(configurer: &Configurer, state: &mut NetnspState) -> Result<()> {
     let ns_names: Vec<String> = state.profile_names();
     for ns in &ns_names {
         let netinfo_o;
@@ -482,11 +497,15 @@ pub async fn config_network(configrer: &Configurer, state: &mut NetnspState) -> 
 
         Configurer::add_netns(&ns).await?;
         let fd = nsfd(&ns)?;
-        config_pre_enter_ns(&netinfo, configrer, fd.as_raw_fd()).await?;
+        config_pre_enter_ns(&netinfo, configurer, fd.as_raw_fd()).await?;
     }
     state.res.root_inode = get_pid1_netns_inode().await?;
     state.dump().await?;
     state.apply_nft().await?;
+    for ns in &ns_names {
+        let info = state.res.netns_info.get(ns).unwrap();
+        config_pre_enter_ns_up(info, configurer).await?;
+    }
     Ok(())
 }
 

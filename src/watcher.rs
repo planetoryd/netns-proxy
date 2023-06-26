@@ -35,8 +35,8 @@ use tokio::{io::AsyncReadExt, sync::RwLock, task::JoinSet};
 use zbus::{dbus_interface, dbus_proxy, Connection};
 
 use crate::configurer::{
-    self, enter_ns_by_pid, get_self_netns_inode, nsfd, nsfd_by_path, ConfigRes, NetnsInfo,
-    NetnspState,
+    self, enter_ns_by_pid, get_self_netns_inode, nsfd, nsfd_by_path, veth_from_base, ConfigRes,
+    NetnsInfo, NetnspState,
 };
 use crate::util::kill_children;
 use ini;
@@ -124,10 +124,27 @@ impl WatcherState {
 
         Ok(())
     }
+    pub async fn resume_netns(&mut self) -> Result<()> {
+        // re-start NETNSes that are associated with processes
+        log::debug!("resuming netns for processes");
+        if let Some(flat) = self.netnsp.res.flatpak.as_ref() {
+            let pids: Vec<i32> = flat.keys().map(|x| *x).collect();
+            // we may just restart netnsp-sub
+            // since netlink should have been configured
+            // we have this exact process running ==> the user must have not rebooted
+            // ==> the config probably has not been changed
+            // and we will not re-configure. it's temporary anyway
+            for item in pids {
+                self.start_netnsp_sub(item).await?;
+            }
+        }
+        Ok(())
+    }
     pub async fn start(mut self) -> Result<()> {
         // start all watching coroutines
 
         self.cleanup()?;
+        self.resume_netns().await?;
 
         let mut arc = Arc::new(self);
         let arc1 = arc.clone();
@@ -170,19 +187,8 @@ impl WatcherState {
     pub fn get_flatpak_profile_state(&mut self, pid: i32) -> Option<&mut ProfileState> {
         self.netnsp.res.flatpak.as_mut().unwrap().get_mut(&pid)
     }
-    pub async fn apply_profile_by_pid(&mut self, pid: i32) -> Result<()> {
+    pub async fn start_netnsp_sub(&mut self, pid: i32) -> Result<()> {
         let ps = self.netnsp.res.flatpak.as_ref().unwrap().get(&pid).unwrap();
-        anyhow::ensure!(!ps.default_pofile.is_empty());
-        let process = procfs::process::Process::new(pid)?;
-        let o: OsString = OsString::from("net");
-        let nss = process.namespaces()?;
-        let proc_ns = nss
-            .get(&o)
-            .ok_or(anyhow::anyhow!("ns/net not found for given pid"))?;
-        let r = nsfd_by_path(&proc_ns.path.as_path())?;
-        configurer::config_pre_enter_ns(&ps.net, &self.configurer, r.as_raw_fd()).await?;
-
-        // may be flatpak app_id or that of other sandbox systems
         let task_name = format!("netnsp-sub of {}", ps.net.base_name);
 
         let mut path = std::env::current_exe()?;
@@ -193,7 +199,7 @@ impl WatcherState {
 
         let tsk = async move {
             (
-                task_name,
+                task_name.clone(),
                 async move {
                     use crate::util::get_non_priv_user;
                     let (puid, pgid) = get_non_priv_user(None, None)?;
@@ -232,7 +238,7 @@ impl WatcherState {
                         },
                         _ = proc_finish => {
                             kill_children(cmdpid)?;
-                            log::debug!("terminate netnsp-sub, {:?}", r);
+                            log::debug!("terminate netnsp-sub, {:?}", task_name);
                         }
                     };
 
@@ -243,6 +249,26 @@ impl WatcherState {
         };
 
         self.send_task.send(Box::pin(tsk)).ok().unwrap();
+        Ok(())
+    }
+    pub async fn apply_profile_by_pid(&mut self, pid: i32) -> Result<()> {
+        let ps = self.netnsp.res.flatpak.as_ref().unwrap().get(&pid).unwrap();
+        anyhow::ensure!(!ps.default_pofile.is_empty());
+        let process = procfs::process::Process::new(pid)?;
+        let o: OsString = OsString::from("net");
+        let nss = process.namespaces()?;
+        let proc_ns = nss
+            .get(&o)
+            .ok_or(anyhow::anyhow!("ns/net not found for given pid"))?;
+        let r = nsfd_by_path(&proc_ns.path.as_path())?;
+        configurer::config_pre_enter_ns(&ps.net, &self.configurer, r.as_raw_fd()).await?;
+        self.netnsp
+            .nft_for_interface(&veth_from_base(&ps.net.veth_base_name, true))
+            .await?;
+        configurer::config_pre_enter_ns_up(&ps.net, &self.configurer).await?;
+
+        // may be flatpak app_id or that of other sandbox systems
+        self.start_netnsp_sub(pid).await?;
         Ok(())
     }
     pub fn cleanup(&mut self) -> Result<()> {
@@ -318,8 +344,6 @@ async fn process_event<'a>(
                     .mask
                     .intersects(EventMask::ISDIR | EventMask::CLOSE_NOWRITE)
                 {
-                    once_set.insert(iid);
-                    // so that, once an instance has such an event, all subsequent events are ignored for it.
                     let mut instance_dir = flatpak_dir.clone();
                     instance_dir.push(fname.clone());
 
@@ -336,6 +360,9 @@ async fn process_event<'a>(
                     info_file.read_to_string(&mut instnace_info_str).await?;
 
                     log::debug!("flatpak instance {} detected", iid);
+                    // this waits for a close event until the info file is present
+                    // it will eventually appear
+                    once_set.insert(iid);
 
                     let c = ini::Ini::load_from_str(&instnace_info_str).unwrap();
                     // if any of the following ops fail, we'll just error and give up
