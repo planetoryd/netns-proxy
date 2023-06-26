@@ -14,14 +14,11 @@
 
 use anyhow::{Ok, Result};
 use futures::{Future, StreamExt};
-use inotify::{EventMask, WatchDescriptor, WatchMask};
-use nix::sched::CloneFlags;
-use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
+use inotify::{EventMask, WatchMask};
+
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::{
-    cell::{Cell, Ref},
     collections::{HashMap, HashSet},
     ffi::OsString,
     os::fd::AsRawFd,
@@ -35,8 +32,7 @@ use tokio::{io::AsyncReadExt, sync::RwLock, task::JoinSet};
 use zbus::{dbus_interface, dbus_proxy, Connection};
 
 use crate::configurer::{
-    self, enter_ns_by_pid, get_self_netns_inode, nsfd, nsfd_by_path, veth_from_base, ConfigRes,
-    NetnsInfo, NetnspState,
+    self, get_self_netns_inode, nsfd_by_path, veth_from_base, NetnsInfo, NetnspState,
 };
 use crate::util::kill_children;
 use ini;
@@ -45,8 +41,8 @@ struct NetnspDbus;
 
 #[dbus_interface(name = "app.netnsp")]
 impl NetnspDbus {
-    fn transform_netns_by_pid(&self, pid: i32) {}
-    fn transform_netns_by_path(&self, path: String) {}
+    fn transform_netns_by_pid(&self, _pid: i32) {}
+    fn transform_netns_by_path(&self, _path: String) {}
 }
 
 // Portal backend APIs provided by flatpak.

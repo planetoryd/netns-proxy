@@ -2,39 +2,36 @@
 #![feature(async_closure)]
 #![feature(exit_status_error)]
 #![feature(setgroups)]
-use flexi_logger::FileSpec;
+
 
 use futures::{FutureExt, TryFutureExt};
 use ipnetwork::IpNetwork;
 use tokio::io::AsyncWriteExt;
 
 use crate::watcher::ActiveProfiles;
-use crate::{nft::FO_CHAIN, watcher};
-use anyhow::{anyhow, Context, Ok, Result};
-use netns_rs::{DefaultEnv, NetNs};
+use crate::{nft::FO_CHAIN};
+use anyhow::{anyhow, Ok, Result};
+use netns_rs::{NetNs};
 use nix::{
-    libc::{kill, SIGTERM},
     sched::CloneFlags,
-    unistd::{getppid, setgroups, Gid, Uid},
+    unistd::{setgroups, Gid, Uid},
 };
 use serde::{Deserialize, Serialize};
 use std::net::Ipv6Addr;
-use std::os::fd::FromRawFd;
+
 use std::{
-    borrow::{Borrow, Cow},
-    ffi::{CStr, CString, OsString},
-    net::{Ipv4Addr, SocketAddrV6},
+    ffi::{CString, OsString},
+    net::{Ipv4Addr},
     os::{fd::RawFd, unix::process::CommandExt},
     path::{Path, PathBuf},
-    process::{exit, Stdio},
+    process::{exit},
 };
-use std::{collections::HashMap, time::Duration};
-use std::{env, os::fd::AsRawFd};
+use std::{collections::HashMap};
+use std::{os::fd::AsRawFd};
 use tokio::{
     self,
     fs::File,
     io::{AsyncBufReadExt, AsyncReadExt},
-    process::Command,
 };
 
 pub const NETNS_PATH: &str = "/run/netns/";
@@ -584,7 +581,7 @@ impl Env for NsEnv {
 }
 
 pub fn veth_from_base(basename: &str, host: bool) -> String {
-    let mut basename = basename.to_owned();
+    let basename = basename.to_owned();
     if basename.len() > 12 {
         unreachable!()
     }

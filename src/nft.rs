@@ -1,18 +1,9 @@
-use ipnetwork::{IpNetwork, Ipv4Network};
 use rustables::{
-    data_type::ip_to_vec,
-    expr::{
-        Bitwise, Cmp, CmpOp, Counter, ExpressionList, HighLevelPayload, ICMPv6HeaderField,
-        IPv4HeaderField, IcmpCode, Immediate, Meta, MetaType, NetworkHeaderField,
-        TransportHeaderField, VerdictKind,
-    },
-    iface_index, list_chains_for_table, list_rules_for_chain, list_tables, Batch, Chain,
-    ChainPolicy, Hook, HookClass, MsgType, ProtocolFamily, Rule, Table,
+    expr::{Cmp, CmpOp, Immediate, Meta, MetaType, VerdictKind},
+    iface_index, list_chains_for_table, list_rules_for_chain, list_tables, Batch, Chain, Hook,
+    MsgType, ProtocolFamily, Rule, Table,
 };
-use std::{
-    collections::{HashMap, HashSet},
-    net::Ipv4Addr,
-};
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Ok, Result};
 

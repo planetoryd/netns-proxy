@@ -1,5 +1,5 @@
 use anyhow::Result;
-use netns_proxy::configurer::{self, NETNS_PATH};
+use netns_proxy::configurer::{self};
 
 // this will run inside netns
 

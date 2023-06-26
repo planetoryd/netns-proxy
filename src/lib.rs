@@ -3,29 +3,23 @@
 #![feature(exit_status_error)]
 #![feature(setgroups)]
 #![feature(get_mut_unchecked)]
-use flexi_logger::FileSpec;
 
-use futures::{FutureExt, TryFutureExt};
+use futures::TryFutureExt;
 use ipnetwork::IpNetwork;
 
-use anyhow::{anyhow, Context, Ok, Result};
-use netns_rs::{DefaultEnv, NetNs};
+use anyhow::{Ok, Result};
+
 use nix::{
     libc::{kill, SIGTERM},
-    sched::CloneFlags,
-    unistd::{getppid, setgroups, Gid, Uid},
+    unistd::{Gid, Uid},
 };
-use serde::{Deserialize, Serialize};
-use std::{
-    os::{unix::process::CommandExt},
-    process::{Stdio},
-};
-use std::{collections::HashMap, time::Duration};
-use std::{env, os::fd::AsRawFd};
+
+use std::collections::HashMap;
+use std::{os::unix::process::CommandExt, process::Stdio};
+
 use sysinfo::{self, PidExt, ProcessExt, System, SystemExt};
 use tokio::{
     self,
-    fs::File,
     io::{AsyncBufReadExt, AsyncReadExt},
     process::Command,
 };
@@ -35,7 +29,6 @@ pub mod util;
 pub mod watcher;
 
 use configurer::*;
-
 
 // Standard procedure
 // Creates various netns, base-vpn, socks, i2p, lokinet, un-firewalled
@@ -72,7 +65,7 @@ fn test_substitute_argv() {
         ip_vn: "192.168.0.2".to_string(),
         ip6_vn: "2001:db8::2".to_string(),
         veth_base_name: "ss".to_owned(),
-        id: 2
+        id: 2,
     };
 
     let mut argv = vec![
@@ -150,7 +143,7 @@ pub async fn inner_daemon(
     let profile = profile.unwrap();
     let fd = fd.unwrap().parse()?;
 
-    let mut state = NetnspState::load(Default::default()).await?;
+    let state = NetnspState::load(Default::default()).await?;
 
     let config: ConfigRes = state.res;
     let secret: Secret = state.conf;
@@ -174,7 +167,9 @@ pub async fn inner_daemon(
     let configurer = Configurer::new();
 
     configurer.set_up("lo").await?;
-    configurer.add_addrs_guest(&netconf.veth_base_name, netconf).await?;
+    configurer
+        .add_addrs_guest(&netconf.veth_base_name, netconf)
+        .await?;
 
     let tun = Tun::new(tun_name, false)?; // prepare a TUN for tun2socks, as root.
                                           // the TUN::new here creates a non-persistent TUN
@@ -211,9 +206,8 @@ pub async fn inner_daemon(
     }
     let mut proc_set = tokio::task::JoinSet::new();
     let ip_vh: IpNetwork = netconf.ip_vh.parse()?;
-    let ip_vh_ip = ip_vh.ip().to_string() ;
-    let mut base_prxy_v4 =
-        "socks5://".to_owned() + &ip_vh_ip + ":" + &tun_target_port.to_string();
+    let ip_vh_ip = ip_vh.ip().to_string();
+    let mut base_prxy_v4 = "socks5://".to_owned() + &ip_vh_ip + ":" + &tun_target_port.to_string();
     if params.hport.is_some() {
         base_prxy_v4 = format!("socks5://{}:{}", &ip_vh_ip, params.hport.unwrap());
     }
@@ -332,7 +326,12 @@ pub async fn inner_daemon(
 
     while let Some(r) = proc_set.join_next().await {
         let r = r??;
-        log::warn!("\"{}\" exited with {}, for {}", r.1, r.0, &netconf.base_name)
+        log::warn!(
+            "\"{}\" exited with {}, for {}",
+            r.1,
+            r.0,
+            &netconf.base_name
+        )
     }
 
     Ok(())
