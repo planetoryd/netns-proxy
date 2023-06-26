@@ -1,4 +1,5 @@
 use std::env;
+use std::path::PathBuf;
 
 use anyhow::Ok;
 use anyhow::Result;
@@ -83,4 +84,58 @@ pub fn kill_children(pid: i32) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(not(test))]
+use log::{info, warn};
+
+#[cfg(test)]
+use std::{println as info, println as warn};
+
+pub fn flatpak_perms_checkup(list: Vec<String>) -> Result<()> {
+    let basedirs = xdg::BaseDirectories::with_prefix("flatpak")?;
+    info!("trying to adapt flatpak app permissions");
+    for appid in list {
+        let mut sub = PathBuf::from("overrides");
+        sub.push(appid);
+        let p = basedirs.get_data_file(&sub);
+        if p.exists() {
+            let mut conf = ini::Ini::load_from_file(p.as_path())?;
+            let k = conf.get_from(Some("Context"), "shared");
+            if k.is_some() {
+                if k.unwrap().contains("!network") {
+                    info!("{} found. it has correct config", p.to_string_lossy());
+                } else {
+                    let o = k.unwrap().to_owned();
+                    let v = o + ";!network";
+                    conf.set_to(Some("Context"), "shared".to_owned(), v);
+                    conf.write_to_file(p.as_path())?;
+                    info!("{} written", p.to_string_lossy());
+                }
+            } else {
+                conf.set_to(Some("Context"), "shared".to_owned(), "!network".to_owned());
+                conf.write_to_file(p.as_path())?;
+                info!("{} written", p.to_string_lossy());
+            }
+        } else {
+            // create a new file for it
+            let mut conf = ini::Ini::new();
+            conf.set_to(Some("Context"), "shared".to_owned(), "!network".to_owned());
+            info!("{} written. new file", p.to_string_lossy());
+            conf.write_to_file(p.as_path())?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_flatpakperm() {
+    flatpak_perms_checkup(
+        [
+            "org.mozilla.firefox".to_owned(),
+            "im.fluffychat.Fluffychat".to_owned(),
+        ]
+        .to_vec(),
+    )
+    .unwrap();
 }

@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
     unsafe {
         netns_proxy::logger = Some(
             flexi_logger::Logger::try_with_env_or_str(
-                "error,netnsp_main=info,netns_proxy=warn,netnsp_sub=info",
+                "error,netnsp_main=info,netns_proxy=debug,netnsp_sub=info",
             )
             .unwrap()
             .log_to_stdout()

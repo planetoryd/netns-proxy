@@ -1,5 +1,7 @@
 # Netns-based selective proxying, for identity isolation
 
+> *identity isolation* because environ-variable based proxying is not safe for that.
+
 - set your firewall to allow `10.27.0.0/16`
 - install the following, make them available in $PATH
   - [tun2socks](https://github.com/xjasonlyu/tun2socks)
@@ -13,9 +15,11 @@
 1. Configure a few persistent Network Namespaces
 2. Watch for new flatpak processes and configure Network Namespaces for them
 
-Network namespace is more secure than netfilter-only approaches.
+Network namespace is more secure than netfilter-only approaches. When netns-proxy stops/crashes, or before it configures your app, the internet is disconnected in the netns.
 
 The default profile (like the `"base_p": {}` below) configures the associated NetNSes to be proxied by a socks5 proxy listening on `host_ip:9909`. Typically you can set your proxy to listen on `0.0.0.0:9909`, and secure it with a firewall.
+
+**Notice**: You need set flatpak applications to have `Network` *disabled*, in Flatseal, in order to use this tool. Netns-proxy would try to disable it. 
 
 ## usage
 

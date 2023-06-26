@@ -907,6 +907,14 @@ pub fn enter_ns_by_fd(ns_fd: RawFd) -> Result<()> {
     Ok(())
 }
 
+// ensure that the ns does not match self ns
+pub fn ensure_ns_not_root(ns_fd: RawFd) -> Result<()> {
+    let stat = nix::sys::stat::fstat(ns_fd)?;
+    let selfi = get_self_netns_inode()?;
+    anyhow::ensure!(stat.st_ino != selfi);
+    Ok(())
+}
+
 pub fn enter_ns_by_pid(pi: i32) -> Result<()> {
     let process = procfs::process::Process::new(pi)?;
     let o: OsString = OsString::from("net");

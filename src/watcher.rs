@@ -32,9 +32,10 @@ use tokio::{io::AsyncReadExt, sync::RwLock, task::JoinSet};
 use zbus::{dbus_interface, dbus_proxy, Connection};
 
 use crate::configurer::{
-    self, get_self_netns_inode, nsfd_by_path, veth_from_base, NetnsInfo, NetnspState,
+    self, ensure_ns_not_root, get_self_netns_inode, nsfd_by_path, veth_from_base, NetnsInfo,
+    NetnspState,
 };
-use crate::util::kill_children;
+use crate::util::{flatpak_perms_checkup, kill_children};
 use ini;
 
 struct NetnspDbus;
@@ -96,6 +97,7 @@ impl WatcherState {
             send_task,
             recv_task,
         };
+        // TODO: check for flatpak app perms
         n.auth().await?;
 
         Ok(n)
@@ -140,6 +142,8 @@ impl WatcherState {
         // start all watching coroutines
 
         self.cleanup()?;
+        let list_appids = self.netnsp.conf.flatpak.keys().map(|s| s.clone()).collect();
+        flatpak_perms_checkup(list_appids)?;
         self.resume_netns().await?;
 
         let mut arc = Arc::new(self);
@@ -208,6 +212,7 @@ impl WatcherState {
                         .get(&o)
                         .ok_or(anyhow::anyhow!("ns/net not found for given pid"))?;
                     let fd = open(&proc_ns.path, OFlag::O_RDONLY, Mode::empty()).unwrap();
+                    ensure_ns_not_root(fd)?;
                     let mut cmd: tokio::process::Child = tokio::process::Command::new(path.clone())
                         .arg(default_pofile)
                         .arg(puid.to_string())
@@ -257,6 +262,7 @@ impl WatcherState {
             .get(&o)
             .ok_or(anyhow::anyhow!("ns/net not found for given pid"))?;
         let r = nsfd_by_path(&proc_ns.path.as_path())?;
+        ensure_ns_not_root(r)?;
         configurer::config_pre_enter_ns(&ps.net, &self.configurer, r.as_raw_fd()).await?;
         self.netnsp
             .nft_for_interface(&veth_from_base(&ps.net.veth_base_name, true))
