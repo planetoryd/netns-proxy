@@ -229,11 +229,15 @@ async fn main() -> Result<()> {
                     );
                 }
             };
-            // exit when either of them exits, because it shouldn't.
-            tokio::select! {
-                _ = tokio::spawn(w_t) => {}
-                _ = tokio::spawn(persis_ns) => {}
-            }
+            log::warn!("subprocesses detached.")
+            // detaches subprocesses.
+            // because futex_wait seems to cause high cpu util on my machine. 
+
+            // // exit when either of them exits, because it shouldn't.
+            // tokio::select! {
+            //     _ = tokio::spawn(w_t) => {}
+            //     _ = tokio::spawn(persis_ns) => {}
+            // }
         }
     }
 
