@@ -1254,6 +1254,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
+ "thiserror",
  "tidy-tuntap",
  "tokio",
  "users",

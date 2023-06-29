@@ -1,18 +1,28 @@
 use std::env;
+use std::fs::File;
+use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 
 use anyhow::Ok;
 use anyhow::Result;
 use nix::sys::signal::kill;
 use nix::sys::signal::Signal;
+use nix::sys::signal::Signal::SIGTERM;
+use nix::unistd::Gid;
 use nix::unistd::Pid;
+use nix::unistd::Uid;
 use procfs::process::Process;
 
 pub fn convert_strings_to_strs(strings: &Vec<String>) -> Vec<&str> {
     strings.iter().map(|s| s.as_str()).collect()
 }
 
-pub fn get_non_priv_user(uid: Option<String>, gid: Option<String>) -> Result<(u32, u32)> {
+pub fn get_non_priv_user(
+    uid: Option<String>,
+    gid: Option<String>,
+    uid2: Option<Uid>,
+    gid2: Option<Gid>,
+) -> Result<(u32, u32)> {
     let r_ui: u32;
     let r_gi: u32;
     if let core::result::Result::Ok(log_name) = env::var("SUDO_USER") {
@@ -24,6 +34,9 @@ pub fn get_non_priv_user(uid: Option<String>, gid: Option<String>) -> Result<(u3
         // supplied
         r_gi = gid.unwrap().parse()?;
         r_ui = uid.unwrap().parse()?;
+    } else if uid2.is_some() && gid2.is_some() {
+        r_gi = gid2.unwrap().as_raw();
+        r_ui = uid2.unwrap().as_raw();
     } else {
         // as child process of some non-root
         let parent_pid = nix::unistd::getppid();
@@ -35,12 +48,16 @@ pub fn get_non_priv_user(uid: Option<String>, gid: Option<String>) -> Result<(u3
         r_gi = parent_process.status()?.egid;
     }
 
-    Ok((r_ui, r_gi))
+    if r_ui == 0 || r_gi == 0 {
+        // when straceing
+        Ok((1000, 1000))
+    } else {
+        Ok((r_ui, r_gi))
+    }
 }
 
 #[test]
 fn t_pidfd() -> Result<()> {
-    use pidfd::PidFuture;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -87,10 +104,13 @@ pub fn kill_children(pid: i32) -> Result<()> {
 }
 
 #[cfg(not(test))]
-use log::{info, warn};
+use log::info;
+use sysinfo::PidExt;
+use sysinfo::ProcessExt;
+use sysinfo::SystemExt;
 
 #[cfg(test)]
-use std::{println as info, println as warn};
+use std::println as info;
 
 pub fn flatpak_perms_checkup(list: Vec<String>) -> Result<()> {
     let basedirs = xdg::BaseDirectories::with_prefix("flatpak")?;
@@ -138,4 +158,90 @@ fn test_flatpakperm() {
         .to_vec(),
     )
     .unwrap();
+}
+
+use std::collections::HashMap;
+
+pub fn substitute_argv<'a>(n_info: &'a NetnsInfo, argv: &mut Vec<String>) {
+    let mut sub_map: HashMap<String, &String> = HashMap::new();
+    sub_map.insert(format!("${}", "subnet_veth"), &n_info.subnet_veth);
+    sub_map.insert(format!("${}", "subnet6_veth"), &n_info.subnet6_veth);
+    sub_map.insert(format!("${}", "ip_vh"), &n_info.ip_vh);
+    sub_map.insert(format!("${}", "ip6_vh"), &n_info.ip6_vh);
+    sub_map.insert(format!("${}", "ip_vn"), &n_info.ip_vn);
+    sub_map.insert(format!("${}", "ip6_vn"), &n_info.ip6_vn);
+
+    for s in argv.iter_mut() {
+        let mut s_ = s.to_owned();
+        for (key, value) in &sub_map {
+            s_ = s_.replace(key, value);
+        }
+        *s = s_;
+    }
+}
+
+use crate::NetnsInfo;
+#[test]
+fn test_substitute_argv() {
+    let n_info = NetnsInfo {
+        base_name: "x".to_owned(),
+        subnet_veth: "eth0".to_string(),
+        subnet6_veth: "eth1".to_string(),
+        ip_vh: "192.168.0.1".to_string(),
+        ip6_vh: "2001:db8::1".to_string(),
+        ip_vn: "192.168.0.2".to_string(),
+        ip6_vn: "2001:db8::2".to_string(),
+        veth_base_name: "ss".to_owned(),
+        id: 2,
+        tun_ip: None,
+        link_base_name: None,
+    };
+
+    let mut argv = vec![
+        "ping".to_string(),
+        "-c".to_string(),
+        "1".to_string(),
+        "$ip_vnxx".to_string(),
+    ];
+
+    substitute_argv(&n_info, &mut argv);
+
+    assert_eq!(
+        argv,
+        vec![
+            "ping".to_string(),
+            "-c".to_string(),
+            "1".to_string(),
+            "192.168.0.2xx".to_string(),
+        ]
+    );
+}
+
+use sysinfo::System;
+
+pub fn kill_suspected() -> Result<()> {
+    let s = System::new_all();
+    for (pid, process) in s.processes() {
+        // kill by saved pids
+        // or by matching commandlines
+        let c = process.cmd();
+        if c.into_iter().any(|x| x.contains("tun2socks"))
+            || c.into_iter().any(|x| x.contains("gost"))
+            || c.into_iter().any(|x| x.contains("dnsproxy"))
+        {
+            println!("killed {pid} {}", c[0]);
+            kill(nix::unistd::Pid::from_raw(pid.as_u32() as i32), SIGTERM)?;
+        }
+    }
+    Ok(())
+}
+
+// first four args must be Some()
+use std::path::Path;
+
+pub fn open_wo_cloexec(path: &Path) -> File {
+    use nix::fcntl::{open, OFlag};
+    use nix::sys::stat::Mode;
+    let fd = open(path, OFlag::O_RDONLY, Mode::empty()).unwrap();
+    unsafe { File::from_raw_fd(fd) }
 }

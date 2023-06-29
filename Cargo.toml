@@ -2,7 +2,7 @@
 name = "netns-proxy"
 version = "0.1.0"
 edition = "2021"
-default-run = "netnsp-main"
+default-run = "nsproxy"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -33,9 +33,9 @@ rustables = { branch = "netnsp", git = "https://github.com/planetoryd/rustables"
 either = "1.8.1"
 pidfd = "0.2.4"
 xdg = "2.5.0"
+thiserror = "1.0.40"
 
 [profile.release]
 strip = true
 opt-level = "z" # bottleneck is size, not cpu
 lto = true
-

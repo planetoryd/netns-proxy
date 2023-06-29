@@ -32,11 +32,12 @@ use tokio::{io::AsyncReadExt, sync::RwLock, task::JoinSet};
 use zbus::{dbus_interface, dbus_proxy, Connection};
 
 use crate::configurer::{
-    self, ensure_ns_not_root, get_self_netns_inode, nsfd_by_path, veth_from_base, NetnsInfo,
-    NetnspState,
+    self, ensure_ns_not_root, get_self_netns_inode, nsfd_by_path, orchestrate_newns,
+    veth_from_base,
 };
 use crate::util::{flatpak_perms_checkup, kill_children};
 use ini;
+use crate::data::*;
 
 struct NetnspDbus;
 
@@ -74,6 +75,8 @@ pub struct ProfileState {
     pub default_pofile: String,
     pub net: NetnsInfo,
 }
+
+use crate::NetnspState;
 
 pub struct WatcherState {
     netnsp: NetnspState,
@@ -127,13 +130,8 @@ impl WatcherState {
         log::debug!("resuming netns for processes");
         if let Some(flat) = self.netnsp.res.flatpak.as_ref() {
             let pids: Vec<i32> = flat.keys().map(|x| *x).collect();
-            // we may just restart netnsp-sub
-            // since netlink should have been configured
-            // we have this exact process running ==> the user must have not rebooted
-            // ==> the config probably has not been changed
-            // and we will not re-configure. it's temporary anyway
             for item in pids {
-                self.start_netnsp_sub(item).await?;
+                self.apply_profile_by_pid(item).await?;
             }
         }
         Ok(())
@@ -163,7 +161,6 @@ impl WatcherState {
                 maybe_task = m.recv_task.recv() => {
                     log::trace!("received new daemon");
                     if let Some(task) = maybe_task {
-
                          m.daemons.write().await.spawn(task);
                     }
                 },
@@ -176,7 +173,9 @@ impl WatcherState {
                 } => {
                     if let Some(res) = maybe_res {
                         let res = res?;
-                        log::error!("{:?}", res);
+                        log::warn!("{:?}", res);
+                    } else {
+                        log::warn!("daemons joinset empty");
                     }
                 }
             }
@@ -202,7 +201,7 @@ impl WatcherState {
                 task_name.clone(),
                 async move {
                     use crate::util::get_non_priv_user;
-                    let (puid, pgid) = get_non_priv_user(None, None)?;
+                    let (puid, pgid) = get_non_priv_user(None, None, None, None)?;
                     use nix::fcntl::{open, OFlag};
                     use nix::sys::stat::Mode;
                     let process = procfs::process::Process::new(pid)?;
@@ -255,20 +254,31 @@ impl WatcherState {
     pub async fn apply_profile_by_pid(&mut self, pid: i32) -> Result<()> {
         let ps = self.netnsp.res.flatpak.as_ref().unwrap().get(&pid).unwrap();
         anyhow::ensure!(!ps.default_pofile.is_empty());
+        let params = self.netnsp.conf.params.get(&ps.default_pofile).unwrap();
         let process = procfs::process::Process::new(pid)?;
         let o: OsString = OsString::from("net");
         let nss = process.namespaces()?;
         let proc_ns = nss
             .get(&o)
             .ok_or(anyhow::anyhow!("ns/net not found for given pid"))?;
-        let r = nsfd_by_path(&proc_ns.path.as_path())?;
-        ensure_ns_not_root(r)?;
-        configurer::config_pre_enter_ns(&ps.net, &self.configurer, r.as_raw_fd()).await?;
+        let proc_ns_fd = nsfd_by_path(&proc_ns.path.as_path())?;
+        ensure_ns_not_root(proc_ns_fd)?;
+        configurer::config_pre_enter_ns(&ps.net, &self.configurer, proc_ns_fd.as_raw_fd()).await?;
         self.netnsp
             .nft_for_interface(&veth_from_base(&ps.net.veth_base_name, true))
             .await?;
+        let ps = self
+            .netnsp
+            .res
+            .flatpak
+            .as_mut()
+            .unwrap()
+            .get_mut(&pid)
+            .unwrap();
         configurer::config_pre_enter_ns_up(&ps.net, &self.configurer).await?;
-
+        orchestrate_newns(&mut ps.net, params, &self.configurer, proc_ns_fd).await?;
+        self.netnsp.dump().await?;
+        nix::unistd::close(proc_ns_fd)?;
         // may be flatpak app_id or that of other sandbox systems
         self.start_netnsp_sub(pid).await?;
         Ok(())
@@ -357,7 +367,11 @@ async fn process_event<'a>(
                     let mut info = instance_dir.clone();
                     info.push("info");
 
-                    let mut info_file = tokio::fs::File::open(info).await?;
+                    let info_file = tokio::fs::File::open(info).await;
+                    if info_file.is_err() {
+                        return Ok(());
+                    }
+                    let mut info_file = info_file.unwrap();
                     let mut instnace_info_str = String::new();
                     info_file.read_to_string(&mut instnace_info_str).await?;
 
@@ -393,6 +407,7 @@ async fn process_event<'a>(
                                 log::info!("unexpected number of threads, {:?}", proc);
                             }
                             let the_child_pid = children[0] as i32; // pid of the process, in unshared netns
+                                                                    // prepare the configs
                             let ifany = watcher.get_flatpak_profile_state(the_child_pid);
                             let mut base_name4flatpak = flatpak_id.to_owned();
                             base_name4flatpak.push_str(&the_child_pid.to_string());
@@ -414,7 +429,6 @@ async fn process_event<'a>(
                                     );
                                 }
                             }
-                            watcher.netnsp.dump().await?;
                             watcher.apply_profile_by_pid(the_child_pid as i32).await?;
                         }
                     } else {
@@ -485,7 +499,7 @@ async fn process_event<'a>(
 // for flatpak and more
 pub async fn fs_watcher<'a>(watcher: &mut WatcherState) -> Result<()> {
     use crate::util::get_non_priv_user;
-    let (uid, _) = get_non_priv_user(None, None)?;
+    let (uid, _) = get_non_priv_user(None, None, None, None)?;
     let flatpak_dir = PathBuf::from(format!("/run/user/{}/.flatpak/", uid));
     log::debug!("flatpak watcher started");
     let mut inoti = inotify::Inotify::init()?;
@@ -523,6 +537,8 @@ pub async fn fs_watcher<'a>(watcher: &mut WatcherState) -> Result<()> {
             }
         }
     }
+
+    log::warn!("fs_watcher stream ended with None");
 
     Ok(())
 }

@@ -11,19 +11,19 @@ pub const TABLE_NAME: &str = "netnsp";
 pub const FO_CHAIN: &str = "block-forward";
 
 #[derive(Default, Debug)]
-pub struct NftProposal {
+pub struct NftState {
     // name -> table. indexed
-    tables: HashMap<String, PTable>,
+    tables: HashMap<String, NftTable>,
 }
 
 #[derive(Default, Debug)]
-pub struct PTable {
+pub struct NftTable {
     table: Table,
-    chains: HashMap<String, PChain>,
+    chains: HashMap<String, NftChain>,
 }
 
 #[derive(Default, Debug)]
-pub struct PChain {
+pub struct NftChain {
     chain: Chain,
     rules: HashSet<Rule>,
     // I think they are not ordered
@@ -33,7 +33,7 @@ pub struct PChain {
 
 // ensure those rules exist
 // if not, incrementally update
-pub fn ensure_rules(proposal: NftProposal) -> Result<()> {
+pub fn ensure_rules(proposal: NftState) -> Result<()> {
     let ts: Vec<Table> = list_tables()?;
     let e_set: HashSet<&String> = ts.iter().flat_map(|table| table.get_name()).collect();
     // do a quick scan for consistency, and if diff is small, update incrementally, else remove & re-add
@@ -73,6 +73,8 @@ pub fn ensure_rules(proposal: NftProposal) -> Result<()> {
                         for rule in &ca.rules {
                             batch.add(rule, MsgType::Add);
                         }
+                        // Note that after I decided to always re-add veths, the existing/expected rules will always be different
+                        // specifically in the CMP data of interface indices, and therefore, re-added.
                     }
                 } else {
                     // add chain
@@ -116,12 +118,12 @@ pub fn apply_block_forwad(veth_list: &[&str]) -> Result<()> {
         rules.insert(drop_interface_rule(v, &chain)?);
     }
 
-    let prop = NftProposal {
+    let prop = NftState {
         tables: HashMap::from_iter([(
             TABLE_NAME.to_owned(),
-            PTable {
+            NftTable {
                 table,
-                chains: HashMap::from([(FO_CHAIN.to_owned(), PChain { chain, rules })]),
+                chains: HashMap::from([(FO_CHAIN.to_owned(), NftChain { chain, rules })]),
             },
         )]),
     };

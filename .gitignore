@@ -1,9 +1,10 @@
 /target
 *.log
-secret.json
-netnsp.json
+secret*.json
+netnsp*.json
 core
 local
 .cargo
 .vscode/settings.json
 .vscode/launch.json
+.vscode

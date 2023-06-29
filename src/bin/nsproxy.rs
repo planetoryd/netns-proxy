@@ -1,13 +1,17 @@
 #![feature(setgroups)]
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Ok, Result};
 use clap::{Parser, Subcommand};
 
+use netns_proxy::sub::{NetnspSub, NetnspSubCaller};
 use netns_proxy::util::get_non_priv_user;
+use netns_proxy::util::open_wo_cloexec;
 
+use std::os::fd::AsRawFd;
 use std::{env, path::PathBuf};
 use tokio::{fs::File, io::AsyncReadExt, process::Command, task::JoinSet};
 
 use netns_proxy::configurer::*;
+use netns_proxy::data::*;
 
 use procfs::process::Process;
 
@@ -40,47 +44,20 @@ enum Commands {
         pid: Option<i32>,
     },
     Id {},
+    Clean {},
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut set = JoinSet::new();
 
-    // this is very safe
-    // unsafe {
-    //     netns_proxy::logger = Some(
-    //         flexi_logger::Logger::try_with_env_or_str("error,netnsp_main=debug,netns_proxy=debug")
-    //             .unwrap()
-    //             .log_to_file(FileSpec::default())
-    //             .duplicate_to_stdout(flexi_logger::Duplicate::All)
-    //             .start()
-    //             .unwrap(),
-    //     );
-    // }
-    #[cfg(debug_assertions)]
-    unsafe {
-        netns_proxy::logger = Some(
-            flexi_logger::Logger::try_with_env_or_str(
-                "error,netnsp_main=trace,netns_proxy=trace,netnsp_sub=trace",
-            )
-            .unwrap()
-            .log_to_stdout()
-            .start()
-            .unwrap(),
-        );
-    }
-    #[cfg(not(debug_assertions))]
-    unsafe {
-        netns_proxy::logger = Some(
-            flexi_logger::Logger::try_with_env_or_str(
-                "error,netnsp_main=info,netns_proxy=debug,netnsp_sub=info",
-            )
-            .unwrap()
-            .log_to_stdout()
-            .start()
-            .unwrap(),
-        );
-    }
+    flexi_logger::Logger::try_with_env_or_str(
+        "debug,netnsp_main=trace,netns_proxy=trace,netnsp_sub=trace,netlink_proto=info,rustables=info",
+    )
+    .unwrap()
+    .log_to_stdout()
+    .start()
+    .unwrap();
     let cli = Cli::parse();
 
     tokio::spawn(async {
@@ -93,7 +70,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Commands::Stop {}) => {
-            netns_proxy::kill_suspected();
+            netns_proxy::util::kill_suspected()?;
         }
         Some(Commands::Id {}) => {
             let got_ns = self_netns_identify()
@@ -101,25 +78,21 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| anyhow!("no matches under the given netns directory"))?;
             println!("{:?}", got_ns);
         }
+        Some(Commands::Clean {}) => {
+            // It is hard to steer the system config state into the desired state
+            // Things get messed up easily.
+            let configurer = Configurer::new();
+            let state = NetnspState::load(Default::default()).await?;
+            state.clean_net(&configurer).await?;
+            log::info!("cleaned");
+            // The config process resets a lot even though it's not an explicit clean
+        }
         Some(Commands::Exec { mut cmd, ns, pid }) => {
-            let path = "./netnsp.json";
-            let mut file = File::open(path).await?;
-            let mut contents = String::new();
-            file.read_to_string(&mut contents).await?;
-
-            let config: ConfigRes = serde_json::from_str(&contents)?;
+            let state = NetnspState::load(Default::default()).await?;
             let curr_inode = get_self_netns_inode()?;
-            let self_pid = nix::unistd::getpid();
+            let (u, g) = get_non_priv_user(None, None, None, None)?;
 
-            let parent_pid = nix::unistd::getppid();
-            let parent_process = match Process::new(parent_pid.into()) {
-                Ok(process) => process,
-                Err(_) => panic!("cannot access parent process"),
-            };
-            let puid = parent_process.status()?.euid;
-            let pgid = parent_process.status()?.egid;
-
-            if curr_inode != config.root_inode {
+            if curr_inode != state.res.root_inode {
                 log::error!("ACCESS DENIED");
                 std::process::exit(1);
             }
@@ -127,27 +100,16 @@ async fn main() -> Result<()> {
             if cmd.is_none() {
                 cmd = Some("fish".to_owned());
             }
-            log::info!(
-                "uid: {:?}, gid: {:?}, pid: {:?}",
-                nix::unistd::getresuid()?,
-                nix::unistd::getresgid()?,
-                self_pid
-            );
+
             if let Some(pi) = pid {
                 enter_ns_by_pid(pi)?;
             } else {
                 enter_ns_by_name(&ns).await?;
             }
 
-            drop_privs1(
-                nix::unistd::Gid::from_raw(pgid),
-                nix::unistd::Uid::from_raw(puid),
-            )?;
+            drop_privs1(nix::unistd::Gid::from_raw(u), nix::unistd::Uid::from_raw(g))?;
 
             let proc = std::process::Command::new(cmd.unwrap());
-
-            // proc.args(&[""]);
-
             let mut cmd_async: Command = proc.into();
             let mut t = cmd_async.spawn()?;
             t.wait().await?;
@@ -162,39 +124,27 @@ async fn main() -> Result<()> {
 
             if cli.pre {
                 match config_network(&configrer, &mut state).await {
-                    Ok(_) => {
+                    Result::Ok(_) => {
                         state.dump().await?;
-
-                        let mut sp = env::current_exe()?;
-                        sp.pop();
-                        sp.push("netnsp-sub");
-                        let sp1 = sp.into_os_string();
                         // start daemons
-                        let (puid, pgid) = get_non_priv_user(None, None)?;
+                        let (puid, pgid) = get_non_priv_user(None, None, None, None)?;
                         for name in state.profile_names() {
-                            let spx = sp1.clone();
 
                             set.spawn(async move {
-                                let spx = spx.clone();
                                 let mut path = PathBuf::from(NETNS_PATH);
                                 path.push(name.clone());
 
-                                use nix::fcntl::{open, OFlag};
-                                use nix::sys::stat::Mode;
-                                let fd = open(&path, OFlag::O_RDONLY, Mode::empty()).unwrap();
-
-                                log::info!("wait on {:?}, ns {}", spx, &name);
-
-                                let mut cmd = Command::new(spx.clone())
-                                    .arg(name.clone())
-                                    .arg(puid.to_string())
-                                    .arg(pgid.to_string())
-                                    .arg(fd.to_string())
-                                    .uid(0) // run it as root
-                                    .spawn()
-                                    .unwrap();
-                                let task = cmd.wait();
-                                let res = task.await;
+                                let netns_sub: NetnspSubCaller = NetnspSubCaller::default();
+                                let nsfile = open_wo_cloexec(&path);
+                                let res = netns_sub
+                                    .inner_daemon(
+                                        name.clone(),
+                                        puid.into(),
+                                        pgid.into(),
+                                        nsfile.as_raw_fd(),
+                                        None,
+                                    )
+                                    .await;
 
                                 (name, res)
                             });
@@ -220,7 +170,7 @@ async fn main() -> Result<()> {
                 let ns_names1 = util::convert_strings_to_strs(&hold);
                 while let Some(res) = set.join_next().await {
                     let idx = res.unwrap();
-                    log::error!(
+                    log::warn!(
                         "{} exited, with {:?}. re-cap, {}/{} running",
                         idx.0,
                         idx.1,
@@ -228,12 +178,22 @@ async fn main() -> Result<()> {
                         ns_names1.len()
                     );
                 }
+                Ok(())
             };
             // exit when either of them exits, because it shouldn't.
-            tokio::select! {
-                _ = tokio::spawn(w_t) => {}
-                _ = tokio::spawn(persis_ns) => {}
-            }
+            let _ = tokio::select! {
+                r = tokio::spawn(w_t) => {
+                    log::warn!("watcher detached");
+                    r?
+                }
+                r = tokio::spawn(persis_ns) => {
+                    log::warn!("persis_ns detached");
+                    r?
+                }
+            }?;
+            // XXX try to catch all the results so we don't get baffled when things happen. rust analyzer doesn't warn about it in macros.
+
+            log::info!("exit");
         }
     }
 
