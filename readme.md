@@ -84,6 +84,8 @@ with `netns-main exec --ns target_ns` it can start a process with everything unc
 
 - use [opensnitch firewall](https://github.com/evilsocket/opensnitch) as the second layer of defense, in case you do anything wrong, like launching an app outside netns.
 
+Some socks proxies support UDP, and some do not. The dnsproxy it starts by default runs on TCP.
+
 ## use with mullvad-browser
 
 0. enter netns with `netnsp-main exec --ns base_p`
@@ -137,3 +139,11 @@ It's possible to have network namespaces recursively, but directly running this 
 
 - https://github.com/nixpak/nixpak
 - https://sr.ht/~fgaz/nix-bubblewrap/
+
+todo
+
+- socks proxy tester
+  - does it support udp, tcp by ip, tcp by host
+- replace veth pair with socks proxy forwarder
+  - http for i2p
+  - if veth, block forward in netns

@@ -9,7 +9,7 @@
       "request": "attach",
       "name": "Attach to gdbserver",
       "executable": "${workspaceRoot}/taget/debug/netnsp-main",
-      "target": "10.212.113.95:2345",
+      "target": "127.0.0.1:2345",
       "remote": true,
       "cwd": "${workspaceRoot}",
       "valuesFormatting": "parseText"

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use tokio::{self, io::AsyncReadExt};
 
-pub const NETNS_PATH: &str = "/run/netns/";
+
 
 // generated info and state store
 #[derive(Serialize, Deserialize, Default)]

@@ -2,18 +2,26 @@
 use anyhow::{anyhow, Ok, Result};
 use clap::{Parser, Subcommand};
 
-use netns_proxy::sub::{NetnspSub, NetnspSubCaller};
-use netns_proxy::util::get_non_priv_user;
+use netns_proxy::sub::{IPConWire, IPConWirePayload, NetnspSub, NetnspSubCaller};
+use netns_proxy::util::ns::{
+    self, enter_ns_by_name, enter_ns_by_pid, get_self_netns_inode, self_netns_identify,
+};
 use netns_proxy::util::open_wo_cloexec;
+use netns_proxy::util::perms::*;
+use tokio_unix_ipc::Sender;
 
-use std::os::fd::AsRawFd;
+use std::env::Args;
+use std::os::fd::{AsRawFd, RawFd};
 use std::{env, path::PathBuf};
 use tokio::{fs::File, io::AsyncReadExt, process::Command, task::JoinSet};
 
-use netns_proxy::configurer::*;
 use netns_proxy::data::*;
+use netns_proxy::netlink::*;
 
+use dashmap::DashMap;
 use procfs::process::Process;
+use tarpc::tokio_serde::formats::{Bincode, SymmetricalBincode};
+use tarpc::{context, serde_transport};
 
 #[derive(Parser)]
 #[command(
@@ -49,7 +57,22 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut set = JoinSet::new();
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 3 {
+        let path: Result<PathBuf> = args[1].parse();
+        let my_fd: Result<RawFd> = args[2].parse();
+        if path.is_ok() && my_fd.is_ok() {
+            let my_fd: RawFd = my_fd?;
+            let sock_path = path.unwrap();
+            log::info!("Sub process started with fd {}", my_fd);
+            let conn =
+                serde_transport::unix::connect(sock_path.as_path(), Bincode::default).await?;
+            let b = BaseChannel::with_defaults(conn);
+            b.execute(NsubRPC.serve()).await;
+
+            return Ok(());
+        }
+    }
 
     flexi_logger::Logger::try_with_env_or_str(
         "debug,netnsp_main=trace,netns_proxy=trace,netnsp_sub=trace,netlink_proto=info,rustables=info",
@@ -58,6 +81,8 @@ async fn main() -> Result<()> {
     .log_to_stdout()
     .start()
     .unwrap();
+
+    let mut set = JoinSet::new();
     let cli = Cli::parse();
 
     tokio::spawn(async {
@@ -81,7 +106,7 @@ async fn main() -> Result<()> {
         Some(Commands::Clean {}) => {
             // It is hard to steer the system config state into the desired state
             // Things get messed up easily.
-            let configurer = Configurer::new();
+            let configurer = NetlinkConn::new();
             let state = NetnspState::load(Default::default()).await?;
             state.clean_net(&configurer).await?;
             log::info!("cleaned");
@@ -120,7 +145,7 @@ async fn main() -> Result<()> {
             use netns_proxy::watcher;
             let mut state = NetnspState::load(Default::default()).await?;
 
-            let configrer = Configurer::new();
+            let configrer = NetlinkConn::new();
 
             if cli.pre {
                 match config_network(&configrer, &mut state).await {
@@ -129,24 +154,25 @@ async fn main() -> Result<()> {
                         // start daemons
                         let (puid, pgid) = get_non_priv_user(None, None, None, None)?;
                         for name in state.profile_names() {
-
                             set.spawn(async move {
-                                let mut path = PathBuf::from(NETNS_PATH);
-                                path.push(name.clone());
-
                                 let netns_sub: NetnspSubCaller = NetnspSubCaller::default();
-                                let nsfile = open_wo_cloexec(&path);
-                                let res = netns_sub
-                                    .inner_daemon(
-                                        name.clone(),
-                                        puid.into(),
-                                        pgid.into(),
-                                        nsfile.as_raw_fd(),
-                                        None,
-                                    )
-                                    .await;
 
-                                (name, res)
+                                match ns::named_ns(&name) {
+                                    Err(e) => (name, Err(e)),
+                                    std::result::Result::Ok(f) => {
+                                        let res = netns_sub
+                                            .inner_daemon(
+                                                name.clone(),
+                                                puid.into(),
+                                                pgid.into(),
+                                                f.as_raw_fd(),
+                                                None,
+                                            )
+                                            .await;
+
+                                        (name, res)
+                                    }
+                                }
                             });
                         }
                     }

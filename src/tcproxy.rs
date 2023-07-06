@@ -6,13 +6,10 @@ use tokio::{
 };
 
 use anyhow::Result;
-
-use crate::configurer;
-
 // for use in the gateway-ish ns instances
 // some socks proxies have strict a security policy, and I couldn't bother studying nftables.
 pub async fn start_proxy(port: u16) -> Result<()> {
-    let selfns = configurer::self_netns_identify().await;
+    let selfns = crate::util::ns::self_netns_identify().await;
     let proxy_server =
         TcpListener::bind(SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), port + 1)).await?;
     // If we don't do this, it will say Address already in use, and starts a loop with itself.

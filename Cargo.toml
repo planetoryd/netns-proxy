@@ -34,6 +34,9 @@ either = "1.8.1"
 pidfd = "0.2.4"
 xdg = "2.5.0"
 thiserror = "1.0.40"
+socksv5 = { version = "0.3.1", features = ["tokio"] }
+tarpc = { version = "0.33.0", features = ["serde-transport", "unix", "serde-transport-bincode"] }
+dashmap = "5.4.0"
 
 [profile.release]
 strip = true

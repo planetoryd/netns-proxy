@@ -31,13 +31,11 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::{io::AsyncReadExt, sync::RwLock, task::JoinSet};
 use zbus::{dbus_interface, dbus_proxy, Connection};
 
-use crate::configurer::{
-    self, ensure_ns_not_root, get_self_netns_inode, nsfd_by_path, orchestrate_newns,
-    veth_from_base,
-};
+use crate::netlink::{self, orchestrate_newns, veth_from_base};
+use crate::data::*;
+use crate::util::{ns::*, open_wo_cloexec};
 use crate::util::{flatpak_perms_checkup, kill_children};
 use ini;
-use crate::data::*;
 
 struct NetnspDbus;
 
@@ -81,14 +79,14 @@ use crate::NetnspState;
 pub struct WatcherState {
     netnsp: NetnspState,
     daemons: RwLock<JoinSet<(String, anyhow::Result<()>)>>,
-    configurer: configurer::Configurer,
+    configurer: netlink::NetlinkConn,
     send_task: UnboundedSender<Pin<Box<dyn Future<Output = (String, Result<()>)> + Send>>>,
     recv_task: UnboundedReceiver<Pin<Box<dyn Future<Output = (String, Result<()>)> + Send>>>,
 }
 
 impl WatcherState {
     pub async fn create(
-        configurer: configurer::Configurer,
+        configurer: netlink::NetlinkConn,
         state: NetnspState,
     ) -> Result<WatcherState> {
         log::info!("watcher started");
@@ -120,7 +118,7 @@ impl WatcherState {
         } else {
             // if the json does not contain inode (which is malformed), serde should error
             // therefore, here it is initalizing.
-            self.netnsp.res.root_inode = crate::get_pid1_netns_inode().await?;
+            self.netnsp.res.root_inode = crate::util::ns::get_pid1_netns_inode().await?;
         }
 
         Ok(())
@@ -200,7 +198,7 @@ impl WatcherState {
             (
                 task_name.clone(),
                 async move {
-                    use crate::util::get_non_priv_user;
+                    use crate::util::perms::get_non_priv_user;
                     let (puid, pgid) = get_non_priv_user(None, None, None, None)?;
                     use nix::fcntl::{open, OFlag};
                     use nix::sys::stat::Mode;
@@ -261,9 +259,9 @@ impl WatcherState {
         let proc_ns = nss
             .get(&o)
             .ok_or(anyhow::anyhow!("ns/net not found for given pid"))?;
-        let proc_ns_fd = nsfd_by_path(&proc_ns.path.as_path())?;
-        ensure_ns_not_root(proc_ns_fd)?;
-        configurer::config_pre_enter_ns(&ps.net, &self.configurer, proc_ns_fd.as_raw_fd()).await?;
+        let proc_ns_fd = open_wo_cloexec(&proc_ns.path.as_path())?;
+        ensure_ns_not_root(proc_ns_fd.as_raw_fd())?;
+        netlink::config_pre_enter_ns(&ps.net, &self.configurer, proc_ns_fd.as_raw_fd()).await?;
         self.netnsp
             .nft_for_interface(&veth_from_base(&ps.net.veth_base_name, true))
             .await?;
@@ -275,10 +273,10 @@ impl WatcherState {
             .unwrap()
             .get_mut(&pid)
             .unwrap();
-        configurer::config_pre_enter_ns_up(&ps.net, &self.configurer).await?;
-        orchestrate_newns(&mut ps.net, params, &self.configurer, proc_ns_fd).await?;
+        netlink::config_pre_enter_ns_up(&ps.net, &self.configurer).await?;
+        orchestrate_newns(&mut ps.net, params, &self.configurer, proc_ns_fd.as_raw_fd()).await?;
         self.netnsp.dump().await?;
-        nix::unistd::close(proc_ns_fd)?;
+        nix::unistd::close(proc_ns_fd.as_raw_fd())?;
         // may be flatpak app_id or that of other sandbox systems
         self.start_netnsp_sub(pid).await?;
         Ok(())
@@ -498,7 +496,7 @@ async fn process_event<'a>(
 
 // for flatpak and more
 pub async fn fs_watcher<'a>(watcher: &mut WatcherState) -> Result<()> {
-    use crate::util::get_non_priv_user;
+    use crate::util::perms::get_non_priv_user;
     let (uid, _) = get_non_priv_user(None, None, None, None)?;
     let flatpak_dir = PathBuf::from(format!("/run/user/{}/.flatpak/", uid));
     log::debug!("flatpak watcher started");

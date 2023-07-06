@@ -13,7 +13,9 @@ use tokio::{self};
 
 use netns_proxy::sub::{NetnspSub, NetnspSubImpl};
 
-// this will run inside netns
+// There should be one netnsp-sub process for each managed netns
+// Start new processes because tokio spans across threads.
+use procspawn;
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = std::env::args();
@@ -46,7 +48,7 @@ async fn main() -> Result<()> {
     } else {
         if arglen == 2 {
             netnsub
-                .remove_veth_in_ns(args.next().unwrap().parse()?, args.next().unwrap())
+                .remove_vethb_in_ns(args.next().unwrap().parse()?, args.next().unwrap())
                 .await?;
         } else if arglen == 3 {
             netnsub

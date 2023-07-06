@@ -4,16 +4,21 @@
 #![feature(exit_status_error)]
 #![feature(setgroups)]
 #![feature(get_mut_unchecked)]
-use anyhow::Result;
-use futures::TryFutureExt;
+use anyhow::{bail, Result};
+use futures::{AsyncRead, Future, SinkExt, StreamExt, TryFutureExt};
 use ipnetwork::IpNetwork;
+use serde::{Deserialize, Serialize};
+use tarpc::server::{BaseChannel, Channel};
+use tarpc::tokio_util::codec::{self, LengthDelimitedCodec};
+use tokio::io::BufStream;
 
 use crate::*;
 
 use anyhow::Ok;
 
-use nix::unistd::{Gid, Pid, Uid};
+use nix::unistd::{unlink, Gid, Pid, Uid};
 
+use std::sync::Arc;
 use std::{net::Ipv4Addr, os::fd::RawFd, path::PathBuf};
 use std::{os::unix::process::CommandExt, process::Stdio};
 
@@ -24,10 +29,14 @@ use tokio::{
     process::Command,
 };
 
+use crate::util::ns::*;
 use data::*;
 use util::substitute_argv;
 
 use anyhow::anyhow;
+use tarpc::tokio_serde::formats::{Bincode, SymmetricalBincode};
+use tarpc::{context, serde_transport};
+use dashmap::DashMap;
 
 // more invariant, the better
 // traits are invariant
@@ -35,7 +44,7 @@ use anyhow::anyhow;
 pub trait NetnspSub {
     async fn config_in_ns_up(&self, fd: RawFd, link_base_name: String, ip: IpNetwork)
         -> Result<()>;
-    async fn remove_veth_in_ns(&self, fd: RawFd, veth_base_name: String) -> Result<()>;
+    async fn remove_vethb_in_ns(&self, fd: RawFd, veth_base_name: String) -> Result<()>;
     async fn inner_daemon(
         &self,
         profile: String,
@@ -44,86 +53,87 @@ pub trait NetnspSub {
         fd: RawFd,
         pid: Option<Pid>, // for non-persistent netns
     ) -> Result<()>;
+    async fn with_ipc(&self, sname: String) -> Result<()>;
+}
+
+use tarpc::{client, server};
+
+#[tarpc::service]
+pub trait NsubService {
+    async fn id() -> RawFd;
+    async fn remove_link(k: LinkKey) -> bool;
+    async fn p() ;
+}
+
+#[derive(Clone)]
+struct NsubRPC;
+
+#[tarpc::server]
+impl NsubService for NsubRPC {
+    async fn id(self, _: tarpc::context::Context) -> RawFd {
+        2.into()
+    }
+    async fn remove_link(self, _: tarpc::context::Context, k: LinkKey) -> bool {
+        true
+    }
 }
 
 pub struct NetnspSubImpl;
-#[derive(Clone)]
+
 pub struct NetnspSubCaller {
-    path: PathBuf,
-    name: String,
+    sock_path: PathBuf,
+    subs: Arc<DashMap<RawFd, NsubServiceClient>>
 }
 
-impl Default for NetnspSubCaller {
-    fn default() -> Self {
-        let mut path = std::env::current_exe().unwrap();
-        let name = "netnsp-sub".to_owned();
-        path.pop();
-        path.push(name.clone());
-        Self { name, path }
-    }
-}
-
-// each call starts a new process
-impl NetnspSub for NetnspSubCaller {
-    async fn remove_veth_in_ns(&self, fd: RawFd, veth_base_name: String) -> Result<()> {
-        let mut cmd = Command::new(self.path.clone())
-            .arg(fd.to_string())
-            .arg(veth_base_name)
-            .uid(0) // run it as root
-            .spawn()
-            .unwrap();
-
-        let task = cmd.wait();
-        task.await?;
-        Ok(())
-    }
-    async fn config_in_ns_up(
-        &self,
-        fd: RawFd,
-        link_base_name: String,
-        ip: IpNetwork,
-    ) -> Result<()> {
-        let mut cmd = Command::new(self.path.clone())
-            .arg(fd.to_string())
-            .arg(link_base_name)
-            .arg(ip.to_string())
-            .uid(0) // run it as root
-            .spawn()
-            .unwrap();
-
-        let task = cmd.wait();
-        task.await?;
-        Ok(())
-    }
-    async fn inner_daemon(
-        &self,
-        profile: String,
-        uid: Uid,
-        gid: Gid,
-        fd: RawFd,
-        pid: Option<Pid>, // for non-persistent netns
-    ) -> Result<()> {
-        let mut cmd = Command::new(self.path.clone());
-        cmd.arg(profile.to_string())
-            .arg(uid.to_string())
-            .arg(gid.to_string())
-            .arg(fd.to_string());
-        if pid.is_some() {
-            cmd.arg(pid.unwrap().to_string());
+impl NetnspSubCaller {
+    /// only need one per program
+    async fn init() -> Result<Self> {
+        // TODO: security
+        let sock_path: PathBuf = "./netnsp.sock".into();
+        if sock_path.exists() {
+            unlink(sock_path.as_path())?;
         }
-        let mut c = cmd.uid(0).spawn().unwrap();
+        let subs = Arc::new(DashMap::new());
+        let mut sock = serde_transport::unix::listen(sock_path.as_path(), Bincode::default).await?;
+        let sub_m = subs.clone();
+        tokio::spawn(async move {
+            while let Some(s) = sock.next().await {
+                let s: _ = s?;
+                let c = NsubServiceClient::new(Default::default(), s).spawn();
+                // the peer_addr is unnamed, so it must self identify.
+                let fd = c.id(context::current()).await?;
+                sub_m.insert(fd.into(), c);
+            }
+            Ok(())
+        });
+        Ok(Self {
+            sock_path,
+            subs,
+        })
+    }
+    /// start a new sub
+    /// new sub for each ns
+    async fn new_sub(&mut self, fd: RawFd) -> Result<()> {
+        let mut cmd = Command::new(std::env::current_exe()?)
+            .arg(self.sock_path.as_path())
+            .arg(fd.to_string())
+            .uid(0) // run it as root
+            .spawn()
+            .unwrap();
 
-        let task = c.wait();
+        let task = cmd.wait();
         task.await?;
+
         Ok(())
     }
 }
+
 
 impl NetnspSub for NetnspSubImpl {
     /// veth_b is removed from ns
-    async fn remove_veth_in_ns(&self, fd: RawFd, veth_base_name: String) -> Result<()> {
+    async fn remove_vethb_in_ns(&self, fd: RawFd, veth_base_name: String) -> Result<()> {
         enter_ns_by_fd(fd)?;
-        let configurer = Configurer::new();
+        let configurer = NetlinkConn::new();
         let rh = configurer
             .get_link(&veth_from_base(&veth_base_name, false))
             .await;
@@ -148,7 +158,7 @@ impl NetnspSub for NetnspSubImpl {
     ) -> Result<()> {
         log::trace!("set ns->ns link up in target ns and add ip");
         enter_ns_by_fd(fd)?;
-        let configurer = Configurer::new();
+        let configurer = NetlinkConn::new();
         let rh = configurer
             .get_link(&veth_from_base(&link_base_name, false))
             .await;
@@ -208,7 +218,7 @@ impl NetnspSub for NetnspSubImpl {
             config.try_get_netinfo(pid.as_ref().unwrap().as_raw())?
         };
 
-        let configurer = Configurer::new();
+        let configurer = NetlinkConn::new();
 
         configurer.set_up("lo").await?;
         configurer
@@ -238,7 +248,7 @@ impl NetnspSub for NetnspSubImpl {
         let ip_vh_ip = ip_vh.ip().to_string();
         let r_ui: u32;
         let r_gi: u32;
-        use util::get_non_priv_user;
+        use util::perms::get_non_priv_user;
         (r_ui, r_gi) = get_non_priv_user(None, None, Some(uid), Some(gid))?;
 
         // the uid and gid for non-privileged processes
@@ -435,6 +445,8 @@ impl NetnspSub for NetnspSubImpl {
 
             // the code above does not work, for unknown reasons
             // and I don't want to spend more hours on this blend of async, system, stochastic programming
+
+            // I think my firewall made it not work.
 
             let mut path = std::env::current_exe()?;
             path.pop();
