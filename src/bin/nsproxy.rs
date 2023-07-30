@@ -80,6 +80,8 @@ async fn main() -> Result<()> {
                 serde_transport::unix::connect(sock_path.as_path(), Bincode::default).await?;
             let b = BaseChannel::with_defaults(conn);
             b.execute(NsubRPC.serve()).await;
+            // which means, this process exits when the connection gets closed
+            // I have experimented too.
             return Ok(());
         }
     }
@@ -145,9 +147,9 @@ async fn main() -> Result<()> {
         None => {
             // Run as a daemon
             let paths = Arc::new(ConfPaths::default());
-            let mut mn: MultiNS = MultiNS::new(paths).await?;
             let mut state: NetnspState = NetnspState::load(Default::default()).await?;
             let mut dae = Daemons::new();
+            let mut mn: MultiNS = MultiNS::new(paths, dae.sender.clone()).await?;
             state.derive_all_named().await?;
             state.initial_nft().await?;
             state.resume(&mut mn, &dae.sender).await?;
@@ -182,6 +184,7 @@ async fn event_handler(
                 state.derive_flatpak(fp.clone()).await?;
                 let inf = state.derivative.flatpak.get(&fp.pid).ok_or(DevianceError)?;
                 inf.apply_veths(&mn, &state.derivative).await?;
+                inf.run(&dae, &mn.procs).await?;
                 // inf.run()
             }
         }

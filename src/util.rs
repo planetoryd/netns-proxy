@@ -20,6 +20,7 @@ use nix::unistd::Uid;
 use procfs::process::Process;
 use serde::Deserialize;
 use serde::Serialize;
+use tarpc::client::RpcError;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -229,7 +230,7 @@ fn t_pidfd() -> Result<()> {
         .block_on(async {
             let f = unsafe { pidfd::PidFd::open(853481, 0)?.into_future() };
             println!("opened");
-            f.await;
+            f.await?;
             println!("finished");
             Ok(())
         })
@@ -326,42 +327,6 @@ fn test_flatpakperm() -> Result<()> {
 }
 
 use crate::data::SubjectInfo;
-#[test]
-fn test_substitute_argv() {
-    // let n_info = NetnsInfo {
-    //     base_name: "x".to_owned(),
-    //     subnet_veth: "127.0.0.1/8".parse().unwrap(),
-    //     subnet6_veth: "eth1".parse().unwrap(),
-    //     ip_va: "192.168.0.1".parse().unwrap(),
-    //     ip6_va: "2001:db8::1".parse().unwrap(),
-    //     ip_vb: "192.168.0.2".parse().unwrap(),
-    //     ip6_vb: "2001:db8::2".parse().unwrap(),
-    //     veth_root2ns: "ss".parse().unwrap(),
-    //     id: 2,
-    //     tun_ip: None,
-    //     veth_ns2ns: None,
-    //     nsid: None
-    // };
-
-    // let mut argv = vec![
-    //     "ping".to_string(),
-    //     "-c".to_string(),
-    //     "1".to_string(),
-    //     "$ip_vnxx".to_string(),
-    // ];
-
-    // substitute_argv(&n_info, &mut argv);
-
-    // assert_eq!(
-    //     argv,
-    //     vec![
-    //         "ping".to_string(),
-    //         "-c".to_string(),
-    //         "1".to_string(),
-    //         "192.168.0.2xx".to_string(),
-    //     ]
-    // );
-}
 
 use sysinfo::System;
 
@@ -606,43 +571,9 @@ pub mod error {
     #[error("Something is missing, and it can be handled")]
     pub struct MissingError;
 
-    // ? operator automatically converts anyhow error to SErr
-    impl From<anyhow::Error> for SErr {
-        fn from(value: anyhow::Error) -> Self {
-            // must log error here
-            log::error!("{:?}", value);
-            let s = SError::new(&*value);
-            Self(s)
-        }
-    }
-
-    impl From<DevianceError> for SErr {
-        fn from(value: DevianceError) -> Self {
-            // must log error here
-            log::error!("{:?}", value);
-            let s = SError::new(&value);
-            Self(s)
-        }
-    }
-
-    impl From<MissingError> for SErr {
-        fn from(value: MissingError) -> Self {
-            // must log error here
-            log::error!("{:?}", value);
-            let s = SError::new(&value);
-            Self(s)
-        }
-    }
-
     use serde_error::Error as SError;
 
-    // TODO: serde-error doesn't send backtrace on wire. as a workaround we just print it here
-
-    #[derive(Serialize, Deserialize, Debug, Error)]
-    #[error("serializable error")]
-    pub struct SErr(SError);
-
-    pub fn se_ok() -> Result<(), SErr> {
+    pub fn se_ok() -> Result<(), SError> {
         Result::Ok(())
     }
 }
@@ -662,6 +593,8 @@ pub struct TaskOutput {
     /// notified in case the task stops
     pub sig: Option<oneshot::Sender<()>>,
 }
+
+use serde_error::Error as SErr;
 
 impl TaskOutput {
     pub fn new(
@@ -701,6 +634,54 @@ impl TaskOutput {
                         Ok(())
                     }
                     Err(e) => Err(e.into()),
+                };
+                TaskOutput {
+                    name,
+                    result: r,
+                    sig: Some(sx),
+                }
+            }),
+            rx,
+        )
+    }
+    pub fn rpc(
+        f: Pin<Box<dyn Future<Output = Result<Result<(), SErr>, RpcError>> + Send>>,
+        name: String,
+    ) -> (
+        Pin<Box<dyn Future<Output = TaskOutput> + Send>>,
+        Receiver<()>,
+    ) {
+        let (sx, rx) = oneshot::channel();
+        (
+            Box::pin(async move {
+                let r = f.await;
+                let r = match r {
+                    Result::Ok(x) => x.map_err(|x| anyhow::Error::from(x)),
+                    Err(x) => Result::<(), _>::Err(x.into()),
+                };
+                TaskOutput {
+                    name,
+                    result: r,
+                    sig: Some(sx),
+                }
+            }),
+            rx,
+        )
+    }
+    pub fn wrapped<E: std::error::Error + Send + Sync + 'static>(
+        f: Pin<Box<dyn Future<Output = Result<Result<()>, E>> + Send>>,
+        name: String,
+    ) -> (
+        Pin<Box<dyn Future<Output = TaskOutput> + Send>>,
+        Receiver<()>,
+    ) {
+        let (sx, rx) = oneshot::channel();
+        (
+            Box::pin(async move {
+                let r = f.await;
+                let r = match r {
+                    Result::Ok(x) => x,
+                    Err(x) => Err::<(), anyhow::Error>(x.into()),
                 };
                 TaskOutput {
                     name,

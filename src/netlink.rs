@@ -985,10 +985,10 @@ impl ConfPaths {
 }
 
 impl MultiNS {
-    pub async fn new(paths: Arc<ConfPaths>) -> Result<MultiNS> {
+    pub async fn new(paths: Arc<ConfPaths>, dae: DaemonSender) -> Result<MultiNS> {
         let ct = proxy::ProxyCtx::new(paths.sock4proxy())?;
         let mn = MultiNS {
-            procs: NetnspSubCaller::init().await?,
+            procs: NetnspSubCaller::init(dae).await?,
             subs: DashMap::new(),
             paths,
             proxy_ctx: Arc::new(RwLock::new(ct)),

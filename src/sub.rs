@@ -11,6 +11,7 @@ use tokio::net::UnixDatagram;
 use tokio::sync::{mpsc, oneshot, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::data::*;
+use crate::util::error::se_ok;
 use crate::util::perms::get_non_priv_user;
 use crate::*;
 use anyhow::Ok;
@@ -38,13 +39,12 @@ use tarpc::tokio_serde::formats::{Bincode, SymmetricalBincode};
 use tarpc::{context, serde_transport};
 
 use tarpc::{client, server};
-use tokio::fs::File;
 
 // I briefly tried to proxy the netink socket. It feels like too much trouble.
 // And the kernel could do it without needless proxying
 
 use rtnetlink::proxy::{self, ProxySocketType};
-use util::error::{se_ok, SErr};
+use serde_error::Error as SErr;
 
 #[tarpc::service]
 pub trait NsubService {
@@ -53,6 +53,7 @@ pub trait NsubService {
     async fn proxy(sock: PathBuf) -> Result<(), SErr>;
     /// Will return when processes exit
     async fn daemons_n(info: SubjectInfo<NamedV>) -> Result<(), SErr>;
+    async fn daemons_f(info: SubjectInfo<FlatpakV>) -> Result<(), SErr>;
 }
 
 #[tarpc::server]
@@ -61,7 +62,9 @@ impl NsubService for NsubRPC {
         let mut gs = global_state_mut().await?;
         let conn = ConnRef::new(Arc::new(NetlinkConn::new_in_current_ns()));
         gs.ns = Netns::enter(id, conn).await?;
-        gs.dae = Daemons::new();
+        let mut dae = Daemons::new();
+        gs.dae = dae.sender.clone();
+        tokio::spawn(async move { dae.run().await });
         se_ok()
     }
     async fn proxy(self, _: tarpc::context::Context, sock: PathBuf) -> Result<(), SErr> {
@@ -77,8 +80,17 @@ impl NsubService for NsubRPC {
         let mut gs = global_state_mut().await?;
         (gs.non_priv_uid, gs.non_priv_gid) = get_non_priv_user(None, None, None, None)?;
 
-        // won't return for long.
-        gs.dae.run().await?;
+        se_ok()
+    }
+    async fn daemons_f(
+        self,
+        _: tarpc::context::Context,
+        info: SubjectInfo<FlatpakV>,
+    ) -> Result<(), SErr> {
+        info.assure_in_ns()?;
+        let mut gs = global_state_mut().await?;
+        (gs.non_priv_uid, gs.non_priv_gid) = get_non_priv_user(None, None, None, None)?;
+
         se_ok()
     }
 }
@@ -105,12 +117,27 @@ impl SubjectInfo<NamedV> {
     }
 }
 
+impl SubjectInfo<FlatpakV> {
+    pub async fn run(&self, dae: &DaemonSender, sub: &NetnspSubCaller) -> Result<()> {
+        let (s, _) = sub.op(self.ns.clone()).await?;
+        let s = s.to_owned();
+        let cloned = self.clone();
+        let n = format!("{}/daemons", self.id);
+        let (t, r) = TaskOutput::rpc(
+            Box::pin(async move { s.daemons_f(current(), cloned).await }),
+            n,
+        );
+        dae.send(t).unwrap();
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct NsubRPC;
 
 pub struct NsubState {
     pub ns: Netns,
-    pub dae: Daemons,
+    pub dae: DaemonSender,
     pub non_priv_uid: u32,
     pub non_priv_gid: u32,
 }
@@ -148,7 +175,7 @@ pub type NsubClient<'a> = Ref<'a, NSID, NsubServiceClient>;
 
 impl NetnspSubCaller {
     /// only need one per program
-    pub async fn init() -> Result<Self> {
+    pub async fn init(dae: DaemonSender) -> Result<Self> {
         // TODO: security
         let sock_path: PathBuf = "./netnsp.sock".into();
         if sock_path.exists() {
@@ -158,7 +185,7 @@ impl NetnspSubCaller {
         let mut sock = serde_transport::unix::listen(sock_path.as_path(), Bincode::default).await?;
         let sub_m = subs.clone();
         let (sx, mut rx) = mpsc::channel::<(NSID, oneshot::Sender<()>)>(5);
-        tokio::spawn(async move {
+        let server = tokio::spawn(async move {
             while let Some(s) = sock.next().await {
                 let s = s?;
                 let c = NsubServiceClient::new(Default::default(), s).spawn();
@@ -177,6 +204,8 @@ impl NetnspSubCaller {
             }
             Ok(())
         });
+        let (t, r) = TaskOutput::wrapped(Box::pin(server), "RPC server".to_owned());
+        dae.send(t).unwrap();
 
         Ok(Self {
             sock_path,

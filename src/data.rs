@@ -214,6 +214,8 @@ pub struct RVethConn {
     pub target: NSRef,
 }
 
+/// userland proxy. used when, for ex. the source proxy only listens on 127.1 
+/// src can be the same as subject NS. 
 /// ip in src ns is implied to be 127.1
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct RProxy {
@@ -222,6 +224,7 @@ pub struct RProxy {
     pub port: u16,
     pub port_local: u16,
 }
+// sometimes netfilter forwarding can be hard to set up, so this can be used.
 
 /// Addr through which the subject accesses an external object
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -291,11 +294,6 @@ impl<V: VSpecifics> SubjectInfo<V> {
         mn.subs.insert(self.ns.clone(), ns);
         Ok(())
     }
-    pub async fn daemons(&self, mn: &mut MultiNS) -> Result<()> {
-        let (sub, _) = mn.procs.op(self.ns.to_owned()).await?;
-
-        Ok(())
-    }
     pub fn assure_in_ns(&self) -> Result<()> {
         let c = NSID::proc()?;
         anyhow::ensure!(c == self.ns);
@@ -322,7 +320,7 @@ impl<V: VSpecifics> SubjectInfo<V> {
         rx.await?; // wait for first line to appear
         let tunk: LinkKey = tun_name.parse()?;
         let tun = st.ns.netlink.links.get_mut(&tunk).ok_or(DevianceError)?;
-        tun.up(st.ns.netlink.conn.get());
+        tun.up(st.ns.netlink.conn.get()).await?;
         let _ = st
             .ns
             .netlink
@@ -339,7 +337,49 @@ impl<V: VSpecifics> SubjectInfo<V> {
             .await;
 
         let (t, r) = TaskOutput::subprocess(Box::pin(async move { tun2h.wait().await }), pre);
-        st.dae.sender.send(t);
+        st.dae.send(t).unwrap();
+
+        Ok(())
+    }
+    pub async fn run_dnsp(&self, st: &mut NsubState) -> Result<()> {
+        use crate::netlink::*;
+        use crate::util::{watch_both, watch_log};
+        let tun_name = "s_tun";
+        let mut tun2 = std::process::Command::new("tun2socks");
+        tun2.uid(st.non_priv_uid.into())
+            .gid(st.non_priv_gid.into())
+            .groups(&[st.non_priv_gid.into()]);
+        let prxy = format!("socks5://{}", self.tun2s.unwrap().to_string());
+        tun2.args(&["-device", tun_name, "-proxy", &prxy]);
+        let mut tun2_async: Command = tun2.into();
+        tun2_async.stdout(Stdio::piped());
+        let mut tun2h = tun2_async.spawn()?;
+        let stdout = tun2h.stdout.take().unwrap();
+        let reader = tokio::io::BufReader::new(stdout).lines();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let pre = format!("{}/tun2socks", self.id);
+        tokio::spawn(watch_log(reader, Some(tx), pre.clone()));
+        rx.await?; // wait for first line to appear
+        let tunk: LinkKey = tun_name.parse()?;
+        let tun = st.ns.netlink.links.get_mut(&tunk).ok_or(DevianceError)?;
+        tun.up(st.ns.netlink.conn.get()).await?;
+        let _ = st
+            .ns
+            .netlink
+            .conn
+            .get()
+            .ip_add_route(tun.index, None, Some(true))
+            .await;
+        let _ = st
+            .ns
+            .netlink
+            .conn
+            .get()
+            .ip_add_route(tun.index, None, Some(false))
+            .await;
+
+        let (t, r) = TaskOutput::subprocess(Box::pin(async move { tun2h.wait().await }), pre);
+        st.dae.send(t).unwrap();
 
         Ok(())
     }
