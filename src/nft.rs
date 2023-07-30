@@ -34,24 +34,30 @@ pub struct NftChain {
 // ensure those rules exist
 // if not, incrementally update
 pub fn ensure_rules(proposal: NftState) -> Result<()> {
-    let ts: Vec<Table> = list_tables()?;
-    let e_set: HashSet<&String> = ts.iter().flat_map(|table| table.get_name()).collect();
+    let exis_tables: Vec<Table> = list_tables()?;
+    let exis_tables_names: HashSet<&String> = exis_tables
+        .iter()
+        .flat_map(|table| table.get_name())
+        .collect();
     // do a quick scan for consistency, and if diff is small, update incrementally, else remove & re-add
     let mut batch: Batch = Batch::new();
-    for (name, ta) in proposal.tables {
-        if e_set.contains(&name) {
+    for (p_table_name, proposed_table) in proposal.tables {
+        if exis_tables_names.contains(&p_table_name) {
             // the comparison isn't that strict / careful. mostly against misconfig, not adversaries
-            let chains = list_chains_for_table(&ta.table)?;
-            let c_set: HashSet<&String> =
-                chains.iter().flat_map(|table| table.get_name()).collect();
-            for (c_name, ca) in ta.chains {
-                if c_set.contains(&c_name) {
-                    let mut rules: Vec<Rule> = list_rules_for_chain(&ca.chain)?;
-                    for r in rules.iter_mut() {
+            let exis_chains = list_chains_for_table(&proposed_table.table)?;
+            let exis_chain_names: HashSet<&String> = exis_chains
+                .iter()
+                .flat_map(|chain| chain.get_name())
+                .collect();
+            for (c_name, p_chain) in proposed_table.chains {
+                if exis_chain_names.contains(&c_name) {
+                    let mut exis_rules: Vec<Rule> = list_rules_for_chain(&p_chain.chain)?;
+                    for r in exis_rules.iter_mut() {
                         r.essentialize();
                     }
-                    let exi_set: HashSet<&Rule> = HashSet::from_iter(rules.iter());
-                    let expec_set: HashSet<&Rule> = HashSet::from_iter(ca.rules.iter());
+
+                    let exi_set: HashSet<&Rule> = HashSet::from_iter(exis_rules.iter());
+                    let expec_set: HashSet<&Rule> = HashSet::from_iter(p_chain.rules.iter());
                     if exi_set.is_subset(&expec_set) {
                         // add all the missing rules
                         let add_diff = &expec_set - &exi_set;
@@ -67,31 +73,30 @@ pub fn ensure_rules(proposal: NftState) -> Result<()> {
                         // remove and re-add
                         // we take full-control of a chain
                         log::trace!("chain {} contaminated, re-adding", c_name);
-                        for rule in rules {
+                        for rule in exis_rules {
+                            // remove every old rule
                             batch.add(&rule, MsgType::Del);
                         }
-                        for rule in &ca.rules {
+                        for rule in &p_chain.rules {
                             batch.add(rule, MsgType::Add);
                         }
-                        // Note that after I decided to always re-add veths, the existing/expected rules will always be different
-                        // specifically in the CMP data of interface indices, and therefore, re-added.
                     }
                 } else {
                     // add chain
                     log::trace!("adding new chain {}", c_name);
-                    batch.add(&ca.chain, MsgType::Add);
-                    for rule in &ca.rules {
+                    batch.add(&p_chain.chain, MsgType::Add);
+                    for rule in &p_chain.rules {
                         batch.add(rule, MsgType::Add);
                     }
                 }
             }
             // do nothing to other chains if they exist
         } else {
-            log::trace!("adding new table {}", name);
-            batch.add(&ta.table, MsgType::Add);
-            for (_c_name, ca) in ta.chains.iter() {
-                batch.add(&ca.chain, MsgType::Add);
-                for rule in &ca.rules {
+            log::trace!("adding new table {}", p_table_name);
+            batch.add(&proposed_table.table, MsgType::Add);
+            for (_, p_chain) in proposed_table.chains.iter() {
+                batch.add(&p_chain.chain, MsgType::Add);
+                for rule in &p_chain.rules {
                     batch.add(rule, MsgType::Add);
                 }
             }
@@ -143,4 +148,34 @@ pub fn drop_interface_rule(i_name: &str, chain: &Chain) -> Result<Rule> {
         .with_expr(Immediate::new_verdict(VerdictKind::Drop));
 
     Ok(r)
+}
+
+#[derive(Default, Debug)]
+pub struct IncrementalNft {
+    links: Vec<String>,
+}
+
+use rustables::*;
+impl IncrementalNft {
+    pub fn drop_packets_from(&mut self, name: String) {
+        log::info!("add nft rule for {}", name);
+        self.links.push(name);
+    }
+    /// blocking socket
+    pub fn execute(&mut self) -> Result<()> {
+        let table = Table::new(ProtocolFamily::Inet).with_name(TABLE_NAME.to_owned());
+        let chain = Chain::new(&table)
+            .with_hook(Hook::new(HookClass::Forward, 0))
+            .with_name(FO_CHAIN)
+            .with_policy(ChainPolicy::Accept);
+        let mut batch: Batch = Batch::new();
+        for name in self.links.iter() {
+            let rule = drop_interface_rule(name, &chain)?;
+            batch.add(&rule, MsgType::Add);
+        }
+        batch.send()?;
+        self.links.clear();
+
+        Ok(())
+    }
 }

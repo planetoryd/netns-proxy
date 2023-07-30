@@ -5,23 +5,17 @@
 #![feature(exit_status_error)]
 #![feature(setgroups)]
 #![feature(get_mut_unchecked)]
+#![feature(adt_const_params)]
+#![feature(assert_matches)]
+#![feature(generators, generator_trait)]
 
-use nix::libc::{kill, SIGTERM};
-
-use std::collections::HashMap;
-
-use sysinfo::{self, PidExt, ProcessExt, System, SystemExt};
-use tokio::{self};
 pub mod data;
 pub mod netlink;
-mod nft;
+pub mod nft;
 pub mod sub;
 pub mod tcproxy;
 pub mod util;
 pub mod watcher;
-
-use data::*;
-use netlink::*;
 
 
 // Standard procedure

@@ -1295,6 +1295,7 @@ dependencies = [
  "anyhow",
  "clap 4.3.5",
  "dashmap",
+ "derivative",
  "either",
  "flexi_logger",
  "futures",
@@ -1312,6 +1313,7 @@ dependencies = [
  "rust-ini",
  "rustables",
  "serde",
+ "serde-error",
  "serde_json",
  "socksv5",
  "sysinfo",
@@ -1908,6 +1910,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e8c8cf938e98f769bc164923b06dce91cea1751522f46f8466461af04c9027d"
 dependencies = [
  "serde_derive",
+]
+
+[[package]]
+name = "serde-error"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e988182713aeed6a619a88bca186f6d6407483485ffe44c869ee264f8eabd13f"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

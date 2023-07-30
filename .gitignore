@@ -7,4 +7,4 @@ local
 .cargo
 .vscode/settings.json
 .vscode/launch.json
-.vscode
+.vscode/

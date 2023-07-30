@@ -38,6 +38,7 @@ async fn handle_client_conn(mut client_conn: TcpStream, port: u16) -> Result<()>
     let (mut client_recv, mut client_send) = client_conn.split();
     let (mut server_recv, mut server_send) = main_server_conn.split();
 
+    // TODO use std io copy
     let handle_one = async { tokio::io::copy(&mut server_recv, &mut client_send).await };
     let handle_two = async { tokio::io::copy(&mut client_recv, &mut server_send).await };
 

@@ -2,24 +2,31 @@
 use anyhow::{anyhow, Ok, Result};
 use clap::{Parser, Subcommand};
 
-use netns_proxy::sub::{IPConWire, IPConWirePayload, NetnspSub, NetnspSubCaller};
+use netns_proxy::sub::{NetnspSubCaller, NsubRPC, NsubService};
+use netns_proxy::util::error::DevianceError;
 use netns_proxy::util::ns::{
     self, enter_ns_by_name, enter_ns_by_pid, get_self_netns_inode, self_netns_identify,
 };
-use netns_proxy::util::open_wo_cloexec;
-use netns_proxy::util::perms::*;
-use tokio_unix_ipc::Sender;
+use netns_proxy::util::{open_wo_cloexec, Daemons, TaskOutput};
+use netns_proxy::util::{perms::*, DaemonSender};
+use netns_proxy::watcher::{FlatpakWatcher, Watcher, WatcherEvent};
+use tarpc::server::{BaseChannel, Channel};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
+use std::collections::HashSet;
 use std::env::Args;
 use std::os::fd::{AsRawFd, RawFd};
+use std::sync::Arc;
 use std::{env, path::PathBuf};
 use tokio::{fs::File, io::AsyncReadExt, process::Command, task::JoinSet};
 
+use dashmap::DashMap;
 use netns_proxy::data::*;
 use netns_proxy::netlink::*;
-
-use dashmap::DashMap;
+use netns_proxy::sub;
+use netns_proxy::watcher;
 use procfs::process::Process;
+use tarpc::serde_transport::unix::Incoming;
 use tarpc::tokio_serde::formats::{Bincode, SymmetricalBincode};
 use tarpc::{context, serde_transport};
 
@@ -33,9 +40,6 @@ use tarpc::{context, serde_transport};
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
-    /// configure each profile as a persistent net namespace. pre means before using apps.
-    #[arg(short, long)]
-    pre: bool,
 }
 
 #[derive(Subcommand)]
@@ -58,31 +62,28 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() == 3 {
-        let path: Result<PathBuf> = args[1].parse();
-        let my_fd: Result<RawFd> = args[2].parse();
-        if path.is_ok() && my_fd.is_ok() {
-            let my_fd: RawFd = my_fd?;
-            let sock_path = path.unwrap();
-            log::info!("Sub process started with fd {}", my_fd);
-            let conn =
-                serde_transport::unix::connect(sock_path.as_path(), Bincode::default).await?;
-            let b = BaseChannel::with_defaults(conn);
-            b.execute(NsubRPC.serve()).await;
-
-            return Ok(());
-        }
-    }
 
     flexi_logger::Logger::try_with_env_or_str(
         "debug,netnsp_main=trace,netns_proxy=trace,netnsp_sub=trace,netlink_proto=info,rustables=info",
     )
     .unwrap()
     .log_to_stdout()
-    .start()
-    .unwrap();
+    .start()?;
 
-    let mut set = JoinSet::new();
+    // XXX: polymorphic binary
+    if args.len() == 2 {
+        // assumed this is the RPC sub
+        let path: Result<PathBuf, _> = args[1].parse();
+        if path.is_ok() {
+            let sock_path = path.unwrap();
+            let conn =
+                serde_transport::unix::connect(sock_path.as_path(), Bincode::default).await?;
+            let b = BaseChannel::with_defaults(conn);
+            b.execute(NsubRPC.serve()).await;
+            return Ok(());
+        }
+    }
+
     let cli = Cli::parse();
 
     tokio::spawn(async {
@@ -106,18 +107,18 @@ async fn main() -> Result<()> {
         Some(Commands::Clean {}) => {
             // It is hard to steer the system config state into the desired state
             // Things get messed up easily.
-            let configurer = NetlinkConn::new();
+            let nl = NetlinkConn::new_in_current_ns();
             let state = NetnspState::load(Default::default()).await?;
-            state.clean_net(&configurer).await?;
+            state.clean_net(&nl).await?;
             log::info!("cleaned");
             // The config process resets a lot even though it's not an explicit clean
         }
         Some(Commands::Exec { mut cmd, ns, pid }) => {
             let state = NetnspState::load(Default::default()).await?;
-            let curr_inode = get_self_netns_inode()?;
+            let curr_inode = NSID::root()?;
             let (u, g) = get_non_priv_user(None, None, None, None)?;
 
-            if curr_inode != state.res.root_inode {
+            if curr_inode != state.derivative.root_ns {
                 log::error!("ACCESS DENIED");
                 std::process::exit(1);
             }
@@ -127,12 +128,14 @@ async fn main() -> Result<()> {
             }
 
             if let Some(pi) = pid {
-                enter_ns_by_pid(pi)?;
+                let n = NSID::from_pid(Pid(pi.try_into()?))?;
+                n.open().await?.enter()?;
             } else {
-                enter_ns_by_name(&ns).await?;
+                let n = NSID::from_name(ProfileName(ns)).await?;
+                n.open().await?.enter()?;
             }
 
-            drop_privs1(nix::unistd::Gid::from_raw(u), nix::unistd::Uid::from_raw(g))?;
+            drop_privs_id(nix::unistd::Gid::from_raw(u), nix::unistd::Uid::from_raw(g))?;
 
             let proc = std::process::Command::new(cmd.unwrap());
             let mut cmd_async: Command = proc.into();
@@ -141,87 +144,47 @@ async fn main() -> Result<()> {
         }
         None => {
             // Run as a daemon
-            use netns_proxy::util;
-            use netns_proxy::watcher;
-            let mut state = NetnspState::load(Default::default()).await?;
+            let paths = Arc::new(ConfPaths::default());
+            let mut mn: MultiNS = MultiNS::new(paths).await?;
+            let mut state: NetnspState = NetnspState::load(Default::default()).await?;
+            let mut dae = Daemons::new();
+            state.derive_all_named().await?;
+            state.initial_nft().await?;
+            state.resume(&mut mn, &dae.sender).await?;
 
-            let configrer = NetlinkConn::new();
+            let (sx, rx) = unbounded_channel();
+            let flp = FlatpakWatcher::new(sx.clone());
+            let (t, _) = TaskOutput::new(Box::pin(flp.daemon()), "flatpak watcher".to_owned());
+            dae.sender.send(t).unwrap();
 
-            if cli.pre {
-                match config_network(&configrer, &mut state).await {
-                    Result::Ok(_) => {
-                        state.dump().await?;
-                        // start daemons
-                        let (puid, pgid) = get_non_priv_user(None, None, None, None)?;
-                        for name in state.profile_names() {
-                            set.spawn(async move {
-                                let netns_sub: NetnspSubCaller = NetnspSubCaller::default();
-
-                                match ns::named_ns(&name) {
-                                    Err(e) => (name, Err(e)),
-                                    std::result::Result::Ok(f) => {
-                                        let res = netns_sub
-                                            .inner_daemon(
-                                                name.clone(),
-                                                puid.into(),
-                                                pgid.into(),
-                                                f.as_raw_fd(),
-                                                None,
-                                            )
-                                            .await;
-
-                                        (name, res)
-                                    }
-                                }
-                            });
-                        }
-                    }
-                    Err(x) => {
-                        log::error!("There is irrecoverable error in configuring. Try reseting the state, like rebooting");
-                        let euid = nix::unistd::geteuid();
-                        if !euid.is_root() {
-                            // the only way of checking if we have the perms is to try. so no mandating root.
-                            log::warn!("Your uid is {euid}. Do you have enough perms")
-                        }
-                        return Err(x);
-                    }
-                }
-            }
-
-            let hold = state.profile_names();
-            let watcher = watcher::WatcherState::create(configrer, state).await?;
-            let w_t = watcher.start();
-
-            let persis_ns = async move {
-                let ns_names1 = util::convert_strings_to_strs(&hold);
-                while let Some(res) = set.join_next().await {
-                    let idx = res.unwrap();
-                    log::warn!(
-                        "{} exited, with {:?}. re-cap, {}/{} running",
-                        idx.0,
-                        idx.1,
-                        set.len(),
-                        ns_names1.len()
-                    );
-                }
-                Ok(())
-            };
-            // exit when either of them exits, because it shouldn't.
-            let _ = tokio::select! {
-                r = tokio::spawn(w_t) => {
-                    log::warn!("watcher detached");
-                    r?
-                }
-                r = tokio::spawn(persis_ns) => {
-                    log::warn!("persis_ns detached");
-                    r?
-                }
-            }?;
-            // XXX try to catch all the results so we don't get baffled when things happen. rust analyzer doesn't warn about it in macros.
-
-            log::info!("exit");
+            let (t, _) = TaskOutput::new(
+                Box::pin(event_handler(rx, state, dae.sender.clone(), mn)),
+                "event handler".to_owned(),
+            );
+            dae.sender.send(t).unwrap();
+            // finally. wait on all tasks.
+            dae.run().await?;
         }
     }
 
+    Ok(())
+}
+
+async fn event_handler(
+    mut rx: UnboundedReceiver<WatcherEvent>,
+    mut state: NetnspState,
+    dae: DaemonSender,
+    mn: MultiNS,
+) -> Result<()> {
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            WatcherEvent::Flatpak(fp) => {
+                state.derive_flatpak(fp.clone()).await?;
+                let inf = state.derivative.flatpak.get(&fp.pid).ok_or(DevianceError)?;
+                inf.apply_veths(&mn, &state.derivative).await?;
+                // inf.run()
+            }
+        }
+    }
     Ok(())
 }

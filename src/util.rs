@@ -1,10 +1,14 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fs::File;
 use std::os::fd::FromRawFd;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::process::ExitStatus;
 
 use anyhow::Ok;
 use anyhow::Result;
+use futures::Future;
 use futures::{FutureExt, TryFutureExt};
 use ipnetwork::IpNetwork;
 use nix::sys::signal::kill;
@@ -14,13 +18,22 @@ use nix::unistd::Gid;
 use nix::unistd::Pid;
 use nix::unistd::Uid;
 use procfs::process::Process;
+use serde::Deserialize;
+use serde::Serialize;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
+use tokio::sync::oneshot::Receiver;
+use tokio::task::JoinSet;
 
+use crate::data::FlatpakID;
+use crate::data::*;
 use crate::{
     nft::FO_CHAIN,
-    sub::{NetnspSub, NetnspSubCaller, NetnspSubImpl},
+    sub::{NetnspSubCaller, NetnspSubImpl},
 };
-
 use anyhow::anyhow;
 use netns_rs::NetNs;
 use nix::{sched::CloneFlags, unistd::setgroups};
@@ -64,8 +77,8 @@ where
 
 /// get v in mb with key from ma
 pub fn hashmap_chain_mut<'a, A, B, C>(
-    ma: &'a HashMap<A, B>,
-    mb: &'a HashMap<B, C>,
+    ma: &'a mut HashMap<A, B>,
+    mb: &'a mut HashMap<B, C>,
     k_in_ma: &'a A,
 ) -> Option<&'a mut C>
 where
@@ -74,6 +87,51 @@ where
     C: Eq + Hash,
 {
     ma.get_mut(k_in_ma).and_then(|r| mb.get_mut(r))
+}
+
+pub fn btreemap_chain_mut<'a, A, B, C>(
+    ma: &'a mut BTreeMap<A, B>,
+    mb: &'a mut BTreeMap<B, C>,
+    k_in_ma: &'a A,
+) -> Option<&'a mut C>
+where
+    A: Ord,
+    B: Ord,
+    C: Ord,
+{
+    ma.get_mut(k_in_ma).and_then(|r| mb.get_mut(r))
+}
+
+pub async fn watch_log(
+    mut reader: tokio::io::Lines<tokio::io::BufReader<impl tokio::io::AsyncRead + Unpin>>,
+    tx: Option<tokio::sync::oneshot::Sender<bool>>,
+    prefix: String,
+) -> Result<()> {
+    if let Some(line) = reader.next_line().await? {
+        log::info!("{} {}", prefix, line);
+        if let Some(t) = tx {
+            t.send(true);
+        }
+    }
+    while let Some(line) = reader.next_line().await? {
+        log::info!("{} {}", prefix, line);
+    }
+    Ok(())
+}
+
+pub fn watch_both(
+    chil: &mut tokio::process::Child,
+    pre: String,
+    tx: Option<tokio::sync::oneshot::Sender<bool>>,
+) -> Result<()> {
+    let stdout = chil.stdout.take().unwrap();
+    let stderr = chil.stderr.take().unwrap();
+    let reader = tokio::io::BufReader::new(stdout).lines();
+    let reader_err = tokio::io::BufReader::new(stderr).lines();
+    tokio::spawn(watch_log(reader, tx, pre.clone()));
+    tokio::spawn(watch_log(reader_err, None, pre));
+
+    Ok(())
 }
 
 pub mod perms {
@@ -108,7 +166,7 @@ pub mod perms {
         Ok(())
     }
 
-    pub fn drop_privs1(gi: Gid, ui: Uid) -> Result<()> {
+    pub fn drop_privs_id(gi: Gid, ui: Uid) -> Result<()> {
         log::trace!("groups, {:?}", nix::unistd::getgroups()?);
         log::trace!("GID to {gi}");
         nix::unistd::setresgid(gi, gi, gi)?;
@@ -218,12 +276,12 @@ use sysinfo::SystemExt;
 #[cfg(test)]
 use std::println as info;
 
-pub fn flatpak_perms_checkup(list: Vec<String>) -> Result<()> {
+pub fn flatpak_perms_checkup(list: Vec<FlatpakID>) -> Result<()> {
     let basedirs = xdg::BaseDirectories::with_prefix("flatpak")?;
     info!("trying to adapt flatpak app permissions");
     for appid in list {
         let mut sub = PathBuf::from("overrides");
-        sub.push(appid);
+        sub.push(appid.0);
         let p = basedirs.get_data_file(&sub);
         if p.exists() {
             let mut conf = ini::Ini::load_from_file(p.as_path())?;
@@ -255,70 +313,54 @@ pub fn flatpak_perms_checkup(list: Vec<String>) -> Result<()> {
 }
 
 #[test]
-fn test_flatpakperm() {
+fn test_flatpakperm() -> Result<()> {
     flatpak_perms_checkup(
         [
-            "org.mozilla.firefox".to_owned(),
-            "im.fluffychat.Fluffychat".to_owned(),
+            "org.mozilla.firefox".parse()?,
+            "im.fluffychat.Fluffychat".parse()?,
         ]
         .to_vec(),
     )
     .unwrap();
+    Ok(())
 }
 
-pub fn substitute_argv<'a>(n_info: &'a NetnsInfo, argv: &mut Vec<String>) {
-    let mut sub_map: HashMap<String, &String> = HashMap::new();
-    sub_map.insert(format!("${}", "subnet_veth"), &n_info.subnet_veth);
-    sub_map.insert(format!("${}", "subnet6_veth"), &n_info.subnet6_veth);
-    sub_map.insert(format!("${}", "ip_vh"), &n_info.ip_vh);
-    sub_map.insert(format!("${}", "ip6_vh"), &n_info.ip6_vh);
-    sub_map.insert(format!("${}", "ip_vn"), &n_info.ip_vn);
-    sub_map.insert(format!("${}", "ip6_vn"), &n_info.ip6_vn);
-
-    for s in argv.iter_mut() {
-        let mut s_ = s.to_owned();
-        for (key, value) in &sub_map {
-            s_ = s_.replace(key, value);
-        }
-        *s = s_;
-    }
-}
-
-use crate::NetnsInfo;
+use crate::data::SubjectInfo;
 #[test]
 fn test_substitute_argv() {
-    let n_info = NetnsInfo {
-        base_name: "x".to_owned(),
-        subnet_veth: "eth0".to_string(),
-        subnet6_veth: "eth1".to_string(),
-        ip_vh: "192.168.0.1".to_string(),
-        ip6_vh: "2001:db8::1".to_string(),
-        ip_vn: "192.168.0.2".to_string(),
-        ip6_vn: "2001:db8::2".to_string(),
-        veth_base_name: "ss".to_owned(),
-        id: 2,
-        tun_ip: None,
-        link_base_name: None,
-    };
+    // let n_info = NetnsInfo {
+    //     base_name: "x".to_owned(),
+    //     subnet_veth: "127.0.0.1/8".parse().unwrap(),
+    //     subnet6_veth: "eth1".parse().unwrap(),
+    //     ip_va: "192.168.0.1".parse().unwrap(),
+    //     ip6_va: "2001:db8::1".parse().unwrap(),
+    //     ip_vb: "192.168.0.2".parse().unwrap(),
+    //     ip6_vb: "2001:db8::2".parse().unwrap(),
+    //     veth_root2ns: "ss".parse().unwrap(),
+    //     id: 2,
+    //     tun_ip: None,
+    //     veth_ns2ns: None,
+    //     nsid: None
+    // };
 
-    let mut argv = vec![
-        "ping".to_string(),
-        "-c".to_string(),
-        "1".to_string(),
-        "$ip_vnxx".to_string(),
-    ];
+    // let mut argv = vec![
+    //     "ping".to_string(),
+    //     "-c".to_string(),
+    //     "1".to_string(),
+    //     "$ip_vnxx".to_string(),
+    // ];
 
-    substitute_argv(&n_info, &mut argv);
+    // substitute_argv(&n_info, &mut argv);
 
-    assert_eq!(
-        argv,
-        vec![
-            "ping".to_string(),
-            "-c".to_string(),
-            "1".to_string(),
-            "192.168.0.2xx".to_string(),
-        ]
-    );
+    // assert_eq!(
+    //     argv,
+    //     vec![
+    //         "ping".to_string(),
+    //         "-c".to_string(),
+    //         "1".to_string(),
+    //         "192.168.0.2xx".to_string(),
+    //     ]
+    // );
 }
 
 use sysinfo::System;
@@ -340,8 +382,6 @@ pub fn kill_suspected() -> Result<()> {
     Ok(())
 }
 
-// first four args must be Some()
-
 pub fn open_wo_cloexec(path: &Path) -> Result<tokio::fs::File> {
     use nix::fcntl::{open, OFlag};
     use nix::sys::stat::Mode;
@@ -358,8 +398,9 @@ pub mod ns {
     use tokio::io::AsyncWriteExt;
 
     use crate::{
+        data::ProfileName,
         nft::FO_CHAIN,
-        sub::{NetnspSub, NetnspSubCaller, NetnspSubImpl},
+        sub::{NetnspSubCaller, NetnspSubImpl},
     };
 
     use anyhow::{anyhow, Ok, Result};
@@ -385,30 +426,41 @@ pub mod ns {
         fs::File,
         io::{AsyncBufReadExt, AsyncReadExt},
     };
-    pub fn named_ns(ns_name: &str) -> Result<File> {
+
+    pub trait ValidNamedNS: AsRef<Path> {}
+    impl ValidNamedNS for ProfileName {}
+
+    impl AsRef<Path> for ProfileName {
+        fn as_ref(&self) -> &Path {
+            Path::new(&self.0)
+        }
+    }
+
+    pub fn named_ns<N: ValidNamedNS>(ns_name: &N) -> Result<File> {
         let mut p = PathBuf::from(NETNS_PATH);
-        p.push(ns_name);
+        p.push(&ns_name);
         open_wo_cloexec(p.as_path())
     }
 
-    pub fn named_ns_exist(ns_name: &str) -> Result<bool> {
+    pub fn named_ns_exist<N: ValidNamedNS>(ns_name: &N) -> Result<bool> {
         let mut p = PathBuf::from(NETNS_PATH);
         p.push(ns_name);
         let r = p.try_exists().map_err(anyhow::Error::from)?;
         if r {
+            // file exists but not a file. should error
             anyhow::ensure!(p.is_file());
         }
         Ok(r)
-        // throws error if abnormality beyond exists-or-not appears
     }
 
-    pub async fn enter_ns_by_name(ns_name: &str) -> Result<()> {
+    pub async fn enter_ns_by_name<N: ValidNamedNS>(ns_name: &N) -> Result<()> {
         let fd = named_ns(ns_name)?;
         nix::sched::setns(fd.as_raw_fd(), CloneFlags::CLONE_NEWNET)?;
         let got_ns = self_netns_identify().await?.ok_or_else(|| {
             anyhow::anyhow!("failed to identify netns. no matches under the given netns directory")
         })?;
-        anyhow::ensure!(got_ns.0 == ns_name);
+        let g_ns = Path::new(&got_ns.0);
+        anyhow::ensure!(g_ns == ns_name.as_ref());
         log::info!("current ns {} (named and persistent)", got_ns.0);
 
         Ok(())
@@ -468,6 +520,8 @@ pub mod ns {
         Ok(pid1_net_ns.identifier)
     }
 
+    // alternatively it can be done without deps, in a few lines.
+    // TODO: would it be overoptimization to optimize this ? procfs is wasting syscalls.
     pub fn get_self_netns_inode() -> Result<u64> {
         use procfs::process::Process;
         let selfproc = Process::myself()?;
@@ -521,9 +575,9 @@ pub mod ns {
         Ok(None) // means, "no matches under NETNS_PATH"
     }
     /// unchecked
-    pub async fn add_netns(ns_name: &str) -> Result<()> {
+    pub async fn add_netns<N: ValidNamedNS>(ns_name: &N) -> Result<()> {
         use rtnetlink::NetworkNamespace;
-        NetworkNamespace::add(ns_name.to_string())
+        NetworkNamespace::add(ns_name.as_ref().to_string_lossy().into_owned())
             .await
             .map_err(anyhow::Error::from)
     }
@@ -536,6 +590,159 @@ pub mod ns {
     impl Env for NsEnv {
         fn persist_dir(&self) -> PathBuf {
             NETNS_PATH.into()
+        }
+    }
+}
+
+pub mod error {
+    use serde::{Deserialize, Serialize};
+    use thiserror::Error;
+
+    #[derive(Error, Debug)]
+    #[error("Deviance from a configuration plan")]
+    pub struct DevianceError;
+
+    #[derive(Error, Debug)]
+    #[error("Something is missing, and it can be handled")]
+    pub struct MissingError;
+
+    // ? operator automatically converts anyhow error to SErr
+    impl From<anyhow::Error> for SErr {
+        fn from(value: anyhow::Error) -> Self {
+            // must log error here
+            log::error!("{:?}", value);
+            let s = SError::new(&*value);
+            Self(s)
+        }
+    }
+
+    impl From<DevianceError> for SErr {
+        fn from(value: DevianceError) -> Self {
+            // must log error here
+            log::error!("{:?}", value);
+            let s = SError::new(&value);
+            Self(s)
+        }
+    }
+
+    impl From<MissingError> for SErr {
+        fn from(value: MissingError) -> Self {
+            // must log error here
+            log::error!("{:?}", value);
+            let s = SError::new(&value);
+            Self(s)
+        }
+    }
+
+    use serde_error::Error as SError;
+
+    // TODO: serde-error doesn't send backtrace on wire. as a workaround we just print it here
+
+    #[derive(Serialize, Deserialize, Debug, Error)]
+    #[error("serializable error")]
+    pub struct SErr(SError);
+
+    pub fn se_ok() -> Result<(), SErr> {
+        Result::Ok(())
+    }
+}
+
+/// A place to keep all daemons
+pub struct Daemons {
+    pub sender: DaemonSender,
+    recver: UnboundedReceiver<Pin<Box<dyn Future<Output = TaskOutput> + Send>>>,
+    daemons: JoinSet<TaskOutput>,
+}
+
+pub type DaemonSender = UnboundedSender<Pin<Box<dyn Future<Output = TaskOutput> + Send>>>;
+
+pub struct TaskOutput {
+    pub name: String,
+    pub result: Result<()>,
+    /// notified in case the task stops
+    pub sig: Option<oneshot::Sender<()>>,
+}
+
+impl TaskOutput {
+    pub fn new(
+        f: Pin<Box<dyn Future<Output = Result<()>> + Send>>,
+        name: String,
+    ) -> (
+        Pin<Box<dyn Future<Output = TaskOutput> + Send>>,
+        Receiver<()>,
+    ) {
+        let (sx, rx) = oneshot::channel();
+        (
+            Box::pin(async move {
+                let r = f.await;
+                TaskOutput {
+                    name,
+                    result: r,
+                    sig: Some(sx),
+                }
+            }),
+            rx,
+        )
+    }
+    pub fn subprocess(
+        f: Pin<Box<dyn Future<Output = Result<ExitStatus, std::io::Error>> + Send>>,
+        name: String,
+    ) -> (
+        Pin<Box<dyn Future<Output = TaskOutput> + Send>>,
+        Receiver<()>,
+    ) {
+        let (sx, rx) = oneshot::channel();
+        (
+            Box::pin(async move {
+                let r = f.await;
+                let r = match r {
+                    Result::Ok(e) => {
+                        log::info!("{} process exited with {}", name, e);
+                        Ok(())
+                    }
+                    Err(e) => Err(e.into()),
+                };
+                TaskOutput {
+                    name,
+                    result: r,
+                    sig: Some(sx),
+                }
+            }),
+            rx,
+        )
+    }
+}
+
+impl Daemons {
+    pub fn new() -> Self {
+        let (s, r) = mpsc::unbounded_channel();
+        Daemons {
+            sender: s,
+            recver: r,
+            daemons: JoinSet::new(),
+        }
+    }
+    pub async fn run(&mut self) -> Result<()> {
+        loop {
+            tokio::select! {
+                maybe_task = self.recver.recv() => {
+                    log::trace!("received new daemon");
+                    if let Some(task) = maybe_task {
+                        self.daemons.spawn(task);
+                    }
+                },
+                maybe_res = self.daemons.join_next() => {
+                    if let Some(res) = maybe_res {
+                        let res = res?;
+                        log::error!("Daemon {} stopped. {:?}", res.name, res.result);
+                        if let Some(x) = res.sig {
+                            x.send(()).unwrap();
+                        }
+
+                        // TODO: can I get traceback by logging ?
+                    }
+                }
+            }
         }
     }
 }

@@ -13,31 +13,36 @@ sysinfo = "0.28.4"
 flexi_logger = "0.25"
 log = "0.4.17"
 futures = "0.3.28"
-ipnetwork = "0.20.0"
+ipnetwork = { version = "0.20.0", features = ["serde"] }
 users = "0.11.0"
 nix = { version = "0.26.2", features = ["user", "sched"] }
-serde = { version = "1.0.160", features = ["derive"] }
+serde = { version = "1.0.160", features = ["derive", "rc"] }
 serde_json = "1.0.96"
 anyhow = { version = "1.0.71", features = ["backtrace"] }
 libc = "0.2.143"
 procfs = "0.15.1"
-rtnetlink = "0.12.0"
-netlink-packet-route = "0.15.0"
+rtnetlink = { path = "../rtnetlink" }
 netns-rs = "0.1.0"
-tidy-tuntap = { git = "https://github.com/planetoryd/tidy-tuntap", branch = "main" }
+tidy-tuntap = { path = "../tidy-tuntap" }
 mnl = "0.2.2"
 zbus = { version = "3.13.1", features = ["tokio"] }
 inotify = "0.10.1"
 rust-ini = "0.19.0"
-rustables = { branch = "netnsp", git = "https://github.com/planetoryd/rustables" }
+rustables = { path = "../rustables" }
 either = "1.8.1"
 pidfd = "0.2.4"
 xdg = "2.5.0"
 thiserror = "1.0.40"
 socksv5 = { version = "0.3.1", features = ["tokio"] }
-tarpc = { version = "0.33.0", features = ["serde-transport", "unix", "serde-transport-bincode"] }
+tarpc = { version = "0.33.0", features = [
+    "serde-transport",
+    "unix",
+    "serde-transport-bincode",
+] }
 dashmap = "5.4.0"
-
+serde-error = "0.1.2"
+derivative = "2.2.0"
+serde_with = "3.1.0"
 [profile.release]
 strip = true
 opt-level = "z" # bottleneck is size, not cpu
