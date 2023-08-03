@@ -4,13 +4,12 @@ use std::fs::File;
 use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::process::ExitStatus;
 
 use anyhow::Ok;
 use anyhow::Result;
 use futures::Future;
 use futures::{FutureExt, TryFutureExt};
-use ipnetwork::IpNetwork;
+
 use nix::sys::signal::kill;
 use nix::sys::signal::Signal;
 use nix::sys::signal::Signal::SIGTERM;
@@ -18,10 +17,7 @@ use nix::unistd::Gid;
 use nix::unistd::Pid;
 use nix::unistd::Uid;
 use procfs::process::Process;
-use serde::Deserialize;
-use serde::Serialize;
-use tarpc::client::RpcError;
-use tokio::io::AsyncWriteExt;
+
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
@@ -30,26 +26,12 @@ use tokio::sync::oneshot::Receiver;
 use tokio::task::JoinSet;
 
 use crate::data::FlatpakID;
-use crate::data::*;
-use crate::{
-    nft::FO_CHAIN,
-    sub::{NetnspSubCaller, NetnspSubImpl},
-};
-use anyhow::anyhow;
-use netns_rs::NetNs;
-use nix::{sched::CloneFlags, unistd::setgroups};
 
-use std::{collections::HashSet, net::Ipv6Addr};
+use nix::unistd::setgroups;
 
 use std::collections::HashMap;
-use std::os::fd::AsRawFd;
-use std::{
-    ffi::{CString, OsString},
-    net::Ipv4Addr,
-    os::{fd::RawFd, unix::process::CommandExt},
-    path::Path,
-    process::exit,
-};
+
+use std::{ffi::CString, os::unix::process::CommandExt, path::Path, process::exit};
 use tokio::{
     self,
     io::{AsyncBufReadExt, AsyncReadExt},
@@ -221,38 +203,6 @@ pub mod perms {
     }
 }
 
-#[test]
-fn t_pidfd() -> Result<()> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(async {
-            let f = unsafe { pidfd::PidFd::open(853481, 0)?.into_future() };
-            println!("opened");
-            f.await?;
-            println!("finished");
-            Ok(())
-        })
-}
-
-#[test]
-fn get_all_child_pids() -> Result<()> {
-    use procfs::process::Process;
-
-    let su = Process::new(942129)?;
-    let mt = su.task_main_thread()?;
-    dbg!(mt.children()?);
-    let chi: Vec<u32> = su
-        .tasks()?
-        .filter_map(|t| t.ok().and_then(|x| x.children().ok()))
-        .flatten()
-        .collect();
-
-    dbg!(chi);
-    Ok(())
-}
-
 pub fn kill_children(pid: i32) -> Result<()> {
     let su = Process::new(pid)?;
     let chi: Vec<u32> = su
@@ -277,6 +227,7 @@ use sysinfo::SystemExt;
 #[cfg(test)]
 use std::println as info;
 
+/// adapt the flatpak settings of given list
 pub fn flatpak_perms_checkup(list: Vec<FlatpakID>) -> Result<()> {
     let basedirs = xdg::BaseDirectories::with_prefix("flatpak")?;
     info!("trying to adapt flatpak app permissions");
@@ -306,8 +257,8 @@ pub fn flatpak_perms_checkup(list: Vec<FlatpakID>) -> Result<()> {
             // create a new file for it
             let mut conf = ini::Ini::new();
             conf.set_to(Some("Context"), "shared".to_owned(), "!network".to_owned());
-            info!("{} written. new file", p.to_string_lossy());
             conf.write_to_file(p.as_path())?;
+            info!("{} written. New file", p.to_string_lossy());
         }
     }
     Ok(())
@@ -325,8 +276,6 @@ fn test_flatpakperm() -> Result<()> {
     .unwrap();
     Ok(())
 }
-
-use crate::data::SubjectInfo;
 
 use sysinfo::System;
 
@@ -358,39 +307,21 @@ pub fn open_wo_cloexec(path: &Path) -> Result<tokio::fs::File> {
 
 pub mod ns {
     pub const NETNS_PATH: &str = "/run/netns/";
-    use futures::{FutureExt, TryFutureExt};
-    use ipnetwork::IpNetwork;
-    use tokio::io::AsyncWriteExt;
+    use futures::TryFutureExt;
 
-    use crate::{
-        data::ProfileName,
-        nft::FO_CHAIN,
-        sub::{NetnspSubCaller, NetnspSubImpl},
-    };
+    use crate::data::ProfileName;
 
     use anyhow::{anyhow, Ok, Result};
     use netns_rs::NetNs;
-    use nix::{
-        sched::CloneFlags,
-        unistd::{setgroups, Gid, Uid},
-    };
+    use nix::sched::CloneFlags;
 
-    use std::{collections::HashSet, net::Ipv6Addr};
-
-    use std::collections::HashMap;
     use std::os::fd::AsRawFd;
     use std::{
-        ffi::{CString, OsString},
-        net::Ipv4Addr,
-        os::{fd::RawFd, unix::process::CommandExt},
+        ffi::OsString,
+        os::fd::RawFd,
         path::{Path, PathBuf},
-        process::exit,
     };
-    use tokio::{
-        self,
-        fs::File,
-        io::{AsyncBufReadExt, AsyncReadExt},
-    };
+    use tokio::{self, fs::File};
 
     pub trait ValidNamedNS: AsRef<Path> {}
     impl ValidNamedNS for ProfileName {}
@@ -560,11 +491,11 @@ pub mod ns {
 }
 
 pub mod error {
-    use serde::{Deserialize, Serialize};
+
     use thiserror::Error;
 
     #[derive(Error, Debug)]
-    #[error("Deviance from a configuration plan")]
+    #[error("Deviance from a configuration plan, or the configuration is faulty")]
     pub struct DevianceError;
 
     #[derive(Error, Debug)]
@@ -579,7 +510,7 @@ pub mod error {
 }
 
 /// A place to keep all daemons
-pub struct Daemons {
+pub struct Awaitor {
     pub sender: DaemonSender,
     recver: UnboundedReceiver<Pin<Box<dyn Future<Output = TaskOutput> + Send>>>,
     daemons: JoinSet<TaskOutput>,
@@ -593,8 +524,6 @@ pub struct TaskOutput {
     /// notified in case the task stops
     pub sig: Option<oneshot::Sender<()>>,
 }
-
-use serde_error::Error as SErr;
 
 impl TaskOutput {
     pub fn new(
@@ -617,8 +546,8 @@ impl TaskOutput {
             rx,
         )
     }
-    pub fn subprocess(
-        f: Pin<Box<dyn Future<Output = Result<ExitStatus, std::io::Error>> + Send>>,
+    pub fn wrapped<E2: std::error::Error + Send + Sync + 'static, T: 'static>(
+        f: Pin<Box<dyn Future<Output = Result<Result<T>, E2>> + Send>>,
         name: String,
     ) -> (
         Pin<Box<dyn Future<Output = TaskOutput> + Send>>,
@@ -629,58 +558,7 @@ impl TaskOutput {
             Box::pin(async move {
                 let r = f.await;
                 let r = match r {
-                    Result::Ok(e) => {
-                        log::info!("{} process exited with {}", name, e);
-                        Ok(())
-                    }
-                    Err(e) => Err(e.into()),
-                };
-                TaskOutput {
-                    name,
-                    result: r,
-                    sig: Some(sx),
-                }
-            }),
-            rx,
-        )
-    }
-    pub fn rpc(
-        f: Pin<Box<dyn Future<Output = Result<Result<(), SErr>, RpcError>> + Send>>,
-        name: String,
-    ) -> (
-        Pin<Box<dyn Future<Output = TaskOutput> + Send>>,
-        Receiver<()>,
-    ) {
-        let (sx, rx) = oneshot::channel();
-        (
-            Box::pin(async move {
-                let r = f.await;
-                let r = match r {
-                    Result::Ok(x) => x.map_err(|x| anyhow::Error::from(x)),
-                    Err(x) => Result::<(), _>::Err(x.into()),
-                };
-                TaskOutput {
-                    name,
-                    result: r,
-                    sig: Some(sx),
-                }
-            }),
-            rx,
-        )
-    }
-    pub fn wrapped<E: std::error::Error + Send + Sync + 'static>(
-        f: Pin<Box<dyn Future<Output = Result<Result<()>, E>> + Send>>,
-        name: String,
-    ) -> (
-        Pin<Box<dyn Future<Output = TaskOutput> + Send>>,
-        Receiver<()>,
-    ) {
-        let (sx, rx) = oneshot::channel();
-        (
-            Box::pin(async move {
-                let r = f.await;
-                let r = match r {
-                    Result::Ok(x) => x,
+                    Result::Ok(_x) => Result::Ok(()),
                     Err(x) => Err::<(), anyhow::Error>(x.into()),
                 };
                 TaskOutput {
@@ -692,18 +570,41 @@ impl TaskOutput {
             rx,
         )
     }
+    pub fn immediately<T: Send + 'static>(
+        f: Pin<Box<dyn Future<Output = Result<T>> + Send>>,
+        name: String,
+    ) -> (
+        Pin<Box<dyn Future<Output = TaskOutput> + Send>>,
+        Receiver<()>,
+    ) {
+        let h = tokio::spawn(f);
+        Self::wrapped(Box::pin(h), name)
+    }
+    pub fn immediately_std<T: Send + 'static, E: std::error::Error + Send + Sync + 'static>(
+        f: Pin<Box<dyn Future<Output = Result<T, E>> + Send>>,
+        name: String,
+    ) -> (
+        Pin<Box<dyn Future<Output = TaskOutput> + Send>>,
+        Receiver<()>,
+    ) {
+        let h = tokio::spawn(async move {
+            f.await?;
+            Ok(())
+        });
+        Self::wrapped(Box::pin(h), name)
+    }
 }
 
-impl Daemons {
+impl Awaitor {
     pub fn new() -> Self {
         let (s, r) = mpsc::unbounded_channel();
-        Daemons {
+        Awaitor {
             sender: s,
             recver: r,
             daemons: JoinSet::new(),
         }
     }
-    pub async fn run(&mut self) -> Result<()> {
+    pub async fn wait(&mut self) -> Result<()> {
         loop {
             tokio::select! {
                 maybe_task = self.recver.recv() => {
@@ -715,11 +616,10 @@ impl Daemons {
                 maybe_res = self.daemons.join_next() => {
                     if let Some(res) = maybe_res {
                         let res = res?;
-                        log::error!("Daemon {} stopped. {:?}", res.name, res.result);
+                        log::error!("daemon {} stopped. {:?}", res.name, res.result);
                         if let Some(x) = res.sig {
-                            x.send(()).unwrap();
+                            let _ = x.send(());
                         }
-
                         // TODO: can I get traceback by logging ?
                     }
                 }

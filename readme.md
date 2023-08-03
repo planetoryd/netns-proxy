@@ -9,6 +9,7 @@
 - for building
   - `libnftnl`
   - `libmnl`
+  - `clang` 
 
 ## features
 

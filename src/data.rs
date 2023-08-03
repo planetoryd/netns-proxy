@@ -1,13 +1,10 @@
-use dashmap::DashMap;
 use derivative::Derivative;
 use ipnetwork::IpNetwork;
 use serde::{Deserialize, Serialize};
 
 use std::{
-    cell::RefCell,
     collections::{BinaryHeap, HashMap, HashSet},
-    fmt::{format, Display},
-    marker::ConstParamTy,
+    fmt::Display,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     os::unix::process::CommandExt,
     path::PathBuf,
@@ -16,13 +13,13 @@ use std::{
     sync::Arc,
 };
 
-use tokio::{io::AsyncBufReadExt, process::Command, sync::RwLock};
+use tokio::{io::AsyncBufReadExt, process::Command};
 
 use crate::{
-    netlink::{ConnRef, MultiNS, Netns, VPairKey},
+    netlink::{ConnRef, MultiNS, VPairKey},
     nft,
     sub::NsubState,
-    util::{convert_strings_to_strs, perms::get_non_priv_user, DaemonSender, TaskOutput},
+    util::TaskOutput,
 };
 use tokio::{self, io::AsyncReadExt};
 
@@ -36,15 +33,16 @@ pub struct Derivative {
     // separate maps, separate indexing
     pub named_ns: HashMap<ProfileName, SubjectInfo<NamedV>>,
     pub flatpak: HashMap<Pid, SubjectInfo<FlatpakV>>,
-    /// could be mutiple instances per FlatpakID. for now just prefer, the first instance.
-    pub flatpak_names: HashMap<FlatpakID, Pid>,
     pub ns_list: HashMap<NSRef, NSID>,
     pub root_ns: NSID,
 }
 
 impl Derivative {
     pub async fn init(&mut self) -> Result<()> {
-        self.root_ns = NSID::root()?;
+        log::info!(
+            "initing Derivative. the netns of current process will be assumed to be root_ns"
+        );
+        self.root_ns = NSID::proc()?;
         Ok(())
     }
     /// clear invalid ones
@@ -63,7 +61,7 @@ impl Derivative {
     }
 }
 
-#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 pub struct Settings {
     pub profiles: HashMap<ProfileName, Arc<SubjectProfile>>,
     pub flatpak: HashMap<FlatpakID, ProfileName>,
@@ -90,14 +88,12 @@ impl From<String> for FlatpakID {
     }
 }
 
-use serde_with::{serde_as, FromInto};
-
 pub struct NetnspState {
     // persistent
     pub derivative: Derivative,
     pub settings: Settings,
     // runtime state
-    pub paths: ConfPaths,
+    pub paths: Arc<ConfPaths>,
     pub nft_refresh_once: bool,
     pub ids: BinaryHeap<UniqueInstance>,
     pub incre_nft: nft::IncrementalNft,
@@ -168,17 +164,18 @@ pub struct ConfPaths {
 // identified by pid OR persistent name
 pub type InstanceID = either::Either<i32, String>;
 
-impl Default for ConfPaths {
-    fn default() -> Self {
-        Self {
-            settings: "./conf.json".parse().unwrap(),
-            derivative: "./netnsp.json".parse().unwrap(),
-            sock: "./nsp/".parse().unwrap(),
-        }
+impl ConfPaths {
+    pub fn default() -> Result<Self> {
+        let xdg = xdg::BaseDirectories::with_prefix("netns-proxy").unwrap();
+        let r = Self {
+            settings: xdg.place_config_file("conf.json")?,
+            derivative: xdg.place_state_file("netnsp.json")?,
+            sock: xdg.create_runtime_directory("nsp")?,
+        };
+        Ok(r)
     }
 }
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SubjectProfile {
     /// veth connections between NSes
     pub vconnections: Vec<RVethConn>,
@@ -193,31 +190,32 @@ pub struct SubjectProfile {
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
 pub enum NSRef {
     Root,
-    Flatpak(FlatpakID),
+    Pid(Pid),
     Named(ProfileName),
 }
 
 impl From<FlatpakV> for NSRef {
     fn from(value: FlatpakV) -> Self {
-        Self::Flatpak(value.id)
+        Self::Pid(value.pid)
     }
 }
+
 impl From<NamedV> for NSRef {
     fn from(value: NamedV) -> Self {
         Self::Named(value.0)
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 /// connection from subject NS to target NS
 pub struct RVethConn {
     pub target: NSRef,
 }
 
-/// userland proxy. used when, for ex. the source proxy only listens on 127.1 
-/// src can be the same as subject NS. 
+/// userland proxy. used when, for ex. the source proxy only listens on 127.1
+/// src can be the same as subject NS.
 /// ip in src ns is implied to be 127.1
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct RProxy {
     pub src: NSRef,
     /// port in src ns
@@ -227,14 +225,14 @@ pub struct RProxy {
 // sometimes netfilter forwarding can be hard to set up, so this can be used.
 
 /// Addr through which the subject accesses an external object
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub enum AddrRef {
     /// veth conn in reference, and whether use v6 (true for v6)
     VConn(RVethConn, bool, u16),
     Proxy(RProxy),
 }
 
-#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
 /// start external processes, as daemons if it doesn't quit
 pub struct RProcTasks {
     pub su: Option<CmdParams>,
@@ -242,14 +240,14 @@ pub struct RProcTasks {
 }
 
 /// TUNified socks proxy pattern
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct RTUNedSocks {
     #[serde(default = "SubjectProfile::default_tun2socks")]
     pub enable: bool,
     pub src: AddrRef,
 }
 
-#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
 pub struct DNSProxyR {
     #[serde(default = "SubjectProfile::default_dnsproxy")]
     pub enable: bool,
@@ -259,7 +257,7 @@ pub struct DNSProxyR {
     pub args: Option<Vec<String>>,
 }
 
-#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
 pub struct CmdParams {
     pub program: String,
     pub argv: Vec<String>,
@@ -285,13 +283,12 @@ pub struct SubjectInfo<V: VSpecifics> {
 }
 
 impl<V: VSpecifics> SubjectInfo<V> {
+    /// get or create a subprocess, and get the Netns instance
     pub async fn connect(&self, mn: &mut MultiNS) -> Result<()> {
-        let n = mn.new_for(self.ns.clone()).await?;
-        mn.netlinks
-            .insert(self.ns.clone(), ConnRef::new(Arc::new(n)));
-        let nl = mn.netlinks.get(&self.ns).unwrap();
-        let ns = nl.clone().to_netns(self.ns.clone()).await?;
-        mn.subs.insert(self.ns.clone(), ns);
+        let n = mn.get_nl(self.ns.clone()).await?;
+        let nl = ConnRef::new(Arc::new(n));
+        let ns = nl.to_netns(self.ns.clone()).await?;
+        mn.ns.insert(self.ns.clone(), ns);
         Ok(())
     }
     pub fn assure_in_ns(&self) -> Result<()> {
@@ -301,7 +298,7 @@ impl<V: VSpecifics> SubjectInfo<V> {
     }
     pub async fn run_tun2s(&self, st: &mut NsubState) -> Result<()> {
         use crate::netlink::*;
-        use crate::util::{watch_both, watch_log};
+        use crate::util::watch_log;
         let tun_name = "s_tun";
         let mut tun2 = std::process::Command::new("tun2socks");
         tun2.uid(st.non_priv_uid.into())
@@ -336,14 +333,14 @@ impl<V: VSpecifics> SubjectInfo<V> {
             .ip_add_route(tun.index, None, Some(false))
             .await;
 
-        let (t, r) = TaskOutput::subprocess(Box::pin(async move { tun2h.wait().await }), pre);
+        let (t, _r) = TaskOutput::immediately_std(Box::pin(async move { tun2h.wait().await }), pre);
         st.dae.send(t).unwrap();
 
         Ok(())
     }
     pub async fn run_dnsp(&self, st: &mut NsubState) -> Result<()> {
         use crate::netlink::*;
-        use crate::util::{watch_both, watch_log};
+        use crate::util::watch_log;
         let tun_name = "s_tun";
         let mut tun2 = std::process::Command::new("tun2socks");
         tun2.uid(st.non_priv_uid.into())
@@ -378,7 +375,7 @@ impl<V: VSpecifics> SubjectInfo<V> {
             .ip_add_route(tun.index, None, Some(false))
             .await;
 
-        let (t, r) = TaskOutput::subprocess(Box::pin(async move { tun2h.wait().await }), pre);
+        let (t, _r) = TaskOutput::immediately_std(Box::pin(async move { tun2h.wait().await }), pre);
         st.dae.send(t).unwrap();
 
         Ok(())
@@ -475,7 +472,7 @@ impl UniqueInstance {
 
 /// resolve with global state
 pub trait ResolvableG<V: VSpecifics, D> {
-    fn resolve_g(&self, global: &NetnspState, uq: &UniqueInstance, v: &V) -> Result<D>;
+    async fn resolve_g(&self, global: &NetnspState, uq: &UniqueInstance, v: &V) -> Result<D>;
 }
 
 pub trait ResolvableS<V: VSpecifics, D> {
@@ -483,17 +480,20 @@ pub trait ResolvableS<V: VSpecifics, D> {
 }
 
 impl NSRef {
-    pub fn resolve_d<'a>(&'a self, de: &'a Derivative) -> Result<&NSID> {
+    pub async fn resolve_d<'a>(&'a self, de: &'a Derivative) -> Result<NSID> {
         match self {
-            Self::Root => Ok(&de.root_ns),
-            Self::Flatpak(f) => {
-                let p = de.flatpak_names.get(f).ok_or(DevianceError)?;
+            Self::Root => Ok(de.root_ns.to_owned()),
+            Self::Pid(p) => {
                 let x = de.flatpak.get(p).ok_or(DevianceError)?;
-                Ok(&x.ns)
+                Ok(x.ns.to_owned())
             }
             Self::Named(n) => {
-                let x = de.named_ns.get(n).ok_or(DevianceError)?;
-                Ok(&x.ns)
+                let x = if let Some(k) = de.named_ns.get(n) {
+                    k.ns.clone()
+                } else {
+                    NSID::from_name(n.to_owned()).await?
+                };
+                Ok(x)
             }
         }
     }
@@ -528,21 +528,31 @@ impl RC for AddrRef {}
 trait RC {}
 
 impl<D: RC, T: ResolvableS<NamedV, D>> ResolvableG<NamedV, D> for T {
-    fn resolve_g(&self, global: &NetnspState, uq: &UniqueInstance, v: &NamedV) -> Result<D> {
+    async fn resolve_g(&self, global: &NetnspState, _uq: &UniqueInstance, v: &NamedV) -> Result<D> {
         let subject = global.derivative.named_ns.get(&v.0).ok_or(DevianceError)?;
         self.resolve(subject)
     }
 }
 
 impl<D: RC, T: ResolvableS<FlatpakV, D>> ResolvableG<FlatpakV, D> for T {
-    fn resolve_g(&self, global: &NetnspState, uq: &UniqueInstance, v: &FlatpakV) -> Result<D> {
+    async fn resolve_g(
+        &self,
+        global: &NetnspState,
+        _uq: &UniqueInstance,
+        v: &FlatpakV,
+    ) -> Result<D> {
         let subject = global.derivative.flatpak.get(&v.pid).ok_or(DevianceError)?;
         self.resolve(subject)
     }
 }
 
 impl<V: VSpecifics> ResolvableG<V, Vec<String>> for DNSProxyR {
-    fn resolve_g(&self, global: &NetnspState, uq: &UniqueInstance, v: &V) -> Result<Vec<String>> {
+    async fn resolve_g(
+        &self,
+        _global: &NetnspState,
+        _uq: &UniqueInstance,
+        _v: &V,
+    ) -> Result<Vec<String>> {
         match &self.args {
             None => {
                 let r = if self.v6 {
@@ -622,7 +632,7 @@ impl<V: VSpecifics> ResolvableS<V, VethConn> for RVethConn {
 }
 
 impl<V: VSpecifics> ResolvableG<V, SubjectInfo<V>> for Arc<SubjectProfile> {
-    fn resolve_g(
+    async fn resolve_g(
         &self,
         global: &NetnspState,
         uq: &UniqueInstance,
@@ -634,7 +644,7 @@ impl<V: VSpecifics> ResolvableG<V, SubjectInfo<V>> for Arc<SubjectProfile> {
             id: uq.clone(),
             vaddrs: HashMap::new(),
             specifics: v.clone(),
-            ns: re.resolve_d(&global.derivative)?.to_owned(),
+            ns: re.resolve_d(&global.derivative).await?.to_owned(),
             dnsp_args: None,
             tun2s: None,
             profile: Some(self.to_owned()),
@@ -643,7 +653,7 @@ impl<V: VSpecifics> ResolvableG<V, SubjectInfo<V>> for Arc<SubjectProfile> {
             let v1 = vc.resolve(&s)?;
             s.vaddrs.insert(vc.target.clone(), v1);
         }
-        s.dnsp_args = Some(self.dnsproxy.resolve_g(global, uq, v)?);
+        s.dnsp_args = Some(self.dnsproxy.resolve_g(global, uq, v).await?);
         s.tun2s = Some(self.tun2socks.resolve(&s)?);
 
         Ok(s)
@@ -663,4 +673,46 @@ pub struct NSID {
     #[derivative(Hash = "ignore")]
     #[derivative(PartialEq = "ignore")]
     pub path: Option<PathBuf>,
+}
+
+mod presets {
+    use std::{sync::Arc, fs};
+
+    use crate::data::*;
+    use anyhow::Result;
+
+    #[test]
+    fn sample() -> Result<()> {
+        let mut s = Settings::default();
+        let v1 = RVethConn {
+            target: NSRef::Root,
+        };
+        s.profiles.insert(
+            ProfileName("geph1".into()),
+            Arc::new(SubjectProfile {
+                vconnections: vec![v1.clone()],
+                proxies: vec![],
+                procs: RProcTasks::default(),
+                tun2socks: RTUNedSocks {
+                    src: AddrRef::VConn(v1, false, 9909),
+                    enable: true,
+                },
+                dnsproxy: DNSProxyR {
+                    enable: true,
+                    ..Default::default()
+                },
+            }),
+        );
+        s.flatpak.insert(
+            FlatpakID("com.belmoussaoui.Decoder".into()),
+            ProfileName("geph1".into()),
+        );
+        let se = serde_json::to_string_pretty(&s)?;
+        let re: Settings = serde_json::from_str(&se)?;
+        let mut ro: PathBuf = env!("CARGO_MANIFEST_DIR").parse()?;
+        ro.push("testing/geph1.json");
+        fs::write(ro, se)?;
+        assert_eq!(s, re);
+        Ok(())
+    }
 }

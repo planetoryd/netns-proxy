@@ -1,17 +1,21 @@
 #![feature(setgroups)]
-use anyhow::{anyhow, Ok, Result};
+use anyhow::{anyhow, bail, Ok, Result};
 use clap::{Parser, Subcommand};
 
-use netns_proxy::sub::{NetnspSubCaller, NsubRPC, NsubService};
+use futures::StreamExt;
+use netns_proxy::sub::{handle, SubHub, ToSub};
 use netns_proxy::util::error::DevianceError;
 use netns_proxy::util::ns::{
     self, enter_ns_by_name, enter_ns_by_pid, get_self_netns_inode, self_netns_identify,
 };
-use netns_proxy::util::{open_wo_cloexec, Daemons, TaskOutput};
+use netns_proxy::util::{open_wo_cloexec, Awaitor, TaskOutput};
 use netns_proxy::util::{perms::*, DaemonSender};
 use netns_proxy::watcher::{FlatpakWatcher, Watcher, WatcherEvent};
-use tarpc::server::{BaseChannel, Channel};
+use nix::unistd::geteuid;
+use tokio::net::UnixStream;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio_util::codec::Framed;
+use tokio_util::codec::LengthDelimitedCodec;
 
 use std::collections::HashSet;
 use std::env::Args;
@@ -26,9 +30,6 @@ use netns_proxy::netlink::*;
 use netns_proxy::sub;
 use netns_proxy::watcher;
 use procfs::process::Process;
-use tarpc::serde_transport::unix::Incoming;
-use tarpc::tokio_serde::formats::{Bincode, SymmetricalBincode};
-use tarpc::{context, serde_transport};
 
 #[derive(Parser)]
 #[command(
@@ -64,7 +65,7 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     flexi_logger::Logger::try_with_env_or_str(
-        "debug,netnsp_main=trace,netns_proxy=trace,netnsp_sub=trace,netlink_proto=info,rustables=info",
+        "trace,netlink_proto=info,rustables=warn,netlink_sys=info",
     )
     .unwrap()
     .log_to_stdout()
@@ -76,12 +77,10 @@ async fn main() -> Result<()> {
         let path: Result<PathBuf, _> = args[1].parse();
         if path.is_ok() {
             let sock_path = path.unwrap();
-            let conn =
-                serde_transport::unix::connect(sock_path.as_path(), Bincode::default).await?;
-            let b = BaseChannel::with_defaults(conn);
-            b.execute(NsubRPC.serve()).await;
-            // which means, this process exits when the connection gets closed
-            // I have experimented too.
+            let conn = UnixStream::connect(sock_path.as_path()).await?;
+            let f: Framed<UnixStream, LengthDelimitedCodec> =
+                Framed::new(conn, LengthDelimitedCodec::new());
+            handle(f).await?;
             return Ok(());
         }
     }
@@ -95,6 +94,11 @@ async fn main() -> Result<()> {
         // let i = nix::unistd::getpgrp();
         // TODO: kill all sub processes in case of crash
     });
+
+    let euid = geteuid();
+    if euid != 0.into() {
+        log::warn!("Not running as root.");
+    }
 
     match cli.command {
         Some(Commands::Stop {}) => {
@@ -110,14 +114,14 @@ async fn main() -> Result<()> {
             // It is hard to steer the system config state into the desired state
             // Things get messed up easily.
             let nl = NetlinkConn::new_in_current_ns();
-            let state = NetnspState::load(Default::default()).await?;
+            let state = NetnspState::load(Arc::new(ConfPaths::default()?)).await?;
             state.clean_net(&nl).await?;
             log::info!("cleaned");
             // The config process resets a lot even though it's not an explicit clean
         }
         Some(Commands::Exec { mut cmd, ns, pid }) => {
-            let state = NetnspState::load(Default::default()).await?;
-            let curr_inode = NSID::root()?;
+            let state = NetnspState::load(Arc::new(ConfPaths::default()?)).await?;
+            let curr_inode = NSID::proc()?;
             let (u, g) = get_non_priv_user(None, None, None, None)?;
 
             if curr_inode != state.derivative.root_ns {
@@ -126,16 +130,18 @@ async fn main() -> Result<()> {
             }
 
             if cmd.is_none() {
-                cmd = Some("fish".to_owned());
+                cmd = Some(
+                    env::var("SHELL").map_err(|x| anyhow!("argument cmd not provided; {}", x))?,
+                );
             }
 
-            if let Some(pi) = pid {
-                let n = NSID::from_pid(Pid(pi.try_into()?))?;
-                n.open().await?.enter()?;
+            let n = if let Some(pi) = pid {
+                NSID::from_pid(Pid(pi.try_into()?))?
             } else {
-                let n = NSID::from_name(ProfileName(ns)).await?;
-                n.open().await?.enter()?;
-            }
+                NSID::from_name(ProfileName(ns.clone())).await?
+            };
+
+            n.open().await?.enter()?;
 
             drop_privs_id(nix::unistd::Gid::from_raw(u), nix::unistd::Uid::from_raw(g))?;
 
@@ -143,29 +149,39 @@ async fn main() -> Result<()> {
             let mut cmd_async: Command = proc.into();
             let mut t = cmd_async.spawn()?;
             t.wait().await?;
+
+            // TODO: better indication
+            println!("entered {}", ns);
         }
         None => {
             // Run as a daemon
-            let paths = Arc::new(ConfPaths::default());
-            let mut state: NetnspState = NetnspState::load(Default::default()).await?;
-            let mut dae = Daemons::new();
+            let paths = Arc::new(ConfPaths::default()?);
+            let mut state: NetnspState = NetnspState::load(paths.clone()).await?;
+            let mut dae = Awaitor::new();
             let mut mn: MultiNS = MultiNS::new(paths, dae.sender.clone()).await?;
+
+            let root = mn.init_root(&mut state.derivative).await?;
+            if root != state.derivative.root_ns {
+                bail!("root_ns mismatch. ");
+            }
+
             state.derive_all_named().await?;
-            state.initial_nft().await?;
             state.resume(&mut mn, &dae.sender).await?;
 
             let (sx, rx) = unbounded_channel();
             let flp = FlatpakWatcher::new(sx.clone());
-            let (t, _) = TaskOutput::new(Box::pin(flp.daemon()), "flatpak watcher".to_owned());
+            let (t, _) =
+                TaskOutput::immediately(Box::pin(flp.daemon()), "flatpak watcher".to_owned());
             dae.sender.send(t).unwrap();
 
-            let (t, _) = TaskOutput::new(
+            let (t, _) = TaskOutput::immediately(
                 Box::pin(event_handler(rx, state, dae.sender.clone(), mn)),
                 "event handler".to_owned(),
             );
             dae.sender.send(t).unwrap();
             // finally. wait on all tasks.
-            dae.run().await?;
+            dae.wait().await?;
+            log::info!("exit");
         }
     }
 
@@ -184,9 +200,9 @@ async fn event_handler(
                 state.derive_flatpak(fp.clone()).await?;
                 let inf = state.derivative.flatpak.get(&fp.pid).ok_or(DevianceError)?;
                 inf.apply_veths(&mn, &state.derivative).await?;
+                // start all daemons
                 inf.run(&dae, &mn.procs).await?;
-                // inf.run()
-            }
+            } // TODO: watch for other kinds, bwrap, unshared.
         }
     }
     Ok(())

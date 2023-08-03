@@ -34,15 +34,13 @@ pidfd = "0.2.4"
 xdg = "2.5.0"
 thiserror = "1.0.40"
 socksv5 = { version = "0.3.1", features = ["tokio"] }
-tarpc = { version = "0.33.0", features = [
-    "serde-transport",
-    "unix",
-    "serde-transport-bincode",
-] }
 dashmap = "5.4.0"
 serde-error = { path = "../serde-error" }
 derivative = "2.2.0"
 serde_with = "3.1.0"
+tokio-util = { version = "0.7.8", features = ["codec"] }
+bytes = "1.4.0"
+bincode = "1.3.3"
 [profile.release]
 strip = true
 opt-level = "z" # bottleneck is size, not cpu

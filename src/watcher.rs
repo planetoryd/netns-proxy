@@ -4,10 +4,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{data::*, util::TaskOutput};
-use anyhow::{anyhow, Result};
-use futures::{Future, StreamExt};
-use inotify::{Event, EventMask, Inotify, WatchMask};
+use crate::{data::*};
+use anyhow::{Result};
+use futures::{StreamExt};
+use inotify::{Event, EventMask, WatchMask};
 use std::result::Result as stdRes;
 use tokio::{fs, io::AsyncReadExt, sync::mpsc::UnboundedSender};
 
