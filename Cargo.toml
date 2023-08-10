@@ -10,7 +10,6 @@ default-run = "nsproxy"
 clap = { version = "4.2.4", features = ["derive"] }
 tokio = { version = "1.27.0", features = ["full"] }
 sysinfo = "0.28.4"
-flexi_logger = "0.25"
 log = "0.4.17"
 futures = "0.3.28"
 ipnetwork = { version = "0.20.0", features = ["serde"] }
@@ -35,13 +34,9 @@ xdg = "2.5.0"
 thiserror = "1.0.40"
 socksv5 = { version = "0.3.1", features = ["tokio"] }
 dashmap = "5.4.0"
-serde-error = { path = "../serde-error" }
 derivative = "2.2.0"
 serde_with = "3.1.0"
 tokio-util = { version = "0.7.8", features = ["codec"] }
 bytes = "1.4.0"
 bincode = "1.3.3"
-[profile.release]
-strip = true
-opt-level = "z" # bottleneck is size, not cpu
-lto = true
+env_logger = "0.10.0"

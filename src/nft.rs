@@ -1,9 +1,18 @@
+use bincode::de;
 use rustables::{
-    expr::{Cmp, CmpOp, Immediate, Meta, MetaType, VerdictKind},
-    iface_index, list_chains_for_table, list_rules_for_chain, list_tables, Batch, Chain, Hook,
-    MsgType, ProtocolFamily, Rule, Table,
+    expr::{
+        Cmp, CmpOp, ExpressionRaw, ExpressionVariant, Immediate, Meta, MetaType, Nat, NatType,
+        RawExpression, VerdictKind,
+    },
+    iface_index, list_chains_for_table, list_rules_for_chain, list_tables,
+    nlmsg::NfNetlinkObject,
+    util::Essence,
+    Batch, Chain, Hook, MsgType, ProtocolFamily, Rule, Table,
 };
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    hash::Hash,
+};
 
 use anyhow::{Ok, Result};
 
@@ -13,105 +22,271 @@ pub const FO_CHAIN: &str = "block-forward";
 #[derive(Default, Debug)]
 pub struct NftState {
     // name -> table. indexed
-    tables: HashMap<String, NftTable>,
+    tables: Vec<PTable>,
 }
 
 #[derive(Default, Debug)]
-pub struct NftTable {
+pub struct PTable {
     table: Table,
-    chains: HashMap<String, NftChain>,
+    chains: Vec<PChain>,
 }
 
 #[derive(Default, Debug)]
-pub struct NftChain {
+pub struct PChain {
     chain: Chain,
     rules: HashSet<Rule>,
     // I think they are not ordered
 }
 
-// it's actually quite awkward to spend so much effort synchronizing the nft state and local state.
+pub trait NftObj: rustables::nlmsg::NfNetlinkObject + Hash + Eq + Essence {}
 
-// ensure those rules exist
-// if not, incrementally update
-pub fn ensure_rules(proposal: NftState) -> Result<()> {
-    let exis_tables: Vec<Table> = list_tables()?;
-    let exis_tables_names: HashSet<&String> = exis_tables
-        .iter()
-        .flat_map(|table| table.get_name())
-        .collect();
-    // do a quick scan for consistency, and if diff is small, update incrementally, else remove & re-add
-    let mut batch: Batch = Batch::new();
-    for (p_table_name, proposed_table) in proposal.tables {
-        if exis_tables_names.contains(&p_table_name) {
-            // the comparison isn't that strict / careful. mostly against misconfig, not adversaries
-            let exis_chains = list_chains_for_table(&proposed_table.table)?;
-            let exis_chain_names: HashSet<&String> = exis_chains
-                .iter()
-                .flat_map(|chain| chain.get_name())
-                .collect();
-            for (c_name, p_chain) in proposed_table.chains {
-                if exis_chain_names.contains(&c_name) {
-                    let mut exis_rules: Vec<Rule> = list_rules_for_chain(&p_chain.chain)?;
-                    for r in exis_rules.iter_mut() {
-                        r.essentialize();
-                    }
-
-                    let exi_set: HashSet<&Rule> = HashSet::from_iter(exis_rules.iter());
-                    let expec_set: HashSet<&Rule> = HashSet::from_iter(p_chain.rules.iter());
-                    if exi_set.is_subset(&expec_set) {
-                        // add all the missing rules
-                        let add_diff = &expec_set - &exi_set;
-                        for expr in add_diff.iter() {
-                            batch.add(*expr, MsgType::Add);
-                        }
-                        log::trace!(
-                            "incrementally adding {} new rules to chain {}",
-                            add_diff.len(),
-                            c_name
-                        )
-                    } else {
-                        // remove and re-add
-                        // we take full-control of a chain
-                        log::trace!("chain {} contaminated, re-adding", c_name);
-                        for rule in exis_rules {
-                            // remove every old rule
-                            batch.add(&rule, MsgType::Del);
-                        }
-                        for rule in &p_chain.rules {
-                            batch.add(rule, MsgType::Add);
-                        }
-                    }
-                } else {
-                    // add chain
-                    log::trace!("adding new chain {}", c_name);
-                    batch.add(&p_chain.chain, MsgType::Add);
-                    for rule in &p_chain.rules {
-                        batch.add(rule, MsgType::Add);
-                    }
-                }
-            }
-            // do nothing to other chains if they exist
-        } else {
-            log::trace!("adding new table {}", p_table_name);
-            batch.add(&proposed_table.table, MsgType::Add);
-            for (_, p_chain) in proposed_table.chains.iter() {
-                batch.add(&p_chain.chain, MsgType::Add);
-                for rule in &p_chain.rules {
-                    batch.add(rule, MsgType::Add);
-                }
-            }
-            // add table
-        }
+pub trait Subbed: Sized {
+    type ST: NftObj;
+    type SP: Concrete<T = Self::ST>;
+    type STIter: IntoIterator<Item = Self::ST> = Vec<Self::ST>;
+    type SPIter<'a>: IntoIterator<Item = &'a Self::SP> = &'a Vec<Self::SP>
+    where
+        Self::SP: 'a,
+        Self: 'a ;
+    fn sub_objs_existing(&self) -> Result<Self::STIter>;
+    fn sub_props(&self) -> Result<Self::SPIter<'_>>;
+    fn exclusive() -> bool {
+        false
     }
-    // do nothing to other tables if any
-    log::trace!("ensure_rules, batch.send");
-    batch.send()?;
+    fn process(&self, batch: &mut Batch) -> Result<HashSet<Self::ST>> {
+        let props = self.sub_props()?;
+        let prop_objs = props.into_iter().map(|x| x.obj());
+        let objs = self.sub_objs_existing()?;
+        let prop_set: HashSet<_> = HashSet::from_iter(prop_objs.into_iter());
+        let obj_set: HashSet<_> = HashSet::from_iter(objs.into_iter().map(|mut e| {
+            e.essentialize();
+            e
+        }));
+        let objsr = HashSet::from_iter(&obj_set);
+        let surplus = &objsr - &prop_set;
+        let missing = &prop_set - &objsr;
+        if Self::exclusive() {
+            for s in surplus {
+                batch.add(s, MsgType::Del);
+            }
+        }
+        for m in missing {
+            batch.add(m, MsgType::Add);
+        }
+        Ok(obj_set)
+    }
+}
 
+/// with concrete NFT data
+pub trait Concrete {
+    type T: NftObj;
+    fn obj(&self) -> &Self::T;
+}
+
+pub trait Fetch<T>: Sized {
+    fn fetch(ext: T) -> Result<Self>;
+}
+
+impl Fetch<()> for NftState {
+    fn fetch(_ext: ()) -> Result<Self> {
+        let mut nf = NftState::default();
+        nf.tables = nf
+            .sub_objs_existing()?
+            .into_iter()
+            .map(|x| PTable::fetch(x))
+            .try_collect()?;
+        Ok(nf)
+    }
+}
+
+impl Fetch<Table> for PTable {
+    fn fetch(ext: Table) -> Result<Self> {
+        let mut t = Self {
+            table: ext,
+            ..Default::default()
+        };
+        t.chains = t
+            .sub_objs_existing()?
+            .into_iter()
+            .map(|x| PChain::fetch(x))
+            .try_collect()?;
+        Ok(t)
+    }
+}
+
+impl Fetch<Chain> for PChain {
+    fn fetch(ext: Chain) -> Result<Self> {
+        let mut c = Self {
+            chain: ext,
+            ..Default::default()
+        };
+        c.rules = HashSet::from_iter(c.sub_objs_existing()?.into_iter());
+        Ok(c)
+    }
+}
+
+pub trait Fat {
+    /// process recursively for state application
+    fn compose(&self, batch: &mut Batch) -> Result<()>;
+}
+
+impl Fat for PChain {
+    fn compose(&self, batch: &mut Batch) -> Result<()> {
+        let _objs = self.process(batch)?;
+        Ok(())
+    }
+}
+
+impl Fat for PTable {
+    fn compose(&self, batch: &mut Batch) -> Result<()> {
+        let _objs = self.process(batch)?;
+        for p in self.sub_props()? {
+            p.compose(batch)?;
+        }
+        Ok(())
+    }
+}
+
+impl Fat for NftState {
+    fn compose(&self, batch: &mut Batch) -> Result<()> {
+        let _objs = self.process(batch)?;
+        for p in self.sub_props()? {
+            p.compose(batch)?;
+        }
+        Ok(())
+    }
+}
+
+impl<N: NfNetlinkObject + Essence + Eq + Hash> NftObj for N {}
+
+impl Concrete for PTable {
+    type T = Table;
+    fn obj(&self) -> &Self::T {
+        &self.table
+    }
+}
+
+impl Subbed for NftState {
+    type SP = PTable;
+    type ST = Table;
+    fn sub_objs_existing(&self) -> Result<Self::STIter> {
+        Ok(list_tables()?)
+    }
+    fn sub_props(&self) -> Result<Self::SPIter<'_>> {
+        Ok(&self.tables)
+    }
+}
+
+impl Subbed for PTable {
+    type SP = PChain;
+    type ST = Chain;
+    fn sub_props(&self) -> Result<Self::SPIter<'_>> {
+        Ok(&self.chains)
+    }
+    fn sub_objs_existing(&self) -> Result<Self::STIter> {
+        Ok(list_chains_for_table(&self.table)?)
+    }
+    fn exclusive() -> bool {
+        true
+    }
+}
+
+impl Concrete for PChain {
+    type T = Chain;
+    fn obj(&self) -> &Self::T {
+        &self.chain
+    }
+}
+
+impl Subbed for PChain {
+    type ST = Rule;
+    type SP = Rule;
+    type SPIter<'a> = &'a HashSet<Self::SP>;
+    fn exclusive() -> bool {
+        true
+    }
+    fn sub_objs_existing(&self) -> Result<Self::STIter> {
+        Ok(list_rules_for_chain(&self.chain)?)
+    }
+    fn sub_props(&self) -> Result<Self::SPIter<'_>> {
+        Ok(&self.rules)
+    }
+}
+
+impl Concrete for Rule {
+    type T = Self;
+    fn obj(&self) -> &Self::T {
+        self
+    }
+}
+
+pub fn print_all() -> Result<()> {
+    let nf = NftState::fetch(())?;
+    dbg!(nf);
     Ok(())
 }
 
-pub fn apply_block_forwad(veth_list: &[&str]) -> Result<()> {
-    log::info!("applying nft rules to block forwarding of {:?}", veth_list);
+/// redirect all DNS traffic to localhost:port
+pub fn redirect_dns(port: u16) -> Result<NftState> {
+    const DNS_CHAIN: &str = "out";
+    let table = Table::new(ProtocolFamily::Inet).with_name(TABLE_NAME.to_owned());
+    let chain = Chain::new(&table)
+        .with_name(DNS_CHAIN)
+        .with_hook(Hook::new(rustables::HookClass::Out, 0))
+        .with_type(ChainType::Nat)
+        .with_flags(1 as u32)
+        .with_policy(rustables::ChainPolicy::Accept);
+
+    let mut exp = RawExpression::default();
+    let raw: ExpressionRaw = [
+        8, 0, 1, 0, 0, 0, 0, 1, 8, 0, 2, 0, 0, 0, 0, 1, 8, 0, 3, 0, 0, 0, 0, 2,
+    ]
+    .to_vec()
+    .into();
+
+    exp.set_name("redir");
+    exp.set_data(raw);
+    let mut rules: HashSet<Rule> = HashSet::new();
+    let r1 = Rule::new(&chain)?
+        .protocol(Protocol::UDP)
+        .dport(53, Protocol::UDP)
+        .with_expr(Immediate::new_data(
+            port.to_be_bytes().to_vec(),
+            expr::Register::Reg1,
+        ))
+        .with_expr(exp);
+    rules.insert(r1);
+
+    let prop = NftState {
+        tables: vec![PTable {
+            table,
+            chains: vec![PChain { chain, rules }],
+        }],
+    };
+
+    Ok(prop)
+}
+
+impl NftState {
+    pub async fn apply(self) -> Result<Self> {
+        let x = tokio::task::spawn_blocking(move || {
+            let mut b = Batch::new();
+            self.compose(&mut b)?;
+            b.send()?;
+            Ok(self)
+        })
+        .await?;
+        Ok(x?)
+    }
+}
+
+#[test]
+fn test_dns_prop() {
+    let p = redirect_dns(5353).unwrap();
+    dbg!(p);
+}
+
+pub async fn apply_block_forwad(veth_list: &[&str]) -> Result<()> {
     let table = Table::new(ProtocolFamily::Inet).with_name(TABLE_NAME.to_owned());
     let chain = Chain::new(&table)
         .with_name(FO_CHAIN)
@@ -124,16 +299,13 @@ pub fn apply_block_forwad(veth_list: &[&str]) -> Result<()> {
     }
 
     let prop = NftState {
-        tables: HashMap::from_iter([(
-            TABLE_NAME.to_owned(),
-            NftTable {
-                table,
-                chains: HashMap::from([(FO_CHAIN.to_owned(), NftChain { chain, rules })]),
-            },
-        )]),
+        tables: vec![PTable {
+            table,
+            chains: vec![PChain { chain, rules }],
+        }],
     };
 
-    ensure_rules(prop)?;
+    prop.apply().await?;
 
     Ok(())
 }
@@ -158,10 +330,10 @@ pub struct IncrementalNft {
 use rustables::*;
 impl IncrementalNft {
     pub fn drop_packets_from(&mut self, name: String) {
-        log::info!("add nft rule for {}", name);
+        log::info!("Add nft rule for {}", name);
         self.links.push(name);
     }
-    /// blocking socket
+    // TODO: blocking socket
     pub fn execute(&mut self) -> Result<()> {
         let table = Table::new(ProtocolFamily::Inet).with_name(TABLE_NAME.to_owned());
         let chain = Chain::new(&table)

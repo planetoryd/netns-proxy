@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::env;
+use std::fmt::Debug;
 use std::fs::File;
 use std::os::fd::FromRawFd;
 use std::path::PathBuf;
@@ -91,13 +92,13 @@ pub async fn watch_log(
     prefix: String,
 ) -> Result<()> {
     if let Some(line) = reader.next_line().await? {
-        log::info!("{} {}", prefix, line);
+        log::debug!("{} {}", prefix, line);
         if let Some(t) = tx {
-            t.send(true);
+            t.send(true).unwrap();
         }
     }
     while let Some(line) = reader.next_line().await? {
-        log::info!("{} {}", prefix, line);
+        log::debug!("{} {}", prefix, line);
     }
     Ok(())
 }
@@ -157,9 +158,7 @@ pub mod perms {
         set_initgroups(&user, gi.as_raw());
         log::trace!("UID to {ui}");
         nix::unistd::setresuid(ui, ui, ui)?;
-
-        log::info!("dropped privs to resuid={ui} resgid={gi}");
-
+        log::info!("Dropped privileges to resuid={ui} resgid={gi}");
         Ok(())
     }
 
@@ -286,7 +285,6 @@ pub fn kill_suspected() -> Result<()> {
         // or by matching commandlines
         let c = process.cmd();
         if c.into_iter().any(|x| x.contains("tun2socks"))
-            || c.into_iter().any(|x| x.contains("gost"))
             || c.into_iter().any(|x| x.contains("dnsproxy"))
         {
             println!("killed {pid} {}", c[0]);
@@ -296,13 +294,13 @@ pub fn kill_suspected() -> Result<()> {
     Ok(())
 }
 
-pub fn open_wo_cloexec(path: &Path) -> Result<tokio::fs::File> {
+pub fn open_wo_cloexec(path: &Path) -> Result<File> {
     use nix::fcntl::{open, OFlag};
     use nix::sys::stat::Mode;
     let fd = open(path, OFlag::O_RDONLY, Mode::empty())?;
     let syncf = unsafe { File::from_raw_fd(fd) };
 
-    Ok(syncf.into())
+    Ok(syncf)
 }
 
 pub mod ns {
@@ -335,7 +333,8 @@ pub mod ns {
     pub fn named_ns<N: ValidNamedNS>(ns_name: &N) -> Result<File> {
         let mut p = PathBuf::from(NETNS_PATH);
         p.push(&ns_name);
-        open_wo_cloexec(p.as_path())
+        let f = open_wo_cloexec(p.as_path())?.into();
+        Ok(f)
     }
 
     pub fn named_ns_exist<N: ValidNamedNS>(ns_name: &N) -> Result<bool> {
@@ -386,7 +385,7 @@ pub mod ns {
         let proc_ns = nss
             .get(&o)
             .ok_or(anyhow!("ns/net not found for given pid"))?;
-        let r = open_wo_cloexec(&proc_ns.path)?;
+        let r = open_wo_cloexec(&proc_ns.path)?.into();
         Ok(r)
     }
 
@@ -491,6 +490,8 @@ pub mod ns {
 }
 
 pub mod error {
+    use anyhow::Result;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use thiserror::Error;
 
@@ -501,15 +502,9 @@ pub mod error {
     #[derive(Error, Debug)]
     #[error("Something is missing, and it can be handled")]
     pub struct MissingError;
-
-    use serde_error::Error as SError;
-
-    pub fn se_ok() -> Result<(), SError> {
-        Result::Ok(())
-    }
 }
 
-/// A place to keep all daemons
+/// A way to wait on all tasks before quitting
 pub struct Awaitor {
     pub sender: DaemonSender,
     recver: UnboundedReceiver<Pin<Box<dyn Future<Output = TaskOutput> + Send>>>,
@@ -537,16 +532,17 @@ impl TaskOutput {
         (
             Box::pin(async move {
                 let r = f.await;
+                Self::handle_task_result(r, name.clone());
                 TaskOutput {
                     name,
-                    result: r,
+                    result: Ok(()),
                     sig: Some(sx),
                 }
             }),
             rx,
         )
     }
-    pub fn wrapped<E2: std::error::Error + Send + Sync + 'static, T: 'static>(
+    pub fn wrapped<E2: std::error::Error + Send + Sync + 'static, T: 'static + Debug>(
         f: Pin<Box<dyn Future<Output = Result<Result<T>, E2>> + Send>>,
         name: String,
     ) -> (
@@ -557,8 +553,12 @@ impl TaskOutput {
         (
             Box::pin(async move {
                 let r = f.await;
+                let n2 = name.clone();
                 let r = match r {
-                    Result::Ok(_x) => Result::Ok(()),
+                    Result::Ok(x) => {
+                        Self::handle_task_result(x, n2);
+                        Ok(())
+                    }
                     Err(x) => Err::<(), anyhow::Error>(x.into()),
                 };
                 TaskOutput {
@@ -570,28 +570,47 @@ impl TaskOutput {
             rx,
         )
     }
-    pub fn immediately<T: Send + 'static>(
+    pub fn immediately<T: Send + 'static + Debug>(
         f: Pin<Box<dyn Future<Output = Result<T>> + Send>>,
         name: String,
     ) -> (
         Pin<Box<dyn Future<Output = TaskOutput> + Send>>,
         Receiver<()>,
     ) {
-        let h = tokio::spawn(f);
-        Self::wrapped(Box::pin(h), name)
+        let n2 = name.clone();
+        let h = tokio::spawn(async move {
+            let x = f.await;
+            Self::handle_task_result(x, name);
+            Ok(())
+        });
+        Self::wrapped(Box::pin(h), n2)
     }
-    pub fn immediately_std<T: Send + 'static, E: std::error::Error + Send + Sync + 'static>(
+    pub fn immediately_std<
+        T: Send + 'static + Debug,
+        E: std::error::Error + Send + Sync + 'static,
+    >(
         f: Pin<Box<dyn Future<Output = Result<T, E>> + Send>>,
         name: String,
     ) -> (
         Pin<Box<dyn Future<Output = TaskOutput> + Send>>,
         Receiver<()>,
     ) {
+        let n2 = name.clone();
         let h = tokio::spawn(async move {
-            f.await?;
+            let x = f.await;
+            Self::handle_task_result(x, name);
             Ok(())
         });
-        Self::wrapped(Box::pin(h), name)
+        Self::wrapped(Box::pin(h), n2)
+    }
+    pub fn handle_task_result<T: Debug, E: Debug>(x: Result<T, E>, name: String) {
+        // a task can error before Awaiter start awaiting, which produces an error
+        // that has to be handled early. Otherwise nothing will be logged, which looks like deadlock.
+        if let Err(e) = x {
+            log::error!("Task {} errored, {:?}", name, e);
+        } else {
+            log::debug!("Task {} has result {:?}", name, x.unwrap());
+        }
     }
 }
 
@@ -608,7 +627,6 @@ impl Awaitor {
         loop {
             tokio::select! {
                 maybe_task = self.recver.recv() => {
-                    log::trace!("received new daemon");
                     if let Some(task) = maybe_task {
                         self.daemons.spawn(task);
                     }

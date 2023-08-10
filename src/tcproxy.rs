@@ -15,10 +15,10 @@ pub async fn start_proxy(port: u16) -> Result<()> {
     // If we don't do this, it will say Address already in use, and starts a loop with itself.
     // the latter seems solvable but let's just just port+1
     log::trace!("tcproxy in ns {:?}", selfns);
-
+    
     loop {
         let (socket, _) = proxy_server.accept().await?;
-        log::debug!("new conn on {}", port);
+        log::trace!("new conn on {}", port);
         tokio::spawn(async move {
             let _r = handle_client_conn(socket, port).await;
         });

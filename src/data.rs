@@ -19,7 +19,7 @@ use crate::{
     netlink::{ConnRef, MultiNS, VPairKey},
     nft,
     sub::NsubState,
-    util::TaskOutput,
+    util::{watch_both, TaskOutput},
 };
 use tokio::{self, io::AsyncReadExt};
 
@@ -28,7 +28,7 @@ use anyhow::{Ok, Result};
 use crate::util::error::*;
 
 // generated info and state store
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Debug)]
 pub struct Derivative {
     // separate maps, separate indexing
     pub named_ns: HashMap<ProfileName, SubjectInfo<NamedV>>,
@@ -37,24 +37,49 @@ pub struct Derivative {
     pub root_ns: NSID,
 }
 
+trait PidMap {
+    /// retain only running processes
+    async fn retain_running(&mut self) -> Result<()>;
+}
+
+impl<T> PidMap for HashMap<Pid, T> {
+    async fn retain_running(&mut self) -> Result<()> {
+        let mut pids = HashSet::new();
+        let mut entries = tokio::fs::read_dir("/proc").await?;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let file_name = entry.file_name();
+
+            if let Result::Ok(pid) = file_name.to_string_lossy().parse::<u32>() {
+                pids.insert(pid);
+            }
+        }
+        self.retain(|p, _v| pids.contains(&p.0));
+        Ok(())
+    }
+}
+
 impl Derivative {
     pub async fn init(&mut self) -> Result<()> {
-        log::info!(
-            "initing Derivative. the netns of current process will be assumed to be root_ns"
+        self.update_rootns()?;
+        log::warn!(
+            "The netns of current process will be assumed to be root_ns. It's recorded in the derivative file for the use of all later launches"
         );
+        Ok(())
+    }
+    /// Update root_ns NSID's Pid
+    pub fn update_rootns(&mut self) -> Result<()> {
         self.root_ns = NSID::proc()?;
+        self.root_ns.root = true;
+        log::debug!("Root_ns is {:?}", &self.root_ns);
         Ok(())
     }
     /// clear invalid ones
-    pub fn clean_flatpak(&mut self, set: &HashMap<FlatpakID, ProfileName>) {
-        let mut removed = HashSet::new();
-        for (p, s) in self.flatpak.iter() {
-            if !set.contains_key(&s.specifics.id) {
-                removed.insert(p.clone());
-            }
-        }
-        self.flatpak.retain(|a, _| !removed.contains(a));
-        // TODO: deal with flatpak_names
+    pub async fn clean_flatpak(&mut self, set: &HashMap<FlatpakID, ProfileName>) -> Result<()> {
+        self.flatpak
+            .retain(|_p, s| set.contains_key(&s.specifics.id));
+        self.flatpak.retain_running().await?;
+        Ok(())
     }
     pub fn clean_named(&mut self, conf: &HashMap<ProfileName, Arc<SubjectProfile>>) {
         self.named_ns.retain(|e, _| conf.contains_key(e));
@@ -88,6 +113,7 @@ impl From<String> for FlatpakID {
     }
 }
 
+#[derive(Debug)]
 pub struct NetnspState {
     // persistent
     pub derivative: Derivative,
@@ -152,7 +178,7 @@ impl FlatpakBaseName {
 
 impl UniqueName for FlatpakBaseName {}
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ConfPaths {
     pub settings: PathBuf,
     pub derivative: PathBuf,
@@ -253,6 +279,8 @@ pub struct DNSProxyR {
     pub enable: bool,
     #[serde(default = "SubjectProfile::default_dns_v6")]
     pub v6: bool,
+    #[serde(default = "SubjectProfile::default_dns_port")]
+    pub port: u16,
     /// override args entirely
     pub args: Option<Vec<String>>,
 }
@@ -263,6 +291,8 @@ pub struct CmdParams {
     pub argv: Vec<String>,
     pub user: Option<String>,
 }
+
+pub const TUN_NAME: &str = "s_tun";
 
 /// This is runtime state that is only valid during runtime.
 /// On startup, it's filled by deriving from the profiles and global state
@@ -278,17 +308,17 @@ pub struct SubjectInfo<V: VSpecifics> {
     pub dnsp_args: Option<Vec<String>>,
     /// socks5 proxy
     pub tun2s: Option<SocketAddr>, // ip without CIDR
-    #[serde(skip)]
     pub profile: Option<Arc<SubjectProfile>>,
 }
 
 impl<V: VSpecifics> SubjectInfo<V> {
     /// get or create a subprocess, and get the Netns instance
     pub async fn connect(&self, mn: &mut MultiNS) -> Result<()> {
+        log::debug!("Connect NS for subject {}", self.ns);
         let n = mn.get_nl(self.ns.clone()).await?;
         let nl = ConnRef::new(Arc::new(n));
         let ns = nl.to_netns(self.ns.clone()).await?;
-        mn.ns.insert(self.ns.clone(), ns);
+        mn.ns.write().await.insert(self.ns.clone(), ns.into());
         Ok(())
     }
     pub fn assure_in_ns(&self) -> Result<()> {
@@ -299,13 +329,19 @@ impl<V: VSpecifics> SubjectInfo<V> {
     pub async fn run_tun2s(&self, st: &mut NsubState) -> Result<()> {
         use crate::netlink::*;
         use crate::util::watch_log;
-        let tun_name = "s_tun";
+
+        if !self.profile.as_ref().unwrap().tun2socks.enable {
+            return Ok(());
+        } else {
+            log::info!("Run tun2socks for {}", self.ns);
+        }
+
         let mut tun2 = std::process::Command::new("tun2socks");
         tun2.uid(st.non_priv_uid.into())
             .gid(st.non_priv_gid.into())
             .groups(&[st.non_priv_gid.into()]);
         let prxy = format!("socks5://{}", self.tun2s.unwrap().to_string());
-        tun2.args(&["-device", tun_name, "-proxy", &prxy]);
+        tun2.args(&["-device", TUN_NAME, "-proxy", &prxy]);
         let mut tun2_async: Command = tun2.into();
         tun2_async.stdout(Stdio::piped());
         let mut tun2h = tun2_async.spawn()?;
@@ -315,7 +351,7 @@ impl<V: VSpecifics> SubjectInfo<V> {
         let pre = format!("{}/tun2socks", self.id);
         tokio::spawn(watch_log(reader, Some(tx), pre.clone()));
         rx.await?; // wait for first line to appear
-        let tunk: LinkKey = tun_name.parse()?;
+        let tunk: LinkKey = TUN_NAME.parse()?;
         let tun = st.ns.netlink.links.get_mut(&tunk).ok_or(DevianceError)?;
         tun.up(st.ns.netlink.conn.get()).await?;
         let _ = st
@@ -340,42 +376,29 @@ impl<V: VSpecifics> SubjectInfo<V> {
     }
     pub async fn run_dnsp(&self, st: &mut NsubState) -> Result<()> {
         use crate::netlink::*;
-        use crate::util::watch_log;
-        let tun_name = "s_tun";
-        let mut tun2 = std::process::Command::new("tun2socks");
-        tun2.uid(st.non_priv_uid.into())
+
+        if !self.profile.as_ref().unwrap().dnsproxy.enable {
+            return Ok(());
+        } else {
+            log::info!("Run dnsproxy for {}", self.ns);
+        }
+
+        let mut dnsp = std::process::Command::new("dnsproxy");
+        dnsp.uid(st.non_priv_uid.into())
             .gid(st.non_priv_gid.into())
             .groups(&[st.non_priv_gid.into()]);
-        let prxy = format!("socks5://{}", self.tun2s.unwrap().to_string());
-        tun2.args(&["-device", tun_name, "-proxy", &prxy]);
-        let mut tun2_async: Command = tun2.into();
-        tun2_async.stdout(Stdio::piped());
-        let mut tun2h = tun2_async.spawn()?;
-        let stdout = tun2h.stdout.take().unwrap();
-        let reader = tokio::io::BufReader::new(stdout).lines();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let pre = format!("{}/tun2socks", self.id);
-        tokio::spawn(watch_log(reader, Some(tx), pre.clone()));
-        rx.await?; // wait for first line to appear
-        let tunk: LinkKey = tun_name.parse()?;
-        let tun = st.ns.netlink.links.get_mut(&tunk).ok_or(DevianceError)?;
-        tun.up(st.ns.netlink.conn.get()).await?;
-        let _ = st
-            .ns
-            .netlink
-            .conn
-            .get()
-            .ip_add_route(tun.index, None, Some(true))
-            .await;
-        let _ = st
-            .ns
-            .netlink
-            .conn
-            .get()
-            .ip_add_route(tun.index, None, Some(false))
-            .await;
 
-        let (t, _r) = TaskOutput::immediately_std(Box::pin(async move { tun2h.wait().await }), pre);
+        dnsp.args(self.dnsp_args.as_ref().unwrap());
+        let mut dnsp_a: Command = dnsp.into();
+        dnsp_a.stdout(Stdio::piped());
+        dnsp_a.stderr(Stdio::piped());
+        let mut dns_h = dnsp_a.spawn()?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let pre = format!("{}/dnsproxy", self.id);
+        watch_both(&mut dns_h, pre.clone(), Some(tx))?;
+        rx.await?; // wait for first line to appear
+
+        let (t, _r) = TaskOutput::immediately_std(Box::pin(async move { dns_h.wait().await }), pre);
         st.dae.send(t).unwrap();
 
         Ok(())
@@ -398,6 +421,9 @@ impl SubjectProfile {
     /// prefer v4 for dns
     fn default_dns_v6() -> bool {
         false
+    }
+    fn default_dns_port() -> u16 {
+        5353
     }
 }
 
@@ -452,7 +478,7 @@ pub struct UniqueInstance {
 
 impl Display for UniqueInstance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("#{}/{}", self.id, self.name))
+        f.write_fmt(format_args!("ID{}/{}", self.id, self.name))
     }
 }
 
@@ -484,8 +510,12 @@ impl NSRef {
         match self {
             Self::Root => Ok(de.root_ns.to_owned()),
             Self::Pid(p) => {
-                let x = de.flatpak.get(p).ok_or(DevianceError)?;
-                Ok(x.ns.to_owned())
+                let x = if let Some(k) = de.flatpak.get(p) {
+                    k.ns.clone()
+                } else {
+                    NSID::from_pid(p.clone())?
+                };
+                Ok(x)
             }
             Self::Named(n) => {
                 let x = if let Some(k) = de.named_ns.get(n) {
@@ -555,6 +585,7 @@ impl<V: VSpecifics> ResolvableG<V, Vec<String>> for DNSProxyR {
     ) -> Result<Vec<String>> {
         match &self.args {
             None => {
+                let p = self.port.to_string();
                 let r = if self.v6 {
                     vec![
                         "-l",
@@ -564,7 +595,7 @@ impl<V: VSpecifics> ResolvableG<V, Vec<String>> for DNSProxyR {
                         "-l",
                         "::1",
                         "-p",
-                        "53",
+                        &p,
                         "-u",
                         "tcp://[2620:119:35::35]:53",
                         "--cache",
@@ -578,7 +609,7 @@ impl<V: VSpecifics> ResolvableG<V, Vec<String>> for DNSProxyR {
                         "-l",
                         "::1",
                         "-p",
-                        "53",
+                        &p,
                         "-u",
                         "tcp://1.1.1.1:53",
                         "--cache",
@@ -673,10 +704,31 @@ pub struct NSID {
     #[derivative(Hash = "ignore")]
     #[derivative(PartialEq = "ignore")]
     pub path: Option<PathBuf>,
+    #[derivative(Hash = "ignore")]
+    #[derivative(PartialEq = "ignore")]
+    /// assumed to be root ns
+    #[serde(default)]
+    #[derivative(Hash = "ignore")]
+    #[derivative(PartialEq = "ignore")]
+    pub root: bool,
+}
+
+impl Display for NSID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(ref name) = self.name {
+            f.write_fmt(format_args!("(NS {}, Inode {})", name.0, self.inode))
+        } else if let Some(ref p) = self.pid {
+            f.write_fmt(format_args!("(NS of PID {}, Inode {})", p.0, self.inode))
+        } else if let Some(ref p) = self.path {
+            f.write_fmt(format_args!("(NS {:?}, Inode {})", p, self.inode))
+        } else {
+            f.write_fmt(format_args!("(NS with inode {})", self.inode))
+        }
+    }
 }
 
 mod presets {
-    use std::{sync::Arc, fs};
+    use std::{fs, sync::Arc};
 
     use crate::data::*;
     use anyhow::Result;
@@ -713,6 +765,17 @@ mod presets {
         ro.push("testing/geph1.json");
         fs::write(ro, se)?;
         assert_eq!(s, re);
+        Ok(())
+    }
+
+    #[test]
+    fn derivative_for_pass() -> Result<()> {
+        let mut de = Derivative::default();
+        de.root_ns = NSID::proc()?;
+        let se = serde_json::to_string_pretty(&de)?;
+        let mut ro: PathBuf = env!("CARGO_MANIFEST_DIR").parse()?;
+        ro.push("testing/pass.json");
+        fs::write(ro, se)?;
         Ok(())
     }
 }

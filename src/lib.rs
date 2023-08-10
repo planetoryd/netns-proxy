@@ -8,6 +8,11 @@
 #![feature(adt_const_params)]
 #![feature(assert_matches)]
 #![feature(generators, generator_trait)]
+#![feature(provide_any)]
+#![feature(error_generic_member_access)]
+#![feature(associated_type_defaults)]
+#![feature(min_specialization)]
+#![feature(iterator_try_collect)]
 
 pub mod data;
 pub mod netlink;
