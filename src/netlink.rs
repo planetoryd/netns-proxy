@@ -5,7 +5,7 @@ use crate::{
     data::*,
     nft::redirect_dns,
     sub::ToSub,
-    util::{open_wo_cloexec, perms::get_non_priv_user, DaemonSender, TaskOutput},
+    util::{open_wo_cloexec, perms::get_non_priv_user, DaemonSender, TaskOutput, TaskCtx},
 };
 
 use futures::{FutureExt, SinkExt, StreamExt, TryFutureExt};
@@ -140,7 +140,9 @@ impl NetnspState {
             let mut file = File::open(path).await?;
             let mut contents = String::new();
             file.read_to_string(&mut contents).await?;
-            serde_json::from_str(&contents)?
+            let mut k: Derivative = serde_json::from_str(&contents)?;
+            k.update_rootns()?;
+            k
         } else {
             // allow it to not exist
             let mut n = Derivative::default();
@@ -187,7 +189,9 @@ impl NetnspState {
             let mut file = File::open(path)?;
             let mut contents = String::new();
             file.read_to_string(&mut contents)?;
-            serde_json::from_str(&contents)?
+            let mut k: Derivative = serde_json::from_str(&contents)?;
+            k.update_rootns()?;
+            k
         } else {
             // allow it to not exist
             let mut n = Derivative::default();
@@ -261,7 +265,7 @@ impl NetnspState {
     }
 
     /// Also, resume from persisted state
-    pub async fn resume(&mut self, mn: &mut MultiNS, dae: &DaemonSender) -> Result<()> {
+    pub async fn resume(&mut self, mn: &mut MultiNS, ctx: TaskCtx) -> Result<()> {
         // Some derivative do not have associated profiles
         // This is invalid, because the information is incomplete for configuration.
         self.derivative.clean_named(&self.settings.profiles);
@@ -279,7 +283,7 @@ impl NetnspState {
 
         // started after nft applied
         for (_, info) in &self.derivative.named_ns {
-            info.run(dae, &mn.procs).await?;
+            info.run(&mn.procs).await?;
         }
 
         // Resume flatpaks
@@ -290,7 +294,7 @@ impl NetnspState {
         }
         self.incre_nft.execute()?;
         for (_n, info) in &self.derivative.flatpak {
-            info.run(&dae, &mn.procs).await?;
+            info.run(&mn.procs).await?;
         }
 
         Ok(())
@@ -333,8 +337,7 @@ impl NSID {
             pid: Some(p),
             name: None,
             inode: proc_ns.identifier,
-            path: Some(path),
-            root: false,
+            path: Some(path)
         })
     }
     /// for netnsp the invariant (that a netns name is also a profile anem) holds.
@@ -354,8 +357,7 @@ impl NSID {
             path: Some(path),
             pid: None,
             name: Some(p),
-            inode: stat.st_ino,
-            root: false,
+            inode: stat.st_ino
         })
     }
     pub fn from_name_sync(p: ProfileName) -> Result<Self> {
@@ -371,8 +373,7 @@ impl NSID {
             path: Some(path),
             pid: None,
             name: Some(p),
-            inode: stat.st_ino,
-            root: false,
+            inode: stat.st_ino
         })
     }
     pub fn proc() -> Result<Self> {
@@ -1139,35 +1140,34 @@ pub struct MultiNS {
     pub ns: RwLock<HashMap<NSID, RwLock<Netns>>>,
     paths: Arc<ConfPaths>,
     proxy_ctx: Arc<RwLock<proxy::ProxyCtx>>,
-    dae: DaemonSender,
+    ctx: TaskCtx
 }
 
 impl ConfPaths {
     pub fn sock4proxy(&self) -> PathBuf {
-        let mut p = self.sock.clone();
-        p.push("ns_proxy.sock");
-        p
+        self.sock.join("ns_proxy.sock")
     }
     pub fn sock4rpc(&self) -> PathBuf {
-        let mut p = self.sock.clone();
-        p.push("nsp_rpc.sock");
-        p
+        self.sock.join("nsp_rpc.sock")
+    }
+    pub fn sock4ctrl(&self) -> PathBuf {
+        self.sock.join("nsp.sock")
     }
 }
 
 impl MultiNS {
-    pub async fn new(paths: Arc<ConfPaths>, dae: DaemonSender) -> Result<MultiNS> {
+    pub async fn new(paths: Arc<ConfPaths>, ctx: TaskCtx) -> Result<MultiNS> {
         let ct = proxy::ProxyCtx::new(paths.sock4proxy())?;
         let mn = MultiNS {
-            procs: SubHub::new(dae.clone(), paths.clone()).await?,
+            procs: SubHub::new(ctx.clone(), paths.clone()).await?,
             ns: Default::default(),
             paths,
             proxy_ctx: Arc::new(RwLock::new(ct)),
-            dae,
+            ctx,
         };
         Ok(mn)
     }
-    pub async fn proc_current(&self) -> Result<()> {
+    pub async fn init_current(&self) -> Result<()> {
         let ro = Netns::proc_current().await?;
         let mut m = self.ns.write().await;
         m.insert(ro.id.clone(), ro.into());
@@ -1223,7 +1223,7 @@ impl MultiNS {
                     Box::pin(tas),
                     "netlink-conn-".to_owned() + &id.inode.to_string(), // this waits on the conn. it ends when the conn ends
                 );
-                self.dae.send(t).unwrap();
+                self.ctx.dae.send(t).unwrap();
                 let (h, _m) = rx.await?;
                 let rth = Handle::new(h);
                 let nc = NetlinkConn { handle: rth };

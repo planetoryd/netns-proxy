@@ -12,6 +12,7 @@ use tidy_tuntap::flags;
 use tokio::fs::remove_file;
 
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::{mpsc, oneshot, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio_util::codec::LengthDelimitedCodec;
 
@@ -33,7 +34,7 @@ use sysinfo::{self, ProcessExt, SystemExt};
 use tokio::{self, io::AsyncReadExt, process::Command};
 
 use crate::netlink::*;
-use crate::util::{Awaitor, DaemonSender, TaskOutput};
+use crate::util::{AbortOnDrop, Awaitor, TaskOutput, TaskCtx, PidAwaiter};
 use anyhow::anyhow;
 use dashmap::DashMap;
 use tokio_util::codec::Framed;
@@ -43,7 +44,7 @@ use tokio_util::codec::Framed;
 use rtnetlink::proxy::{self, ProxySocketType};
 
 impl SubjectInfo<NamedV> {
-    pub async fn run(&self, _dae: &DaemonSender, sub: &SubHub) -> Result<()> {
+    pub async fn run(&self, sub: &SubHub) -> Result<()> {
         let (mut s, _) = sub.op(self.ns.clone()).await?;
         s.send(ToSub::Named(self.clone())).await?;
         Ok(())
@@ -51,7 +52,7 @@ impl SubjectInfo<NamedV> {
 }
 
 impl SubjectInfo<FlatpakV> {
-    pub async fn run(&self, _dae: &DaemonSender, sub: &SubHub) -> Result<()> {
+    pub async fn run(&self, sub: &SubHub) -> Result<()> {
         let (mut s, _) = sub.op(self.ns.clone()).await?;
         s.send(ToSub::Flatpak(self.clone())).await?;
         Ok(())
@@ -60,7 +61,7 @@ impl SubjectInfo<FlatpakV> {
 
 pub struct NsubState {
     pub ns: Netns,
-    pub dae: DaemonSender,
+    pub ctx: TaskCtx,
     pub non_priv_uid: u32,
     pub non_priv_gid: u32,
 }
@@ -91,7 +92,7 @@ pub struct SubHub {
     sock_path: PathBuf,
     pub subs: Arc<DashMap<NSID, Sub>>,
     queue: mpsc::UnboundedSender<(NSID, oneshot::Sender<()>)>,
-    dae: DaemonSender,
+    ctx: TaskCtx,
 }
 
 /// to manipulate an NS
@@ -99,9 +100,8 @@ pub type NsubClient<'a> = Ref<'a, NSID, Sub>;
 
 impl SubHub {
     /// only need one per program
-    pub async fn new(dae: DaemonSender, paths: Arc<ConfPaths>) -> Result<Self> {
+    pub async fn new(ctx: TaskCtx, paths: Arc<ConfPaths>) -> Result<Self> {
         let sock_rpc = paths.sock4rpc();
-        // TODO: what if it's in use
         if sock_rpc.exists() {
             remove_file(sock_rpc.as_path()).await?;
         }
@@ -111,6 +111,7 @@ impl SubHub {
         let (sx, mut rx) = mpsc::unbounded_channel::<(NSID, oneshot::Sender<()>)>();
         let sockr = sock_rpc.clone();
         let task = async move {
+            let mut to_abort = Vec::new();
             loop {
                 let (stream, _anon) = sock.accept().await?;
                 log::trace!("new connection on {:?}", sockr.as_path());
@@ -124,7 +125,7 @@ impl SubHub {
                     fd_q: fds,
                 };
 
-                tokio::spawn(async move {
+                let h: AbortOnDrop<_> = tokio::spawn(async move {
                     while let Some(byt) = stream.next().await {
                         let pack: ToMain = bincode::deserialize(&byt?)?;
                         match pack {
@@ -141,7 +142,9 @@ impl SubHub {
                         }
                     }
                     Ok(())
-                });
+                })
+                .into();
+                to_abort.push(h);
                 // the peer_addr is unnamed, so it must self identify.
                 log::trace!("wait for rpc-sub assignment");
                 if let Some((id, sx)) = rx.recv().await {
@@ -157,26 +160,28 @@ impl SubHub {
             Ok(())
         }; // must start it now
         let (t, _r) = TaskOutput::immediately(Box::pin(task), "rpc-listener".to_owned());
-
+        ctx.dae.send(t).unwrap();
         // ends when the listener closes
-        dae.send(t).unwrap();
 
         Ok(Self {
             sock_path: sock_rpc,
             subs,
             queue: sx,
-            dae,
+            ctx,
         })
     }
     /// start a new sub
     /// new sub for each ns
     fn new_sub(&self, fd: RawFd) -> Result<()> {
         let sp = self.sock_path.as_path().to_owned();
+
+        let sx = self.ctx.pid.clone();
+
         // TODO: logic for watching this process
         let h = async move {
             let e = std::env::current_exe()?;
             log::trace!("self exe {:?}", &e);
-            let mut cmd = Command::new(e)
+            let mut cmd: tokio::process::Child = Command::new(e)
                 .arg("sub")
                 .arg(sp)
                 .arg(fd.to_string())
@@ -184,11 +189,13 @@ impl SubHub {
                 .spawn()?;
             let pid = cmd.id().unwrap();
             log::debug!("Subprocess started {}", pid);
+            sx.send(Pid(pid)).unwrap();
             let e = cmd.wait().await?;
+            log::warn!("Subprocess exited {}, {}", e, pid);
             Ok(())
         };
         let (t, _r) = TaskOutput::immediately(Box::pin(h), "rpc-proc".to_owned());
-        self.dae.send(t).unwrap();
+        self.ctx.dae.send(t).unwrap();
         Ok(())
     }
     // gets the handle to operate on an NS
@@ -268,6 +275,10 @@ pub async fn send<T: Serialize>(
 
 pub async fn handle(mut f: Framed<UnixStream, LengthDelimitedCodec>) -> Result<()> {
     let dae = Awaitor::new();
+    let pw = PidAwaiter::new();
+    let sx = pw.sx.clone();
+    tokio::spawn(crate::util::handle_sig(pw));
+    
     let p = next(&mut f, None, true).await?;
     match p {
         ToSub::Init(path, u, g, subject_ns) => {
@@ -281,11 +292,11 @@ pub async fn handle(mut f: Framed<UnixStream, LengthDelimitedCodec>) -> Result<(
 
             let mut st = NsubState {
                 ns: Netns::proc_current().await?,
-                dae: dae.sender.clone(),
+                ctx: TaskCtx { dae: dae.sender, pid: sx },
                 non_priv_uid: u,
                 non_priv_gid: g,
             };
-
+        
             let fds: DashMap<NSID, NsFile<std::fs::File>> = DashMap::new();
 
             loop {
@@ -314,7 +325,6 @@ pub async fn handle(mut f: Framed<UnixStream, LengthDelimitedCodec>) -> Result<(
         _ => unreachable!(),
     }
     dae.wait().await?;
-    log::trace!("rpc-sub-exit");
     Ok(())
 }
 

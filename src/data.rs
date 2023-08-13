@@ -23,7 +23,7 @@ use crate::{
 };
 use tokio::{self, io::AsyncReadExt};
 
-use anyhow::{Ok, Result};
+use anyhow::{anyhow, bail, ensure, Ok, Result};
 
 use crate::util::error::*;
 
@@ -69,9 +69,13 @@ impl Derivative {
     }
     /// Update root_ns NSID's Pid
     pub fn update_rootns(&mut self) -> Result<()> {
-        self.root_ns = NSID::proc()?;
-        self.root_ns.root = true;
-        log::debug!("Root_ns is {:?}", &self.root_ns);
+        let n = NSID::proc()?;
+        if self.root_ns.inode != 0 {
+            if n != self.root_ns {
+                bail!("Root NS mismatch. You are running this process from a different NS than what was recorded.");
+            }
+        }
+        self.root_ns = n;
         Ok(())
     }
     /// clear invalid ones
@@ -191,12 +195,17 @@ pub struct ConfPaths {
 pub type InstanceID = either::Either<i32, String>;
 
 impl ConfPaths {
+    // must ensure one ConfPaths per root ns
     pub fn default() -> Result<Self> {
-        let xdg = xdg::BaseDirectories::with_prefix("netns-proxy").unwrap();
+        // because it is a system-wide program.
+        let run_base: PathBuf = "/var/lib/netns-proxy".parse()?;
+        let conf_base: PathBuf = "/etc/netns-proxy".parse()?;
+        std::fs::create_dir_all(&run_base)?;
+        std::fs::create_dir_all(&conf_base)?;
         let r = Self {
-            settings: xdg.place_config_file("conf.json")?,
-            derivative: xdg.place_state_file("netnsp.json")?,
-            sock: xdg.create_runtime_directory("nsp")?,
+            settings: conf_base.join("conf.json"),
+            derivative: run_base.join("state.json"),
+            sock: run_base,
         };
         Ok(r)
     }
@@ -326,6 +335,8 @@ impl<V: VSpecifics> SubjectInfo<V> {
         anyhow::ensure!(c == self.ns);
         Ok(())
     }
+    /// These two methods return shortly. Tasks are passed to the awaiter
+    /// Conforms to PidAwaiter
     pub async fn run_tun2s(&self, st: &mut NsubState) -> Result<()> {
         use crate::netlink::*;
         use crate::util::watch_log;
@@ -345,11 +356,14 @@ impl<V: VSpecifics> SubjectInfo<V> {
         let mut tun2_async: Command = tun2.into();
         tun2_async.stdout(Stdio::piped());
         let mut tun2h = tun2_async.spawn()?;
+        let pid = Pid(tun2h.id().ok_or(anyhow!("Tun2socks stopped"))?);
+        st.ctx.pid.send(pid).unwrap();
+        use tokio_stream::wrappers::LinesStream;
         let stdout = tun2h.stdout.take().unwrap();
-        let reader = tokio::io::BufReader::new(stdout).lines();
+        let reader = LinesStream::new(tokio::io::BufReader::new(stdout).lines());
         let (tx, rx) = tokio::sync::oneshot::channel();
         let pre = format!("{}/tun2socks", self.id);
-        tokio::spawn(watch_log(reader, Some(tx), pre.clone()));
+        tokio::spawn(watch_log(Box::pin(reader), Some(tx), pre.clone()));
         rx.await?; // wait for first line to appear
         let tunk: LinkKey = TUN_NAME.parse()?;
         let tun = st.ns.netlink.links.get_mut(&tunk).ok_or(DevianceError)?;
@@ -370,7 +384,7 @@ impl<V: VSpecifics> SubjectInfo<V> {
             .await;
 
         let (t, _r) = TaskOutput::immediately_std(Box::pin(async move { tun2h.wait().await }), pre);
-        st.dae.send(t).unwrap();
+        st.ctx.dae.send(t).unwrap();
 
         Ok(())
     }
@@ -393,13 +407,14 @@ impl<V: VSpecifics> SubjectInfo<V> {
         dnsp_a.stdout(Stdio::piped());
         dnsp_a.stderr(Stdio::piped());
         let mut dns_h = dnsp_a.spawn()?;
+        let pid = Pid(dns_h.id().ok_or(anyhow!("Dnsproxy stopped"))?);
+        st.ctx.pid.send(pid).unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let pre = format!("{}/dnsproxy", self.id);
         watch_both(&mut dns_h, pre.clone(), Some(tx))?;
         rx.await?; // wait for first line to appear
-
         let (t, _r) = TaskOutput::immediately_std(Box::pin(async move { dns_h.wait().await }), pre);
-        st.dae.send(t).unwrap();
+        st.ctx.dae.send(t).unwrap();
 
         Ok(())
     }
@@ -704,13 +719,6 @@ pub struct NSID {
     #[derivative(Hash = "ignore")]
     #[derivative(PartialEq = "ignore")]
     pub path: Option<PathBuf>,
-    #[derivative(Hash = "ignore")]
-    #[derivative(PartialEq = "ignore")]
-    /// assumed to be root ns
-    #[serde(default)]
-    #[derivative(Hash = "ignore")]
-    #[derivative(PartialEq = "ignore")]
-    pub root: bool,
 }
 
 impl Display for NSID {

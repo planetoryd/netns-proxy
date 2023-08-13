@@ -1,14 +1,15 @@
 #![feature(setgroups)]
-use anyhow::{anyhow, bail, Ok, Result};
+use anyhow::{anyhow, bail, ensure, Ok, Result};
 use clap::{Parser, Subcommand};
 
 use futures::StreamExt;
+use netns_proxy::ctrl::{ToClient, ToServer};
 use netns_proxy::sub::{handle, SubHub, ToSub};
 use netns_proxy::util::error::DevianceError;
 use netns_proxy::util::ns::{
     self, enter_ns_by_name, enter_ns_by_pid, get_self_netns_inode, self_netns_identify,
 };
-use netns_proxy::util::{open_wo_cloexec, Awaitor, TaskOutput};
+use netns_proxy::util::{branch_out, open_wo_cloexec, Awaitor, TaskOutput};
 use netns_proxy::util::{perms::*, DaemonSender};
 use netns_proxy::watcher::{FlatpakWatcher, Watcher, WatcherEvent};
 use nix::unistd::geteuid;
@@ -30,6 +31,7 @@ use netns_proxy::netlink::*;
 use netns_proxy::sub;
 use netns_proxy::watcher;
 use procfs::process::Process;
+
 #[derive(Parser)]
 #[command(
     author,
@@ -38,6 +40,8 @@ use procfs::process::Process;
     long_about = "utility for using netns as socks proxy containers. may need root. \n example commandline `RUST_LOG=error,netns_proxy=info sudo -E netns-proxy`, errors may be fine"
 )]
 struct Cli {
+    #[arg(short, long)]
+    ctl: bool,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -54,53 +58,28 @@ enum Commands {
         /// Enter the Net NS of certain process
         #[arg(short, long)]
         pid: Option<i32>,
-        /// Command to run.
-        #[arg(short, long)]
-        cmd: Option<String>,
         /// Print network related info in root ns or the specified NS and exit.
         #[arg(short, long)]
         dbg: bool,
+        /// Command to run.
+        cmd: Option<String>,
     },
     /// Identify the Netns you are currently in
     Id {},
     /// Clean up all possible things in nftables, netlink, netns, left by netns-proxy.
     Clean {},
+    // Control commands
+    /// Reload config by the daemon
+    Reload,
 }
 
+
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let e = env_logger::Env::new().default_filter_or("error,netns_proxy=debug");
+    let e = env_logger::Env::new().default_filter_or("warn,netns_proxy=debug,nsproxy=debug");
     env_logger::init_from_env(e);
 
     // XXX: polymorphic binary
-    if args.len() == 4 {
-        use std::fs::File;
-        let path: Result<PathBuf, _> = args[2].parse();
-        let fd: Result<i32, _> = args[3].parse();
-        if path.is_ok() && fd.is_ok() && args[1] == "sub" {
-            let fd = fd?;
-            let fd: File = unsafe { File::from_raw_fd(fd) };
-            let ns = NsFile(fd);
-            ns.enter()?;
-            return tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async move {
-                    let sock_path = path.unwrap();
-                    let conn = UnixStream::connect(sock_path.as_path()).await?;
-                    let f: Framed<UnixStream, LengthDelimitedCodec> =
-                        Framed::new(conn, LengthDelimitedCodec::new());
-                    let x = handle(f).await;
-                    if let Err(e) = x {
-                        log::warn!("Sub exited, {:?}", e);
-                    }
-                    return Ok(());
-
-                    Ok(())
-                });
-        }
-    }
+    branch_out()?;
 
     let cli = Cli::parse();
 
@@ -153,7 +132,6 @@ fn main() -> Result<()> {
             let state = NetnspState::load_sync(Arc::new(ConfPaths::default()?))?;
             let curr_ns = NSID::proc()?;
             let (u, g) = get_non_priv_user(None, None, None, None)?;
-
             if curr_ns != state.derivative.root_ns {
                 log::error!("ACCESS DENIED");
                 log::info!(
@@ -168,11 +146,9 @@ fn main() -> Result<()> {
                     env::var("SHELL").map_err(|x| anyhow!("argument cmd not provided; {}", x))?,
                 );
             }
-
             if ns.is_some() && pid.is_some() {
                 bail!("You can't specify both PID and NS");
             }
-
             if let Some(ns) = ns {
                 let n = NSID::from_name_sync(ProfileName(ns.clone()))?;
                 n.open_sync()?.enter()?;
@@ -186,7 +162,6 @@ fn main() -> Result<()> {
                     bail!("use --ns or --pid to specify the network namespace.");
                 }
             };
-
             if !dbg {
                 drop_privs_id(nix::unistd::Gid::from_raw(u), nix::unistd::Uid::from_raw(g))?;
             }
@@ -209,72 +184,39 @@ fn main() -> Result<()> {
                     Ok(())
                 })?;
         }
+        Some(Commands::Reload) => {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let p = ConfPaths::default()?;
+                    let p2 = p.sock4ctrl();
+                    let mut client = netns_proxy::ctrl::Client::new(p2.as_path()).await?;
+                    log::info!("connected");
+                    let res = client.req(ToServer::ReloadConfig).await?;
+                    ensure!(res == ToClient::ConfigReloaded);
+                    log::info!("reloaded");
+                    Ok(())
+                })?;
+        }
         None => {
-            let k =  tokio::runtime::Builder::new_multi_thread()
+            if cli.ctl {
+                bail!("a command is required.");
+            }
+            let k = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .unwrap()
                 .block_on(async move {
                     let paths = Arc::new(ConfPaths::default()?);
-                    let mut state: NetnspState = NetnspState::load(paths.clone()).await?;
-
-                    if get_self_netns_inode()? != state.derivative.root_ns.inode {
-                        bail!("root_ns mismatch. You are running from a different Netns than what was recorded in the Derivative file");
-                    }
-                    let mut dae = Awaitor::new();
-                    let mut mn: MultiNS = MultiNS::new(paths, dae.sender.clone()).await?;
-
-                    mn.proc_current().await?;
-                    state.derive_all_named().await?;
-                    state.resume(&mut mn, &dae.sender).await?;
-
-                    let (sx, rx) = unbounded_channel();
-                    let flp = FlatpakWatcher::new(sx.clone());
-                    let (t, _) = TaskOutput::immediately(
-                        Box::pin(flp.daemon()),
-                        "flatpak-watcher".to_owned(),
-                    );
-                    dae.sender.send(t).unwrap();
-
-                    let (t, _) = TaskOutput::immediately(
-                        Box::pin(event_handler(rx, state, dae.sender.clone(), mn)),
-                        "event-handler".to_owned(),
-                    );
-                    dae.sender.send(t).unwrap();
-                    // finally. wait on all tasks.
-                    log::info!("wait on all tasks");
-                    dae.wait().await?;
-                    log::info!("normal exit");
+                    // Paths shall not be changed, even across reloads
+                    let server = netns_proxy::ctrl::Server;
+                    server.serve(paths.clone()).await?;
                     Ok(())
                 });
             // must manually print it or something wont be displayed
             println!("main-process error, {:?}", k);
-        }
-    }
-    Ok(())
-}
-
-async fn event_handler(
-    mut rx: UnboundedReceiver<WatcherEvent>,
-    mut state: NetnspState,
-    dae: DaemonSender,
-    mut mn: MultiNS,
-) -> Result<()> {
-    while let Some(ev) = rx.recv().await {
-        match ev {
-            WatcherEvent::Flatpak(fp) => {
-                if state.derive_flatpak(fp.clone()).await? {
-                    let inf = state.derivative.flatpak.get(&fp.pid).ok_or(DevianceError)?;
-                    inf.connect(&mut mn).await?;
-                    inf.apply_veths(&mn, &state.derivative).await?;
-                    inf.apply_nft_veth(&mut state.incre_nft);
-                    state.incre_nft.execute()?;
-                    // start all daemons
-                    inf.run(&dae, &mn.procs).await?;
-                } else {
-                    log::debug!("Flatpak-watcher: {:?} ignored, no associaed profile", fp);
-                }
-            } // TODO: watch for other kinds, bwrap, unshared.
         }
     }
     Ok(())

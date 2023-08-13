@@ -1,4 +1,4 @@
-# Netns-based selective proxying, for identity isolation
+# Containerized Networking for Proxying
 
 > _identity isolation_ because environ-variable based proxying is not safe for that.
 
@@ -13,7 +13,7 @@
 
 ## features
 
-1. Configure a few persistent Network Namespaces, requires option `--pre`
+1. Configure a few persistent Network Namespaces.
 2. Watch for new flatpak processes and configure Network Namespaces for them
 
 Network namespace is more secure than netfilter-only approaches, or `proxychains` the tool. When netns-proxy stops/crashes, or before it configures your app, the internet is disconnected in the netns.

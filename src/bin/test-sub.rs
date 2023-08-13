@@ -5,6 +5,8 @@ use futures::SinkExt;
 use netns_proxy::data::*;
 use netns_proxy::sub::handle;
 use netns_proxy::sub::ToSub;
+use netns_proxy::util::PidAwaiter;
+use netns_proxy::util::TaskCtx;
 use rtnetlink::NetworkNamespace;
 use tokio::net::UnixStream;
 use tokio_util::codec::Framed;
@@ -22,32 +24,10 @@ use netns_proxy::util::Awaitor;
 // binary for testing configuration within a single NS
 
 fn main() -> Result<()> {
+    let e = env_logger::Env::new().default_filter_or("error,netns_proxy=debug");
+    env_logger::init_from_env(e);
 
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() == 3 {
-        use std::fs::File;
-        let path: Result<PathBuf, _> = args[1].parse();
-        let fd: i32 = args[2].parse()?;
-        let fd: File = unsafe { File::from_raw_fd(fd) };
-        let ns = NsFile(fd);
-        ns.enter()?;
-        return tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async move {
-                if path.is_ok() {
-                    let sock_path = path.unwrap();
-                    let conn = UnixStream::connect(sock_path.as_path()).await?;
-                    let f: Framed<UnixStream, LengthDelimitedCodec> =
-                        Framed::new(conn, LengthDelimitedCodec::new());
-                    let x = handle(f).await;
-                    println!("sub exited, {:?}", x);
-                    return Ok(());
-                }
-                Ok(())
-            });
-    }
+    netns_proxy::util::branch_out()?;
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -70,14 +50,19 @@ fn main() -> Result<()> {
                 derivative,
                 sock,
             });
-            let pn = ProfileName("geph1".to_owned());  
+            let pn = ProfileName("geph1".to_owned());
             if NSID::exists(pn.clone())? {
                 NSID::del(pn.clone()).await?;
             }
             let id = NSID::from_name(pn).await?;
             let _state: NetnspState = NetnspState::load(paths.clone()).await?;
             let mut dae = Awaitor::new();
-            let mn: MultiNS = MultiNS::new(paths.clone(), dae.sender.clone()).await?;
+            let pid_wait = PidAwaiter::new();
+            let ctx = TaskCtx {
+                dae: dae.sender.clone(),
+                pid: pid_wait.sx,
+            };
+            let mn: MultiNS = MultiNS::new(paths.clone(), ctx).await?;
             let nl = mn.get_nl(id.clone()).await?;
             let mut ns = ConnRef::new(Arc::new(nl)).to_netns(id).await?;
             dbg!(&ns);
@@ -126,7 +111,7 @@ async fn tests(ns: &mut Netns) -> Result<()> {
     let la = ns.netlink.links.get_mut(&vp.link(true)).unwrap();
     la.add_addr("1.1.1.1/15".parse()?).await?;
     let e = la.add_addr("::1/22".parse()?).await;
-    assert!(e.is_err()); 
+    assert!(e.is_err());
     la.add_addr("fefe::1/32".parse()?).await?;
     la.up(ns.netlink.conn.get()).await?;
     ns.refresh().await?;

@@ -5,10 +5,13 @@ use std::fs::File;
 use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use anyhow::Ok;
 use anyhow::Result;
 use futures::Future;
+use futures::StreamExt;
 use futures::{FutureExt, TryFutureExt};
 
 use nix::sys::signal::kill;
@@ -17,16 +20,25 @@ use nix::sys::signal::Signal::SIGTERM;
 use nix::unistd::Gid;
 use nix::unistd::Pid;
 use nix::unistd::Uid;
+use pidfd::PidFd;
 use procfs::process::Process;
 
+use tokio::io::BufStream;
+use tokio::signal::unix::SignalKind;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::Receiver;
+use tokio::task::AbortHandle;
+use tokio::task::JoinError;
+use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 
 use crate::data::FlatpakID;
+use crate::netlink::NsFile;
+use crate::sub::SocketEOF;
 
 use nix::unistd::setgroups;
 
@@ -86,18 +98,20 @@ where
     ma.get_mut(k_in_ma).and_then(|r| mb.get_mut(r))
 }
 
-pub async fn watch_log(
-    mut reader: tokio::io::Lines<tokio::io::BufReader<impl tokio::io::AsyncRead + Unpin>>,
+pub async fn watch_log<S: futures::Stream<Item = std::io::Result<String>> + Send>(
+    mut reader: Pin<Box<S>>,
     tx: Option<tokio::sync::oneshot::Sender<bool>>,
     prefix: String,
 ) -> Result<()> {
-    if let Some(line) = reader.next_line().await? {
+    if let Some(line) = reader.next().await {
+        let line = line?;
         log::debug!("{} {}", prefix, line);
         if let Some(t) = tx {
             t.send(true).unwrap();
         }
     }
-    while let Some(line) = reader.next_line().await? {
+    while let Some(line) = reader.next().await {
+        let line = line?;
         log::debug!("{} {}", prefix, line);
     }
     Ok(())
@@ -108,12 +122,15 @@ pub fn watch_both(
     pre: String,
     tx: Option<tokio::sync::oneshot::Sender<bool>>,
 ) -> Result<()> {
+    use tokio::io::BufReader;
+    use tokio_stream::wrappers::LinesStream;
     let stdout = chil.stdout.take().unwrap();
     let stderr = chil.stderr.take().unwrap();
-    let reader = tokio::io::BufReader::new(stdout).lines();
-    let reader_err = tokio::io::BufReader::new(stderr).lines();
-    tokio::spawn(watch_log(reader, tx, pre.clone()));
-    tokio::spawn(watch_log(reader_err, None, pre));
+
+    let reader = LinesStream::new(BufReader::new(stdout).lines());
+    let reader_err = LinesStream::new(BufReader::new(stderr).lines());
+    let s = futures::stream_select!(reader, reader_err);
+    tokio::spawn(watch_log(Box::pin(s), tx, pre.clone()));
 
     Ok(())
 }
@@ -511,7 +528,43 @@ pub struct Awaitor {
     daemons: JoinSet<TaskOutput>,
 }
 
+pub struct PidAwaiter {
+    pub sx: UnboundedSender<crate::data::Pid>,
+    pub rx: UnboundedReceiver<crate::data::Pid>,
+}
+
+impl PidAwaiter {
+    pub fn new() -> Self {
+        let (sx, rx) = unbounded_channel();
+        Self { sx, rx }
+    }
+    pub async fn kill_n_wait(mut self) {
+        let mut h = vec![];
+        while let Result::Ok(x) = self.rx.try_recv() {
+            // all pids should be in buffer
+            if let Result::Ok(f) = unsafe { PidFd::open(x.0 as i32, 0) } {
+                unsafe {
+                    let _ = f.send_raw_signal(libc::SIGINT, std::ptr::null(), 0);
+                };
+                h.push(f.into_future());
+            } else {
+                // skip. dead proc.
+            }
+        }
+        log::debug!("Wait {} processes to finish", h.len());
+        futures::future::join_all(h).await;
+        log::debug!("All processes stopped");
+    }
+}
+
 pub type DaemonSender = UnboundedSender<Pin<Box<dyn Future<Output = TaskOutput> + Send>>>;
+
+/// Senders.
+#[derive(Debug, Clone)]
+pub struct TaskCtx {
+    pub dae: DaemonSender,
+    pub pid: UnboundedSender<crate::data::Pid>,
+}
 
 pub struct TaskOutput {
     pub name: String,
@@ -578,11 +631,13 @@ impl TaskOutput {
         Receiver<()>,
     ) {
         let n2 = name.clone();
-        let h = tokio::spawn(async move {
+        let h: AbortOnDrop<_> = tokio::spawn(async move {
             let x = f.await;
             Self::handle_task_result(x, name);
             Ok(())
-        });
+        })
+        .into();
+
         Self::wrapped(Box::pin(h), n2)
     }
     pub fn immediately_std<
@@ -596,11 +651,12 @@ impl TaskOutput {
         Receiver<()>,
     ) {
         let n2 = name.clone();
-        let h = tokio::spawn(async move {
+        let h: AbortOnDrop<_> = tokio::spawn(async move {
             let x = f.await;
             Self::handle_task_result(x, name);
             Ok(())
-        });
+        })
+        .into();
         Self::wrapped(Box::pin(h), n2)
     }
     pub fn handle_task_result<T: Debug, E: Debug>(x: Result<T, E>, name: String) {
@@ -644,4 +700,120 @@ impl Awaitor {
             }
         }
     }
+}
+
+use crate::sub::handle;
+use std::sync::atomic::Ordering;
+use tokio::net::UnixStream;
+use tokio_util::codec::Framed;
+use tokio_util::codec::LengthDelimitedCodec;
+
+pub async fn handle_sig(pw: PidAwaiter) -> Result<()> {
+    tokio::signal::unix::signal(SignalKind::interrupt())?
+        .recv()
+        .await;
+    SIG_EXIT.store(true, Ordering::Relaxed);
+    pw.kill_n_wait().await;
+    Ok(())
+}
+
+static SIG_EXIT: AtomicBool = AtomicBool::new(false);
+
+pub fn branch_out() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 4 {
+        let path: Result<PathBuf, _> = args[2].parse();
+        let fd: Result<i32, _> = args[3].parse();
+        if path.is_ok() && fd.is_ok() && args[1] == "sub" {
+            let fd = fd?;
+            let fd: File = unsafe { File::from_raw_fd(fd) };
+            let ns = NsFile(fd);
+            ns.enter()?;
+            return tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let sock_path = path.unwrap();
+                    let conn = UnixStream::connect(sock_path.as_path()).await?;
+                    let f: Framed<UnixStream, LengthDelimitedCodec> =
+                        Framed::new(conn, LengthDelimitedCodec::new());
+
+                    let x = handle(f).await;
+                    if let Err(e) = x {
+                        if let Some(x) = e.downcast_ref::<SocketEOF>() {
+                            if SIG_EXIT.load(Ordering::Relaxed) {
+                                // ignore
+                            } else {
+                                log::error!("exit as sub \n Err: {:?}", e);
+                            }
+                        } else {
+                            log::error!("exit as sub \n Err: {:?}", e);
+                        }
+                        exit(1);
+                    }
+                    return Ok(());
+
+                    Ok(())
+                });
+        }
+    }
+
+    Ok(())
+}
+
+pub struct AbortOnDrop<T>(JoinHandle<T>);
+
+impl<T> Future for AbortOnDrop<T> {
+    type Output = std::result::Result<T, JoinError>;
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        unsafe { self.map_unchecked_mut(|s| &mut s.0) }.poll(cx)
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort()
+    }
+}
+
+impl<T> From<JoinHandle<T>> for AbortOnDrop<T> {
+    fn from(value: JoinHandle<T>) -> Self {
+        Self(value)
+    }
+}
+
+impl<T> AbortOnDrop<T> {
+    pub fn handle(&self) -> AbortHandle {
+        self.0.abort_handle()
+    }
+}
+
+#[tokio::test]
+async fn test_aod() {
+    let h = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        println!("3");
+    });
+
+    let h2 = tokio::spawn(async move { h.await });
+    h2.abort(); // Aboring h2, dropping h, doesn't abort h.
+
+    println!("--");
+
+    let h: AbortOnDrop<()> = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        println!("3");
+    })
+    .into();
+
+    let h2 = tokio::spawn(async move { h.await });
+    h2.abort(); // This also aborts h
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // should output -- 3
 }
