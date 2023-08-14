@@ -216,7 +216,7 @@ fn main() -> Result<()> {
                     Ok(())
                 });
             // must manually print it or something wont be displayed
-            println!("main-process error, {:?}", k);
+            println!("Main-process {:?}", k);
         }
     }
     Ok(())

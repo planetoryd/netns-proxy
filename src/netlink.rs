@@ -118,9 +118,7 @@ impl NetnspState {
     pub async fn load(paths: Arc<ConfPaths>) -> Result<NetnspState> {
         log::info!("Loading state from {:?}", paths);
         let path = Path::new(&paths.settings);
-
         let sett: Settings;
-
         if path.exists() {
             let mut file = File::open(path).await?;
             let mut contents = String::new();

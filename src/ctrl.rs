@@ -16,7 +16,7 @@ use tokio::{
 
 use crate::{
     data::ConfPaths,
-    util::{PidAwaiter, TaskCtx},
+    util::{self, PidAwaiter, TaskCtx},
 };
 use pidfd::PidFd;
 
@@ -56,15 +56,21 @@ impl Server {
         // If a restart is in progress, no restart signal is accepted.
         let (restart, mut rx) = channel::<oneshot::Sender<()>>(1);
         tokio::spawn(async move {
-            let mut h: JoinHandle<Result<()>>;
+            let mut h: _;
             let p2 = p2;
+
             let mut cback: Option<oneshot::Sender<()>> = None;
             loop {
                 if let Some(c) = cback {
                     c.send(()).unwrap();
                 }
+                let p3 = p2.clone();
                 let pid_wait = PidAwaiter::new();
-                h = tokio::spawn(main_task(p2.clone(), pid_wait.sx.clone()));
+                let sx = pid_wait.sx.clone();
+                h = tokio::spawn(async move {
+                    TaskOutput::handle_task_result(main_task(p3, sx).await, "main".to_owned());
+                    log::info!("I will continue running though. Try 'nsproxy -c reload'");
+                });
                 if let Some(cb) = rx.recv().await {
                     log::info!("Abort main task");
                     h.abort(); // drops all things, kills some processes, and sends the pids.
@@ -152,7 +158,13 @@ async fn main_task(paths: Arc<ConfPaths>, pid_wait: UnboundedSender<Pid>) -> Res
     // IP addresses etc. are fixed by putting derivation in the state file
     // Applying a SubjectInfo should work regardless how messed up the user's system state is.
     // Therefore all tasks may be aborted
-    let mut state: NetnspState = NetnspState::load(paths.clone()).await?;
+    let state_r = NetnspState::load(paths.clone()).await;
+    let mut state: NetnspState = match state_r {
+        Result::Ok(e) => e,
+        Err(e) => {
+            bail!(e.context("There may be an error in your configuration"));
+        }
+    };
 
     let mut dae = Awaitor::new();
     let ctx = TaskCtx {

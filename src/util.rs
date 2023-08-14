@@ -713,6 +713,7 @@ pub async fn handle_sig(pw: PidAwaiter) -> Result<()> {
         .recv()
         .await;
     SIG_EXIT.store(true, Ordering::Relaxed);
+    log::debug!("Sub received SIGINT. Now kill wait processes to die");
     pw.kill_n_wait().await;
     Ok(())
 }
