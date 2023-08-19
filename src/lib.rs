@@ -13,12 +13,12 @@
 #![feature(associated_type_defaults)]
 #![feature(min_specialization)]
 #![feature(iterator_try_collect)]
+#![feature(hash_extract_if)]
 
 pub mod data;
 pub mod netlink;
 pub mod nft;
 pub mod sub;
-pub mod tcproxy;
 pub mod util;
 pub mod watcher;
 pub mod ctrl;

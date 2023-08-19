@@ -1,35 +1,35 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc};
 
-use anyhow::Result;
-use bincode::{deserialize, serialize};
-use bytes::Bytes;
-use rtnetlink::netlink_packet_route::tc::u32::Sel;
-use serde::{Deserialize, Serialize};
-use tokio::{
-    net::{UnixDatagram, UnixListener, UnixStream},
-    sync::{
-        mpsc::{self, channel, Receiver, UnboundedSender},
-        oneshot,
-    },
-    task::JoinHandle,
-};
-
+use crate::util::{self, PidOp};
 use crate::{
     data::ConfPaths,
-    util::{self, PidAwaiter, TaskCtx},
+    util::{PidAwaiter, TaskCtx},
 };
-use pidfd::PidFd;
+use anyhow::{Context, Result};
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+use tokio::{
+    net::{UnixListener, UnixStream},
+    sync::{
+        mpsc::{self, channel, UnboundedSender},
+        oneshot,
+    },
+};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub enum ToServer {
     Ping,
     ReloadConfig,
+    GC(ProfileName),
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone)]
 pub enum ToClient {
     Pong,
     ConfigReloaded,
+    GCed,
+    Fail,
 }
 
 pub struct Server;
@@ -55,6 +55,7 @@ impl Server {
         let p2 = paths.clone();
         // If a restart is in progress, no restart signal is accepted.
         let (restart, mut rx) = channel::<oneshot::Sender<()>>(1);
+        let (sx_main, mut rx_main) = unbounded_channel::<UnboundedSender<ToServer>>();
         tokio::spawn(async move {
             let mut h: _;
             let p2 = p2;
@@ -67,14 +68,19 @@ impl Server {
                 let p3 = p2.clone();
                 let pid_wait = PidAwaiter::new();
                 let sx = pid_wait.sx.clone();
+                let (sx_cmd, rx_cmd) = unbounded_channel();
+                sx_main.send(sx_cmd).unwrap();
                 h = tokio::spawn(async move {
-                    TaskOutput::handle_task_result(main_task(p3, sx).await, "main".to_owned());
+                    TaskOutput::handle_task_result(
+                        main_task(p3, sx, rx_cmd).await,
+                        "main".to_owned(),
+                    );
                     log::info!("I will continue running though. Try 'nsproxy -c reload'");
                 });
                 if let Some(cb) = rx.recv().await {
                     log::info!("Abort main task");
-                    h.abort(); // drops all things, kills some processes, and sends the pids.
-                    pid_wait.kill_n_wait().await;
+                    pid_wait.kill_all().await;
+                    h.abort(); // drops all things.
                     cback = Some(cb);
                 } else {
                     break;
@@ -82,20 +88,34 @@ impl Server {
             }
             Ok(())
         });
+        let k: Arc<Mutex<Option<UnboundedSender<ToServer>>>> = Arc::new(Mutex::new(None));
+        let k2 = k.clone();
+        tokio::spawn(async move {
+            while let Some(sx) = rx_main.recv().await {
+                let mut x = k2.lock().await;
+                let _ = x.insert(sx);
+            }
+        });
+
         loop {
             let (us, _anon) = sock.accept().await?;
-            tokio::spawn(Self::handle_conn(us, restart.clone()));
+            tokio::spawn(Self::handle_conn(us, restart.clone(), k.clone()));
         }
         Ok(())
     }
-    async fn handle_conn(us: UnixStream, restart: mpsc::Sender<oneshot::Sender<()>>) -> Result<()> {
+    async fn handle_conn(
+        us: UnixStream,
+        restart: mpsc::Sender<oneshot::Sender<()>>,
+        sx_main: Arc<Mutex<Option<UnboundedSender<ToServer>>>>,
+    ) -> Result<()> {
         let mut f: Framed<UnixStream, LengthDelimitedCodec> =
             Framed::new(us, LengthDelimitedCodec::new());
+
         while let Some(by) = f.next().await {
             let by = by?;
-            let pa: ToServer = bincode::deserialize(&by)?;
+            let pa: ToServer = util::from_vec_internal(&by)?;
             let re: ToClient;
-            match pa {
+            match &pa {
                 ToServer::Ping => {
                     re = ToClient::Pong;
                 }
@@ -106,8 +126,17 @@ impl Server {
                     rx.await.unwrap();
                     re = ToClient::ConfigReloaded;
                 }
+                ToServer::GC(_) => {
+                    let k = sx_main.lock().await;
+                    if let Some(ref x) = *k {
+                        x.send(pa).unwrap();
+                        re = ToClient::GCed;
+                    } else {
+                        re = ToClient::Fail;
+                    }
+                }
             };
-            let by = bincode::serialize(&re)?;
+            let by = util::to_vec_internal(&re)?;
             f.send(by.into()).await?;
         }
         Ok(())
@@ -126,27 +155,22 @@ impl Client {
         })
     }
     pub async fn req(&mut self, r: ToServer) -> Result<ToClient> {
-        let by: Bytes = bincode::serialize(&r)?.into();
+        let by: Bytes = util::to_vec_internal(&r)?.into();
         self.f.send(by).await?;
         let res = self
             .f
             .next()
             .await
             .ok_or(anyhow!("client: conn closed"))??;
-        let res: ToClient = bincode::deserialize(&res)?;
+        let res: ToClient = util::from_vec_internal(&res)?;
         Ok(res)
     }
 }
 
-use anyhow::{anyhow, bail, Ok};
-use clap::{Parser, Subcommand};
-
-use crate::sub::{handle, SubHub, ToSub};
 use crate::util::error::DevianceError;
-use crate::util::ns::{get_self_netns_inode, self_netns_identify};
-use crate::util::{branch_out, open_wo_cloexec, Awaitor, TaskOutput};
-use crate::util::{perms::*, DaemonSender};
-use crate::watcher::{FlatpakWatcher, Watcher, WatcherEvent};
+use crate::util::{Awaitor, TaskOutput};
+use crate::watcher::{FlatpakWatcher, MainEvent, Watcher};
+use anyhow::{anyhow, bail, Ok};
 use futures::{SinkExt, StreamExt};
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
@@ -154,7 +178,11 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use crate::data::*;
 use crate::netlink::*;
 
-async fn main_task(paths: Arc<ConfPaths>, pid_wait: UnboundedSender<Pid>) -> Result<()> {
+async fn main_task(
+    paths: Arc<ConfPaths>,
+    pid_wait: UnboundedSender<PidOp>,
+    mut cmd: UnboundedReceiver<ToServer>,
+) -> Result<()> {
     // IP addresses etc. are fixed by putting derivation in the state file
     // Applying a SubjectInfo should work regardless how messed up the user's system state is.
     // Therefore all tasks may be aborted
@@ -162,29 +190,44 @@ async fn main_task(paths: Arc<ConfPaths>, pid_wait: UnboundedSender<Pid>) -> Res
     let mut state: NetnspState = match state_r {
         Result::Ok(e) => e,
         Err(e) => {
-            bail!(e.context("There may be an error in your configuration"));
+            bail!(e.context("There may be an error in your configuration or state files"));
         }
     };
-
+    state.load_ids();
     let mut dae = Awaitor::new();
     let ctx = TaskCtx {
         dae: dae.sender.clone(),
         pid: pid_wait,
     };
 
-    let mut mn: MultiNS = MultiNS::new(paths, ctx.clone()).await?;
+    let mn: MultiNS = MultiNS::new(paths, ctx.clone()).await?;
     mn.init_current().await?;
-    state.derive_all_named().await?;
-    state.resume(&mut mn, ctx.clone()).await?;
+    state.derivative.update_nsid().await?;
+    state.derive_named_all().await?;
+    // All named are derived and NSes are present.
+    state.flatpak_ensure()?;
+
+    state.resume(&mn, ctx.clone()).await?;
     state.dump().await?;
 
     let (sx, rx) = unbounded_channel();
     let flp = FlatpakWatcher::new(sx.clone());
     let (t, _) = TaskOutput::immediately(Box::pin(flp.daemon()), "flatpak-watcher".to_owned());
     ctx.dae.send(t).unwrap();
+    let sxx = sx.clone();
+    let (t, _) = TaskOutput::immediately(
+        Box::pin(async move {
+            while let Some(c) = cmd.recv().await {
+                sx.send(MainEvent::Command(c)).unwrap();
+            }
+            Ok(())
+        }),
+        "command-to-watcher".to_owned(),
+    );
+    ctx.dae.send(t).unwrap();
 
     let (t, _) = TaskOutput::immediately(
-        Box::pin(event_handler(rx, state, mn)),
+        Box::pin(event_handler(rx, state, mn, sxx, ctx.clone())),
         "event-handler".to_owned(),
     );
     ctx.dae.send(t).unwrap();
@@ -196,25 +239,79 @@ async fn main_task(paths: Arc<ConfPaths>, pid_wait: UnboundedSender<Pid>) -> Res
 }
 
 async fn event_handler(
-    mut rx: UnboundedReceiver<WatcherEvent>,
+    mut rx: UnboundedReceiver<MainEvent>,
     mut state: NetnspState,
     mut mn: MultiNS,
+    sx: UnboundedSender<MainEvent>,
+    ctx: TaskCtx,
 ) -> Result<()> {
     while let Some(ev) = rx.recv().await {
         match ev {
-            WatcherEvent::Flatpak(fp) => {
-                if state.derive_flatpak(fp.clone()).await? {
-                    let inf = state.derivative.flatpak.get(&fp.pid).ok_or(DevianceError)?;
-                    inf.connect(&mut mn).await?;
-                    inf.apply_veths(&mn, &state.derivative).await?;
-                    inf.apply_nft_veth(&mut state.incre_nft);
-                    state.incre_nft.execute()?;
-                    // start all daemons
-                    inf.run(&mn.procs).await?;
-                } else {
-                    log::debug!("Flatpak-watcher: {:?} ignored, no associaed profile", fp);
+            MainEvent::Flatpak(fp) => {
+                match state.derive_flatpak(fp.clone()).await? {
+                    DeriveRes::New => {
+                        let inf = state.derivative.flatpak.get(&fp.pid).ok_or(DevianceError)?;
+                        let pf = PidAwaiter::wait(fp.pid);
+                        if let Some(pf) = pf {
+                            let s2 = sx.clone();
+                            let pw = async move {
+                                pf.await?;
+                                s2.send(MainEvent::SubjectExpire(SubjectKey::Flatpak(fp.pid)))
+                                    .unwrap();
+                                // even if flatpak exits right now it has to finish this iteration first.
+                                Ok(())
+                            };
+                            let (t, _) = TaskOutput::immediately(
+                                Box::pin(pw),
+                                "flatpak-pidfd-".to_owned() + &fp.pid.0.to_string(),
+                            );
+                            ctx.dae.send(t).unwrap();
+
+                            inf.connect(&mut mn).await?;
+                            inf.apply_veths(&mn, &state.derivative, &mut state.incre_nft)
+                                .await?;
+                            state.incre_nft.execute()?;
+                            state.dump().await?;
+
+                            let inf = state.derivative.flatpak.get_mut(&fp.pid).unwrap();
+                            // start all daemons
+                            inf.run(&mn.procs).await?;
+                        }
+                        // else, process exited early
+                    }
+                    _ => (),
                 }
             } // TODO: watch for other kinds, bwrap, unshared.
+            MainEvent::Command(cmd) => match cmd {
+                ToServer::GC(p) => {
+                    if let Some(k) = state.derivative.named_ns.get(&p) {
+                        k.garbage_collect(&mn, &state.derivative).await?;
+                        state.derivative.named_ns.remove(&p);
+                        state.dump().await?;
+                    } else {
+                        log::error!("Attempt to GC; {p:?} doesn't exist");
+                    }
+                }
+                _ => (),
+            },
+            MainEvent::SubjectExpire(sk) => match sk {
+                SubjectKey::Flatpak(fp) => {
+                    let si = state.derivative.flatpak.remove(&fp);
+                    if let Some(si) = si {
+                        si.garbage_collect(&mn, &state.derivative).await?;
+                        ctx.pid.send(PidOp::Kill(si.ns.clone())).with_context(|| {
+                            format!(
+                                "trying to kill the processes of {}, sending Pid failed",
+                                si.ns
+                            )
+                        })?;
+                        state.dump().await?;
+                    } else {
+                        // it prolly has been GCed
+                    }
+                }
+                _ => unimplemented!(),
+            },
         }
     }
     Ok(())

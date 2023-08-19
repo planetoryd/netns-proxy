@@ -1,4 +1,4 @@
-use bincode::de;
+
 use rustables::{
     expr::{
         Cmp, CmpOp, ExpressionRaw, ExpressionVariant, Immediate, Meta, MetaType, Nat, NatType,
@@ -226,9 +226,14 @@ pub fn print_all() -> Result<()> {
     Ok(())
 }
 
+pub enum NftConf {
+    RedirDNS(u16),
+    ForwardPort(u16)
+}
+
 /// redirect all DNS traffic to localhost:port
+const DNS_CHAIN: &str = "out";
 pub fn redirect_dns(port: u16) -> Result<NftState> {
-    const DNS_CHAIN: &str = "out";
     let table = Table::new(ProtocolFamily::Inet).with_name(TABLE_NAME.to_owned());
     let chain = Chain::new(&table)
         .with_name(DNS_CHAIN)
@@ -265,6 +270,10 @@ pub fn redirect_dns(port: u16) -> Result<NftState> {
     };
 
     Ok(prop)
+}
+
+pub fn expose_port(port: u16) {
+    
 }
 
 impl NftState {
@@ -322,16 +331,27 @@ pub fn drop_interface_rule(i_name: &str, chain: &Chain) -> Result<Rule> {
     Ok(r)
 }
 
+pub fn drop_interface_rule_index(index: u32, chain: &Chain) -> Result<Rule> {
+    let mut r = Rule::new(&chain)?;
+
+    r = r
+        .with_expr(Meta::new(MetaType::Iif))
+        .with_expr(Cmp::new(CmpOp::Eq, index.to_le_bytes()))
+        .with_expr(Immediate::new_verdict(VerdictKind::Drop));
+
+    Ok(r)
+}
+
 #[derive(Default, Debug)]
 pub struct IncrementalNft {
-    links: Vec<String>,
+    links: Vec<u32>,
 }
 
 use rustables::*;
 impl IncrementalNft {
-    pub fn drop_packets_from(&mut self, name: String) {
-        log::info!("Add nft rule for {}", name);
-        self.links.push(name);
+    pub fn drop_packets_from(&mut self, index: u32) {
+        log::info!("Add nft rule for {}", index);
+        self.links.push(index);
     }
     // TODO: blocking socket
     pub fn execute(&mut self) -> Result<()> {
@@ -341,8 +361,8 @@ impl IncrementalNft {
             .with_name(FO_CHAIN)
             .with_policy(ChainPolicy::Accept);
         let mut batch: Batch = Batch::new();
-        for name in self.links.iter() {
-            let rule = drop_interface_rule(name, &chain)?;
+        for index in self.links.iter() {
+            let rule = drop_interface_rule_index(*index, &chain)?;
             batch.add(&rule, MsgType::Add);
         }
         batch.send()?;

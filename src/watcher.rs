@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{data::*};
+use crate::{data::*, ctrl::ToServer};
 use anyhow::{Result};
 use futures::{StreamExt};
 use inotify::{Event, EventMask, WatchMask};
@@ -12,21 +12,26 @@ use std::result::Result as stdRes;
 use tokio::{fs, io::AsyncReadExt, sync::mpsc::UnboundedSender};
 
 pub trait Watcher {
-    fn new(signal: UnboundedSender<WatcherEvent>) -> Self;
+    fn new(signal: UnboundedSender<MainEvent>) -> Self;
     async fn daemon(self) -> Result<()>;
 }
 
-pub enum WatcherEvent {
+
+/// Events of the main task
+pub enum MainEvent {
     Flatpak(FlatpakV),
+    Command(ToServer),
+    /// Some subjects have bounded lifetime
+    SubjectExpire(SubjectKey)
 }
 
 pub struct FlatpakWatcher {
     seen_pid: HashSet<Pid>,
-    signal: UnboundedSender<WatcherEvent>,
+    signal: UnboundedSender<MainEvent>,
 }
 
 impl Watcher for FlatpakWatcher {
-    fn new(signal: UnboundedSender<WatcherEvent>) -> Self {
+    fn new(signal: UnboundedSender<MainEvent>) -> Self {
         Self {
             seen_pid: Default::default(),
             signal,
@@ -105,7 +110,7 @@ impl FlatpakWatcher {
                             id: flatpak_id,
                             pid: Pid(the_child_pid)
                         };
-                        self.signal.send(WatcherEvent::Flatpak(resp))?;
+                        self.signal.send(MainEvent::Flatpak(resp))?;
                     }
                 }
             }

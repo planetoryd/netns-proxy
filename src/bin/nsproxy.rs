@@ -2,42 +2,26 @@
 use anyhow::{anyhow, bail, ensure, Ok, Result};
 use clap::{Parser, Subcommand};
 
-use futures::StreamExt;
 use netns_proxy::ctrl::{ToClient, ToServer};
-use netns_proxy::sub::{handle, SubHub, ToSub};
-use netns_proxy::util::error::DevianceError;
-use netns_proxy::util::ns::{
-    self, enter_ns_by_name, enter_ns_by_pid, get_self_netns_inode, self_netns_identify,
-};
-use netns_proxy::util::{branch_out, open_wo_cloexec, Awaitor, TaskOutput};
-use netns_proxy::util::{perms::*, DaemonSender};
-use netns_proxy::watcher::{FlatpakWatcher, Watcher, WatcherEvent};
+use netns_proxy::util::branch_out;
+use netns_proxy::util::ns::self_netns_identify;
+use netns_proxy::util::perms::*;
+use nix::sched::CloneFlags;
 use nix::unistd::geteuid;
-use tokio::net::UnixStream;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
-use tokio_util::codec::Framed;
-use tokio_util::codec::LengthDelimitedCodec;
 
-use std::collections::HashSet;
-use std::env::Args;
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::env;
 use std::sync::Arc;
-use std::{env, path::PathBuf};
-use tokio::{fs::File, io::AsyncReadExt, process::Command, task::JoinSet};
+use tokio::process::Command;
 
-use dashmap::DashMap;
 use netns_proxy::data::*;
 use netns_proxy::netlink::*;
-use netns_proxy::sub;
-use netns_proxy::watcher;
-use procfs::process::Process;
 
 #[derive(Parser)]
 #[command(
     author,
     version,
-    about = "utility for using netns as socks proxy containers.",
-    long_about = "utility for using netns as socks proxy containers. may need root. \n example commandline `RUST_LOG=error,netns_proxy=info sudo -E netns-proxy`, errors may be fine"
+    about = "utility for using netns as socks proxy containers, and other related tasks",
+    long_about = "utility for using netns as socks proxy containers, and other related tasks. It can run as a SUID daemon, a cli controller, or a standalone utility"
 )]
 struct Cli {
     #[arg(short, long)]
@@ -55,24 +39,34 @@ enum Commands {
         /// Enter a persistent NS. Their names are the same as the corresponding profiles'.
         #[arg(short, long)]
         ns: Option<String>,
+        /// Use an empty, new network namespace. This uses syscall unshare, but without the need of sudo.
+        #[arg(long)]
+        new: bool,
         /// Enter the Net NS of certain process
         #[arg(short, long)]
         pid: Option<i32>,
         /// Print network related info in root ns or the specified NS and exit.
         #[arg(short, long)]
         dbg: bool,
+        /// Keep root privileges
+        #[arg(short, long)]
+        su: bool,
         /// Command to run.
         cmd: Option<String>,
     },
     /// Identify the Netns you are currently in
     Id {},
-    /// Clean up all possible things in nftables, netlink, netns, left by netns-proxy.
-    Clean {},
+    /// Clean up changes to the system made according to the state file.
+    /// A reboot cleans up everything, though.
+    GC {
+        /// Enter a persistent NS. Their names are the same as the corresponding profiles'.
+        #[arg(short, long)]
+        ns: String,
+    },
     // Control commands
     /// Reload config by the daemon
     Reload,
 }
-
 
 fn main() -> Result<()> {
     let e = env_logger::Env::new().default_filter_or("warn,netns_proxy=debug,nsproxy=debug");
@@ -105,38 +99,22 @@ fn main() -> Result<()> {
                     Ok(())
                 })?;
         }
-        Some(Commands::Clean {}) => {
-            log::info!("Clean up the changes netns-proxy made");
-            // It is hard to steer the system config state into the desired state
-            // Things get messed up easily.
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async move {
-                    let nl = NetlinkConn::new_in_current_ns();
-                    let state = NetnspState::load(Arc::new(ConfPaths::default()?)).await?;
-                    state.clean_net(&nl).await?;
-                    log::info!("Cleaned");
-                    Ok(())
-                })?;
-
-            // The config process resets a lot even though it's not an explicit clean
-        }
         Some(Commands::Exec {
             mut cmd,
             ns,
             pid,
             dbg,
+            new,
+            su,
         }) => {
             let state = NetnspState::load_sync(Arc::new(ConfPaths::default()?))?;
-            let curr_ns = NSID::proc()?;
+            let current_ns = NSID::proc()?;
             let (u, g) = get_non_priv_user(None, None, None, None)?;
-            if curr_ns != state.derivative.root_ns {
-                log::error!("ACCESS DENIED");
+            if current_ns != state.derivative.root_ns {
+                log::error!("Access denied. It's not allowed to exec from a non-root NS which is specified in the state file.");
                 log::info!(
                     "current {:?}, saved {:?}",
-                    curr_ns,
+                    current_ns,
                     state.derivative.root_ns
                 );
                 std::process::exit(1);
@@ -158,11 +136,13 @@ fn main() -> Result<()> {
             } else {
                 if dbg {
                     log::info!("Will not change NS");
+                } else if new {
+                    nix::sched::unshare(CloneFlags::CLONE_NEWNET)?;
                 } else {
                     bail!("use --ns or --pid to specify the network namespace.");
                 }
             };
-            if !dbg {
+            if !dbg && !su {
                 drop_privs_id(nix::unistd::Gid::from_raw(u), nix::unistd::Uid::from_raw(g))?;
             }
             // Netns must be entered before the mess of multi threading
@@ -192,11 +172,28 @@ fn main() -> Result<()> {
                 .block_on(async move {
                     let p = ConfPaths::default()?;
                     let p2 = p.sock4ctrl();
+                    log::warn!("Config will not take effect if there is a corresponding entry in the derivative/state file");
                     let mut client = netns_proxy::ctrl::Client::new(p2.as_path()).await?;
                     log::info!("connected");
                     let res = client.req(ToServer::ReloadConfig).await?;
                     ensure!(res == ToClient::ConfigReloaded);
                     log::info!("reloaded");
+                    Ok(())
+                })?;
+        }
+        Some(Commands::GC { ns }) => {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let p = ConfPaths::default()?;
+                    let p2 = p.sock4ctrl();
+                    let mut client = netns_proxy::ctrl::Client::new(p2.as_path()).await?;
+                    log::info!("connected");
+                    let res = client.req(ToServer::GC(ProfileName(ns))).await?;
+                    ensure!(res == ToClient::GCed);
+                    log::info!("cleaned");
                     Ok(())
                 })?;
         }
@@ -216,7 +213,7 @@ fn main() -> Result<()> {
                     Ok(())
                 });
             // must manually print it or something wont be displayed
-            println!("Main-process {:?}", k);
+            println!("Main-process Errored, {:?}", k);
         }
     }
     Ok(())

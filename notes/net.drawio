@@ -1,0 +1,43 @@
+<mxfile host="65bd71144e">
+    <diagram id="dCMFA2lEqtgDeuTFAu6F" name="Page-1">
+        <mxGraphModel dx="876" dy="699" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="6" style="edgeStyle=none;html=1;" edge="1" parent="1" source="2" target="5">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="2" value="&lt;div style=&quot;color: rgb(204, 204, 204); background-color: rgb(31, 31, 31); font-family: &amp;quot;Droid Sans Mono&amp;quot;, &amp;quot;monospace&amp;quot;, monospace; font-weight: normal; font-size: 14px; line-height: 19px;&quot;&gt;&lt;div&gt;&lt;/div&gt;&lt;div&gt;&lt;div style=&quot;line-height: 19px;&quot;&gt;&lt;div&gt;&lt;/div&gt;&lt;div&gt;&lt;span style=&quot;color: #569cd6;&quot;&gt;pub&lt;/span&gt; &lt;span style=&quot;color: #569cd6;&quot;&gt;enum&lt;/span&gt; &lt;span style=&quot;color: #4ec9b0;&quot;&gt;SocksV5Host&lt;/span&gt; {&lt;/div&gt;&lt;div&gt;    &lt;span style=&quot;color: #4fc1ff;&quot;&gt;Domain&lt;/span&gt;(&lt;span style=&quot;color: #4ec9b0;&quot;&gt;Vec&lt;/span&gt;&amp;lt;&lt;span style=&quot;color: #4ec9b0;&quot;&gt;u8&lt;/span&gt;&amp;gt;),&lt;/div&gt;&lt;div&gt;    &lt;span style=&quot;color: #4fc1ff;&quot;&gt;Ipv4&lt;/span&gt;([&lt;span style=&quot;color: #4ec9b0;&quot;&gt;u8&lt;/span&gt;; &lt;span style=&quot;color: #b5cea8;&quot;&gt;4&lt;/span&gt;]),&lt;/div&gt;&lt;div&gt;    &lt;span style=&quot;color: #4fc1ff;&quot;&gt;Ipv6&lt;/span&gt;([&lt;span style=&quot;color: #4ec9b0;&quot;&gt;u8&lt;/span&gt;; &lt;span style=&quot;color: #b5cea8;&quot;&gt;16&lt;/span&gt;]),&lt;/div&gt;&lt;div&gt;}&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;" style="text;whiteSpace=wrap;html=1;align=left;rounded=0;" vertex="1" parent="1">
+                    <mxGeometry x="230" y="250" width="210" height="120" as="geometry"/>
+                </mxCell>
+                <mxCell id="5" value="Proxy Vendor" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+                    <mxGeometry x="60" y="280" width="120" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="9" style="edgeStyle=none;html=1;" edge="1" parent="1" source="7" target="2">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="7" value="Tun2socks" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+                    <mxGeometry x="275" y="100" width="120" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="12" value="&lt;div style=&quot;color: rgb(204, 204, 204); background-color: rgb(31, 31, 31); font-family: &amp;quot;Droid Sans Mono&amp;quot;, &amp;quot;monospace&amp;quot;, monospace; font-weight: normal; font-size: 14px; line-height: 19px;&quot;&gt;&lt;br&gt;&lt;/div&gt;" style="text;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+                    <mxGeometry x="540" y="110" width="260" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="14" style="edgeStyle=none;html=1;" edge="1" parent="1" source="13" target="7">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="13" value="&lt;div style=&quot;color: rgb(204, 204, 204); background-color: rgb(31, 31, 31); font-family: &amp;quot;Droid Sans Mono&amp;quot;, &amp;quot;monospace&amp;quot;, monospace; font-weight: normal; font-size: 14px; line-height: 19px;&quot;&gt;&lt;div&gt;&lt;span style=&quot;color: #569cd6;&quot;&gt;pub&lt;/span&gt;&lt;span style=&quot;color: #cccccc;&quot;&gt; &lt;/span&gt;&lt;span style=&quot;color: #569cd6;&quot;&gt;struct&lt;/span&gt;&lt;span style=&quot;color: #cccccc;&quot;&gt; &lt;/span&gt;&lt;span style=&quot;color: #4ec9b0;&quot;&gt;Tun&lt;/span&gt;&lt;span style=&quot;color: #cccccc;&quot;&gt;(&lt;/span&gt;&lt;span style=&quot;color: #4ec9b0;&quot;&gt;Device&lt;/span&gt;&lt;span style=&quot;color: #cccccc;&quot;&gt;);&lt;/span&gt;&lt;/div&gt;&lt;div&gt;&lt;span style=&quot;color: #cccccc;&quot;&gt;&lt;br&gt;&lt;/span&gt;&lt;/div&gt;&lt;div&gt;&lt;span style=&quot;color: rgb(86, 156, 214);&quot;&gt;impl&lt;/span&gt;&amp;nbsp;&lt;span style=&quot;color: rgb(78, 201, 176);&quot;&gt;io&lt;/span&gt;&lt;span style=&quot;color: rgb(212, 212, 212);&quot;&gt;::&lt;/span&gt;&lt;span style=&quot;color: rgb(78, 201, 176);&quot;&gt;Read&lt;/span&gt;&amp;nbsp;&lt;span style=&quot;color: rgb(86, 156, 214);&quot;&gt;for&lt;/span&gt;&amp;nbsp;&lt;span style=&quot;color: rgb(78, 201, 176);&quot;&gt;Device&lt;/span&gt;&amp;nbsp;{&lt;span style=&quot;color: #cccccc;&quot;&gt;&lt;br&gt;&lt;/span&gt;&lt;/div&gt;&lt;div&gt;&lt;br&gt;&lt;/div&gt;&lt;div&gt;&lt;span style=&quot;color: rgb(86, 156, 214);&quot;&gt;impl&lt;/span&gt;&amp;nbsp;&lt;span style=&quot;color: rgb(78, 201, 176);&quot;&gt;io&lt;/span&gt;&lt;span style=&quot;color: rgb(212, 212, 212);&quot;&gt;::&lt;/span&gt;&lt;span style=&quot;color: rgb(78, 201, 176);&quot;&gt;Write&lt;/span&gt;&amp;nbsp;&lt;span style=&quot;color: rgb(86, 156, 214);&quot;&gt;for&lt;/span&gt;&amp;nbsp;&lt;span style=&quot;color: rgb(78, 201, 176);&quot;&gt;Device&lt;/span&gt;&amp;nbsp;{&lt;br&gt;&lt;/div&gt;&lt;/div&gt;" style="text;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+                    <mxGeometry x="510" y="75" width="230" height="110" as="geometry"/>
+                </mxCell>
+                <mxCell id="16" style="edgeStyle=none;html=1;" edge="1" parent="1" source="15" target="13">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="15" value="IP packets" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;" vertex="1" parent="1">
+                    <mxGeometry x="595" y="250" width="60" height="30" as="geometry"/>
+                </mxCell>
+                <mxCell id="18" value="Byte stream to a host" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;" vertex="1" parent="1">
+                    <mxGeometry x="265" y="360" width="140" height="30" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+</mxfile>

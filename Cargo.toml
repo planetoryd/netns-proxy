@@ -15,7 +15,7 @@ futures = "0.3.28"
 ipnetwork = { version = "0.20.0", features = ["serde"] }
 users = "0.11.0"
 nix = { version = "0.26.2", features = ["user", "sched"] }
-serde = { version = "1.0.160", features = ["derive", "rc"] }
+serde = { version = "<=1.0.171", features = ["derive", "rc"] }
 serde_json = "1.0.96"
 anyhow = { version = "1.0.71", features = ["backtrace"] }
 libc = "0.2.143"
@@ -23,8 +23,6 @@ procfs = "0.15.1"
 rtnetlink = { path = "../rtnetlink" }
 netns-rs = "0.1.0"
 tidy-tuntap = { path = "../tidy-tuntap" }
-mnl = "0.2.2"
-zbus = { version = "3.13.1", features = ["tokio"] }
 inotify = "0.10.1"
 rust-ini = "0.19.0"
 rustables = { path = "../rustables" }
@@ -32,13 +30,11 @@ either = "1.8.1"
 pidfd = "0.2.4"
 xdg = "2.5.0"
 thiserror = "1.0.40"
-socksv5 = { version = "0.3.1", features = ["tokio"] }
 dashmap = "5.4.0"
 derivative = "2.2.0"
 serde_with = "3.1.0"
 tokio-util = { version = "0.7.8", features = ["codec"] }
 bytes = "1.4.0"
-bincode = "1.3.3"
 env_logger = "0.10.0"
-rpds = "1.0.0"
 tokio-stream = { version = "0.1.14", features = ["io-util"] }
+ron = "0.8.1"

@@ -1,9 +1,9 @@
+use crate::util;
 use anyhow::Result;
 use bytes::Bytes;
 use dashmap::mapref::one::{Ref, RefMut};
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt, TryFutureExt};
-
 use rtnetlink::netlink_proto::new_connection_with_socket;
 use rtnetlink::Handle;
 use serde::{Deserialize, Serialize};
@@ -34,7 +34,7 @@ use sysinfo::{self, ProcessExt, SystemExt};
 use tokio::{self, io::AsyncReadExt, process::Command};
 
 use crate::netlink::*;
-use crate::util::{AbortOnDrop, Awaitor, TaskOutput, TaskCtx, PidAwaiter};
+use crate::util::{AbortOnDrop, Awaitor, PidAwaiter, TaskCtx, TaskOutput};
 use anyhow::anyhow;
 use dashmap::DashMap;
 use tokio_util::codec::Framed;
@@ -44,7 +44,7 @@ use tokio_util::codec::Framed;
 use rtnetlink::proxy::{self, ProxySocketType};
 
 impl SubjectInfo<NamedV> {
-    pub async fn run(&self, sub: &SubHub) -> Result<()> {
+    pub async fn run(&mut self, sub: &SubHub) -> Result<()> {
         let (mut s, _) = sub.op(self.ns.clone()).await?;
         s.send(ToSub::Named(self.clone())).await?;
         Ok(())
@@ -52,7 +52,7 @@ impl SubjectInfo<NamedV> {
 }
 
 impl SubjectInfo<FlatpakV> {
-    pub async fn run(&self, sub: &SubHub) -> Result<()> {
+    pub async fn run(&mut self, sub: &SubHub) -> Result<()> {
         let (mut s, _) = sub.op(self.ns.clone()).await?;
         s.send(ToSub::Flatpak(self.clone())).await?;
         Ok(())
@@ -72,9 +72,13 @@ pub struct Sub {
     pub fd_q: mpsc::UnboundedSender<oneshot::Sender<RawFd>>,
 }
 
+pub struct Proc {
+    pid: Pid,
+}
+
 impl Sub {
     pub async fn send(&mut self, x: ToSub) -> Result<()> {
-        self.st.send(bincode::serialize(&x)?.into()).await?;
+        self.st.send(util::to_vec_internal(&x)?.into()).await?;
         Ok(())
     }
     /// get an fd opened by the sub process
@@ -127,7 +131,7 @@ impl SubHub {
 
                 let h: AbortOnDrop<_> = tokio::spawn(async move {
                     while let Some(byt) = stream.next().await {
-                        let pack: ToMain = bincode::deserialize(&byt?)?;
+                        let pack: ToMain = util::from_vec_internal(&byt?)?;
                         match pack {
                             ToMain::FD(rfd) => {
                                 if let Some(sx) = fdr.recv().await {
@@ -172,7 +176,7 @@ impl SubHub {
     }
     /// start a new sub
     /// new sub for each ns
-    fn new_sub(&self, fd: RawFd) -> Result<()> {
+    fn new_sub(&self, fd: RawFd, id: NSID) -> Result<()> {
         let sp = self.sock_path.as_path().to_owned();
 
         let sx = self.ctx.pid.clone();
@@ -189,7 +193,7 @@ impl SubHub {
                 .spawn()?;
             let pid = cmd.id().unwrap();
             log::debug!("Subprocess started {}", pid);
-            sx.send(Pid(pid)).unwrap();
+            sx.send(util::PidOp::Add(id, Pid(pid))).unwrap();
             let e = cmd.wait().await?;
             log::warn!("Subprocess exited {}, {}", e, pid);
             Ok(())
@@ -206,7 +210,7 @@ impl SubHub {
                 let nf = id.open_wo_close()?;
                 let (sx, rx) = oneshot::channel::<()>();
                 self.queue.send((id.clone(), sx)).unwrap();
-                self.new_sub(nf.0.as_raw_fd())?;
+                self.new_sub(nf.0.as_raw_fd(), id.clone())?;
                 rx.await?;
                 log::trace!("rpc-sub received");
                 (
@@ -254,7 +258,7 @@ pub async fn next<T: for<'a> Deserialize<'a> + Debug>(
     match pa {
         Some(pa) => {
             let k = pa?;
-            let pa: T = bincode::deserialize(&k)?;
+            let pa: T = util::from_vec_internal(&k)?;
             Ok(pa)
         }
         None => {
@@ -268,7 +272,7 @@ pub async fn send<T: Serialize>(
     f: &mut Framed<UnixStream, LengthDelimitedCodec>,
     v: &T,
 ) -> Result<()> {
-    f.send(bincode::serialize(v)?.into())
+    f.send(util::to_vec_internal(v)?.into())
         .await
         .map_err(anyhow::Error::from)
 }
@@ -278,7 +282,7 @@ pub async fn handle(mut f: Framed<UnixStream, LengthDelimitedCodec>) -> Result<(
     let pw = PidAwaiter::new();
     let sx = pw.sx.clone();
     tokio::spawn(crate::util::handle_sig(pw));
-    
+
     let p = next(&mut f, None, true).await?;
     match p {
         ToSub::Init(path, u, g, subject_ns) => {
@@ -292,11 +296,14 @@ pub async fn handle(mut f: Framed<UnixStream, LengthDelimitedCodec>) -> Result<(
 
             let mut st = NsubState {
                 ns: Netns::proc_current().await?,
-                ctx: TaskCtx { dae: dae.sender, pid: sx },
+                ctx: TaskCtx {
+                    dae: dae.sender,
+                    pid: sx,
+                },
                 non_priv_uid: u,
                 non_priv_gid: g,
             };
-        
+
             let fds: DashMap<NSID, NsFile<std::fs::File>> = DashMap::new();
 
             loop {

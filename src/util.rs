@@ -6,6 +6,7 @@ use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Ok;
@@ -21,6 +22,7 @@ use nix::unistd::Gid;
 use nix::unistd::Pid;
 use nix::unistd::Uid;
 use pidfd::PidFd;
+use pidfd::PidFuture;
 use procfs::process::Process;
 
 use tokio::io::BufStream;
@@ -31,12 +33,15 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::Receiver;
+use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
 use tokio::task::JoinError;
 use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 
 use crate::data::FlatpakID;
+use crate::data::Pid as DPid;
+use crate::data::NSID;
 use crate::netlink::NsFile;
 use crate::sub::SocketEOF;
 
@@ -244,12 +249,12 @@ use sysinfo::SystemExt;
 use std::println as info;
 
 /// adapt the flatpak settings of given list
-pub fn flatpak_perms_checkup(list: Vec<FlatpakID>) -> Result<()> {
+pub fn flatpak_perms_checkup(list: Vec<&FlatpakID>) -> Result<()> {
     let basedirs = xdg::BaseDirectories::with_prefix("flatpak")?;
-    info!("trying to adapt flatpak app permissions");
+    info!("Trying to adapt flatpak app permissions. \n This turns 'Network' off which causes flatpak to use isolated network namespaces. \n This must be done early to prevent accidental unsandboxed use of network");
     for appid in list {
         let mut sub = PathBuf::from("overrides");
-        sub.push(appid.0);
+        sub.push(&appid.0);
         let p = basedirs.get_data_file(&sub);
         if p.exists() {
             let mut conf = ini::Ini::load_from_file(p.as_path())?;
@@ -284,8 +289,8 @@ pub fn flatpak_perms_checkup(list: Vec<FlatpakID>) -> Result<()> {
 fn test_flatpakperm() -> Result<()> {
     flatpak_perms_checkup(
         [
-            "org.mozilla.firefox".parse()?,
-            "im.fluffychat.Fluffychat".parse()?,
+            &"org.mozilla.firefox".parse()?,
+            &"im.fluffychat.Fluffychat".parse()?,
         ]
         .to_vec(),
     )
@@ -528,31 +533,90 @@ pub struct Awaitor {
     daemons: JoinSet<TaskOutput>,
 }
 
-pub struct PidAwaiter {
-    pub sx: UnboundedSender<crate::data::Pid>,
-    pub rx: UnboundedReceiver<crate::data::Pid>,
+pub enum PidOp {
+    Kill(NSID),
+    Add(NSID, DPid),
 }
 
+pub struct PidAwaiter {
+    pub sx: UnboundedSender<PidOp>,
+    pub groups: Arc<Mutex<HashMap<NSID, Vec<DPid>>>>,
+    server: Option<AbortHandle>,
+}
+use std::collections::hash_map::Entry;
 impl PidAwaiter {
-    pub fn new() -> Self {
-        let (sx, rx) = unbounded_channel();
-        Self { sx, rx }
+    pub fn new() -> Arc<Self> {
+        let (sx, mut rx) = unbounded_channel::<PidOp>();
+        let groups: Arc<Mutex<HashMap<NSID, Vec<DPid>>>> = Default::default();
+        let g = groups.clone();
+        let p = Arc::new(Self {
+            sx,
+            groups,
+            server: None,
+        });
+        let p2 = p.clone();
+        let k = tokio::spawn(async move {
+            while let Some(p) = rx.recv().await {
+                match p {
+                    PidOp::Add(ns, pid) => {
+                        let mut w = g.lock().await;
+                        match w.entry(ns) {
+                            Entry::Occupied(mut v) => {
+                                v.get_mut().push(pid);
+                            }
+                            Entry::Vacant(v) => {
+                                let v = v.insert(vec![]);
+                                v.push(pid);
+                            }
+                        }
+                    }
+                    PidOp::Kill(ns) => {
+                        p2.kill_await(Some(&ns)).await;
+                    }
+                }
+            }
+        });
+
+        p
     }
-    pub async fn kill_n_wait(mut self) {
-        let mut h = vec![];
-        while let Result::Ok(x) = self.rx.try_recv() {
-            // all pids should be in buffer
-            if let Result::Ok(f) = unsafe { PidFd::open(x.0 as i32, 0) } {
-                unsafe {
-                    let _ = f.send_raw_signal(libc::SIGINT, std::ptr::null(), 0);
-                };
-                h.push(f.into_future());
-            } else {
-                // skip. dead proc.
+    pub async fn kill_await(&self, ns: Option<&NSID>) {
+        let mut g = self.groups.lock().await;
+        if let Some(ns) = ns {
+            if let Some(ve) = g.get_mut(ns) {
+                Self::kill_vec(ve, &ns).await;
+            }
+        } else {
+            for (ns, ve) in g.iter_mut() {
+                Self::kill_vec(ve, &ns).await;
             }
         }
-        log::debug!("Wait {} processes to finish", h.len());
+    }
+    pub fn wait(x: DPid) -> Option<PidFuture> {
+        if let Result::Ok(f) = unsafe { PidFd::open(x.0 as i32, 0) } {
+            unsafe {
+                let _ = f.send_raw_signal(libc::SIGINT, std::ptr::null(), 0);
+            };
+            Some(f.into_future())
+        } else {
+            None
+        }
+    }
+    /// each killed pid is removed
+    async fn kill_vec(ve: &mut Vec<DPid>, ns: &NSID) {
+        let mut h = vec![];
+        while let Some(x) = ve.pop() {
+            if let Some(e) = Self::wait(x) {
+                h.push(e);
+            }
+        }
+        log::info!("Kill process group {ns}, num {}", h.len());
         futures::future::join_all(h).await;
+    }
+    pub async fn kill_all(&self) {
+        if let Some(ref s) = self.server {
+            s.abort();
+        }
+        self.kill_await(None).await;
         log::debug!("All processes stopped");
     }
 }
@@ -563,7 +627,7 @@ pub type DaemonSender = UnboundedSender<Pin<Box<dyn Future<Output = TaskOutput> 
 #[derive(Debug, Clone)]
 pub struct TaskCtx {
     pub dae: DaemonSender,
-    pub pid: UnboundedSender<crate::data::Pid>,
+    pub pid: UnboundedSender<PidOp>,
 }
 
 pub struct TaskOutput {
@@ -637,7 +701,6 @@ impl TaskOutput {
             Ok(())
         })
         .into();
-
         Self::wrapped(Box::pin(h), n2)
     }
     pub fn immediately_std<
@@ -665,7 +728,7 @@ impl TaskOutput {
         if let Err(e) = x {
             log::error!("Task {} errored, {:?}", name, e);
         } else {
-            log::debug!("Task {} has result {:?}", name, x.unwrap());
+            log::trace!("Task {} has result {:?}", name, x.unwrap());
         }
     }
 }
@@ -690,7 +753,7 @@ impl Awaitor {
                 maybe_res = self.daemons.join_next() => {
                     if let Some(res) = maybe_res {
                         let res = res?;
-                        log::error!("daemon {} stopped. {:?}", res.name, res.result);
+                        log::info!("Daemon {} stopped. {:?}", res.name, res.result);
                         if let Some(x) = res.sig {
                             let _ = x.send(());
                         }
@@ -708,13 +771,14 @@ use tokio::net::UnixStream;
 use tokio_util::codec::Framed;
 use tokio_util::codec::LengthDelimitedCodec;
 
-pub async fn handle_sig(pw: PidAwaiter) -> Result<()> {
+pub async fn handle_sig(pw: Arc<PidAwaiter>) -> Result<()> {
     tokio::signal::unix::signal(SignalKind::interrupt())?
         .recv()
         .await;
-    SIG_EXIT.store(true, Ordering::Relaxed);
-    log::debug!("Sub received SIGINT. Now kill wait processes to die");
-    pw.kill_n_wait().await;
+    SIG_EXIT.store(true, Ordering::SeqCst);
+    log::debug!("Sub received SIGINT.");
+    pw.kill_all().await;
+    exit(0);
     Ok(())
 }
 
@@ -743,10 +807,10 @@ pub fn branch_out() -> Result<()> {
                     let x = handle(f).await;
                     if let Err(e) = x {
                         if let Some(x) = e.downcast_ref::<SocketEOF>() {
-                            if SIG_EXIT.load(Ordering::Relaxed) {
+                            if SIG_EXIT.load(Ordering::SeqCst) {
                                 // ignore
                             } else {
-                                log::error!("exit as sub \n Err: {:?}", e);
+                                log::error!("exit as sub \n Err: SocketEOF");
                             }
                         } else {
                             log::error!("exit as sub \n Err: {:?}", e);
@@ -763,7 +827,7 @@ pub fn branch_out() -> Result<()> {
     Ok(())
 }
 
-pub struct AbortOnDrop<T>(JoinHandle<T>);
+pub struct AbortOnDrop<T>(pub JoinHandle<T>);
 
 impl<T> Future for AbortOnDrop<T> {
     type Output = std::result::Result<T, JoinError>;
@@ -817,4 +881,18 @@ async fn test_aod() {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // should output -- 3
+}
+
+// I have to use json because I skip fields in serde, which does not work those compact binary formats
+// I tried every one of them and none of them works.
+// not going to waste any more time on this
+
+pub fn to_vec_internal<T: serde::Serialize>(x: &T) -> Result<Vec<u8>> {
+    let v = ron::to_string(x)?.into_bytes();
+    Ok(v)
+}
+
+pub fn from_vec_internal<'a, T: for<'b> serde::Deserialize<'b>>(b: &'a [u8]) -> Result<T> {
+    let k = ron::from_str(&String::from_utf8_lossy(b))?;
+    Ok(k)
 }

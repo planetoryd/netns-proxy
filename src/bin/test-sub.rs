@@ -60,7 +60,7 @@ fn main() -> Result<()> {
             let pid_wait = PidAwaiter::new();
             let ctx = TaskCtx {
                 dae: dae.sender.clone(),
-                pid: pid_wait.sx,
+                pid: pid_wait.sx.clone(),
             };
             let mn: MultiNS = MultiNS::new(paths.clone(), ctx).await?;
             let nl = mn.get_nl(id.clone()).await?;
@@ -104,11 +104,11 @@ async fn tests(ns: &mut Netns) -> Result<()> {
     dbg!(&ns.netlink);
     VethPair::new(&mut ns.netlink, vp.clone()).await?;
     assert!(ns.netlink.links.len() - prev_len == 2);
-    assert!(ns.netlink.links.contains_key(&vp.link(true)));
-    assert!(ns.netlink.links.contains_key(&vp.link(false)));
+    assert!(ns.netlink.links.contains_key(&vp.link(LinkAB::A)));
+    assert!(ns.netlink.links.contains_key(&vp.link(LinkAB::B)));
     dbg!(&ns.netlink);
 
-    let la = ns.netlink.links.get_mut(&vp.link(true)).unwrap();
+    let la = ns.netlink.links.get_mut(&vp.link(LinkAB::A)).unwrap();
     la.add_addr("1.1.1.1/15".parse()?).await?;
     let e = la.add_addr("::1/22".parse()?).await;
     assert!(e.is_err());
@@ -117,7 +117,7 @@ async fn tests(ns: &mut Netns) -> Result<()> {
     ns.refresh().await?;
     dbg!(&ns.netlink);
 
-    let rm = vp.link(true);
+    let rm = vp.link(LinkAB::A);
     ns.netlink.remove_link(&rm).await?;
     assert!(!ns.netlink.links.contains_key(&rm));
     assert!(matches!(ns.netlink.veths.get(&vp).unwrap(), VethPair::None));
