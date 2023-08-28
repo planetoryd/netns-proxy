@@ -129,8 +129,13 @@ impl Server {
                 ToServer::GC(_) => {
                     let k = sx_main.lock().await;
                     if let Some(ref x) = *k {
-                        x.send(pa).unwrap();
-                        re = ToClient::GCed;
+                        match x.send(pa) {
+                            Result::Ok(_) => re = ToClient::GCed,
+                            Err(_) => {
+                                log::error!("Main_task isn't running");
+                                re = ToClient::Fail;
+                            }
+                        }
                     } else {
                         re = ToClient::Fail;
                     }
@@ -204,6 +209,7 @@ async fn main_task(
     mn.init_current().await?;
     state.derivative.update_nsid().await?;
     state.derive_named_all().await?;
+    state.dump().await?;
     // All named are derived and NSes are present.
     state.flatpak_ensure()?;
 
@@ -250,27 +256,26 @@ async fn event_handler(
             MainEvent::Flatpak(fp) => {
                 match state.derive_flatpak(fp.clone()).await? {
                     DeriveRes::New => {
-                        let inf = state.derivative.flatpak.get(&fp.pid).ok_or(DevianceError)?;
+                        let inf = state.derivative.flatpak.get_mut(&fp.pid).ok_or(DevianceError)?;
                         let pf = PidAwaiter::wait(fp.pid);
                         if let Some(pf) = pf {
                             let s2 = sx.clone();
-                            let pw = async move {
-                                pf.await?;
-                                s2.send(MainEvent::SubjectExpire(SubjectKey::Flatpak(fp.pid)))
-                                    .unwrap();
-                                // even if flatpak exits right now it has to finish this iteration first.
-                                Ok(())
-                            };
                             let (t, _) = TaskOutput::immediately(
-                                Box::pin(pw),
+                                Box::pin(async move {
+                                    pf.await?;
+                                    s2.send(MainEvent::SubjectExpire(SubjectKey::Flatpak(fp.pid)))
+                                        .unwrap();
+                                    // even if flatpak exits right now it has to finish this iteration first.
+                                    Ok(())
+                                }),
                                 "flatpak-pidfd-".to_owned() + &fp.pid.0.to_string(),
                             );
                             ctx.dae.send(t).unwrap();
-
-                            inf.connect(&mut mn).await?;
-                            inf.apply_veths(&mn, &state.derivative, &mut state.incre_nft)
+                            inf.ns.connect(&mn).await?;
+                            let inf = state.derivative.flatpak.get(&fp.pid).ok_or(DevianceError)?;
+                            inf.apply_veths(&mn, &state.derivative, &mut state.nft)
                                 .await?;
-                            state.incre_nft.execute()?;
+                            state.nft.execute()?;
                             state.dump().await?;
 
                             let inf = state.derivative.flatpak.get_mut(&fp.pid).unwrap();
@@ -285,7 +290,7 @@ async fn event_handler(
             MainEvent::Command(cmd) => match cmd {
                 ToServer::GC(p) => {
                     if let Some(k) = state.derivative.named_ns.get(&p) {
-                        k.garbage_collect(&mn, &state.derivative).await?;
+                        k.garbage_collect(&mn, &state.derivative, &ctx).await?;
                         state.derivative.named_ns.remove(&p);
                         state.dump().await?;
                     } else {
@@ -298,7 +303,7 @@ async fn event_handler(
                 SubjectKey::Flatpak(fp) => {
                     let si = state.derivative.flatpak.remove(&fp);
                     if let Some(si) = si {
-                        si.garbage_collect(&mn, &state.derivative).await?;
+                        si.garbage_collect(&mn, &state.derivative, &ctx).await?;
                         ctx.pid.send(PidOp::Kill(si.ns.clone())).with_context(|| {
                             format!(
                                 "trying to kill the processes of {}, sending Pid failed",

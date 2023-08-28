@@ -72,7 +72,7 @@ fn main() -> Result<()> {
     let e = env_logger::Env::new().default_filter_or("warn,netns_proxy=debug,nsproxy=debug");
     env_logger::init_from_env(e);
 
-    // XXX: polymorphic binary
+    // polymorphic binary
     branch_out()?;
 
     let cli = Cli::parse();
@@ -108,9 +108,9 @@ fn main() -> Result<()> {
             su,
         }) => {
             let state = NetnspState::load_sync(Arc::new(ConfPaths::default()?))?;
-            let current_ns = NSID::proc()?;
+            let current_ns = NSIDFrom::Thread.to_id_sync(NSCreate::empty())?;
             let (u, g) = get_non_priv_user(None, None, None, None)?;
-            if current_ns != state.derivative.root_ns {
+            if &current_ns != state.derivative.root_ns.as_ref().ok_or(anyhow!("No root_ns specified in derived file"))? {
                 log::error!("Access denied. It's not allowed to exec from a non-root NS which is specified in the state file.");
                 log::info!(
                     "current {:?}, saved {:?}",
@@ -128,10 +128,10 @@ fn main() -> Result<()> {
                 bail!("You can't specify both PID and NS");
             }
             if let Some(ns) = ns {
-                let n = NSID::from_name_sync(ProfileName(ns.clone()))?;
+                let n = NSIDFrom::Named(ProfileName(ns.clone()));
                 n.open_sync()?.enter()?;
             } else if let Some(pi) = pid {
-                let n = NSID::from_pid(Pid(pi.try_into()?))?;
+                let n = NSIDFrom::Pid(Pid(pi.try_into()?));
                 n.open_sync()?.enter()?;
             } else {
                 if dbg {
@@ -152,9 +152,15 @@ fn main() -> Result<()> {
                 .unwrap()
                 .block_on(async move {
                     if dbg {
-                        let ns = Netns::proc_current().await?;
+                        let ns = Netns::thread().await?;
                         dbg!(&ns.netlink);
-                        netns_proxy::nft::print_all()?;
+                        let k = netns_proxy::nft::print_all().await;
+                        if k.is_err() {
+                            log::error!("{:?}", k);
+                            if euid != 0.into() {
+                                log::warn!("You are not running as root. ");
+                            }
+                        }
                     } else {
                         let proc = std::process::Command::new(cmd.unwrap());
                         let mut cmd_async: Command = proc.into();
@@ -216,5 +222,8 @@ fn main() -> Result<()> {
             println!("Main-process Errored, {:?}", k);
         }
     }
+
+
+
     Ok(())
 }

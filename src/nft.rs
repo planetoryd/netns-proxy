@@ -1,10 +1,10 @@
-
+use rtnetlink::netlink_sys::{AsyncSocket, TokioSocket};
 use rustables::{
     expr::{
         Cmp, CmpOp, ExpressionRaw, ExpressionVariant, Immediate, Meta, MetaType, Nat, NatType,
         RawExpression, VerdictKind,
     },
-    iface_index, list_chains_for_table, list_rules_for_chain, list_tables,
+    iface_index, list_chains_for_table_async, list_rules_for_chain_async, list_tables_async,
     nlmsg::NfNetlinkObject,
     util::Essence,
     Batch, Chain, Hook, MsgType, ProtocolFamily, Rule, Table,
@@ -48,15 +48,19 @@ pub trait Subbed: Sized {
     where
         Self::SP: 'a,
         Self: 'a ;
-    fn sub_objs_existing(&self) -> Result<Self::STIter>;
+    async fn sub_objs_existing<S: AsyncSocket>(&self, sock: &mut S) -> Result<Self::STIter>;
     fn sub_props(&self) -> Result<Self::SPIter<'_>>;
     fn exclusive() -> bool {
         false
     }
-    fn process(&self, batch: &mut Batch) -> Result<HashSet<Self::ST>> {
+    async fn process<S: AsyncSocket>(
+        &self,
+        batch: &mut Batch,
+        sock: &mut S,
+    ) -> Result<HashSet<Self::ST>> {
         let props = self.sub_props()?;
         let prop_objs = props.into_iter().map(|x| x.obj());
-        let objs = self.sub_objs_existing()?;
+        let objs = self.sub_objs_existing(sock).await?;
         let prop_set: HashSet<_> = HashSet::from_iter(prop_objs.into_iter());
         let obj_set: HashSet<_> = HashSet::from_iter(objs.into_iter().map(|mut e| {
             e.essentialize();
@@ -84,74 +88,76 @@ pub trait Concrete {
 }
 
 pub trait Fetch<T>: Sized {
-    fn fetch(ext: T) -> Result<Self>;
+    async fn fetch<S: AsyncSocket>(ext: T, sock: &mut S) -> Result<Self>;
 }
 
 impl Fetch<()> for NftState {
-    fn fetch(_ext: ()) -> Result<Self> {
+    async fn fetch<S: AsyncSocket>(_ext: (), sock: &mut S) -> Result<Self> {
         let mut nf = NftState::default();
-        nf.tables = nf
-            .sub_objs_existing()?
-            .into_iter()
-            .map(|x| PTable::fetch(x))
-            .try_collect()?;
+        let k = nf.sub_objs_existing(sock).await?;
+        nf.tables.clear();
+        for p in k {
+            nf.tables.push(PTable::fetch(p, sock).await?);
+        }
+
         Ok(nf)
     }
 }
 
 impl Fetch<Table> for PTable {
-    fn fetch(ext: Table) -> Result<Self> {
+    async fn fetch<S: AsyncSocket>(ext: Table, sock: &mut S) -> Result<Self> {
         let mut t = Self {
             table: ext,
             ..Default::default()
         };
-        t.chains = t
-            .sub_objs_existing()?
-            .into_iter()
-            .map(|x| PChain::fetch(x))
-            .try_collect()?;
+        let k = t.sub_objs_existing(sock).await?;
+
+        t.chains.clear();
+        for p in k {
+            t.chains.push(PChain::fetch(p, sock).await?);
+        }
         Ok(t)
     }
 }
 
 impl Fetch<Chain> for PChain {
-    fn fetch(ext: Chain) -> Result<Self> {
+    async fn fetch<S: AsyncSocket>(ext: Chain, sock: &mut S) -> Result<Self> {
         let mut c = Self {
             chain: ext,
             ..Default::default()
         };
-        c.rules = HashSet::from_iter(c.sub_objs_existing()?.into_iter());
+        c.rules = HashSet::from_iter(c.sub_objs_existing(sock).await?.into_iter());
         Ok(c)
     }
 }
 
 pub trait Fat {
     /// process recursively for state application
-    fn compose(&self, batch: &mut Batch) -> Result<()>;
+    async fn compose<S: AsyncSocket>(&self, batch: &mut Batch, sock: &mut S) -> Result<()>;
 }
 
 impl Fat for PChain {
-    fn compose(&self, batch: &mut Batch) -> Result<()> {
-        let _objs = self.process(batch)?;
+    async fn compose<S: AsyncSocket>(&self, batch: &mut Batch, sock: &mut S) -> Result<()> {
+        let _objs = self.process(batch, sock).await?;
         Ok(())
     }
 }
 
 impl Fat for PTable {
-    fn compose(&self, batch: &mut Batch) -> Result<()> {
-        let _objs = self.process(batch)?;
+    async fn compose<S: AsyncSocket>(&self, batch: &mut Batch, sock: &mut S) -> Result<()> {
+        let _objs = self.process(batch, sock).await?;
         for p in self.sub_props()? {
-            p.compose(batch)?;
+            p.compose(batch, sock).await?;
         }
         Ok(())
     }
 }
 
 impl Fat for NftState {
-    fn compose(&self, batch: &mut Batch) -> Result<()> {
-        let _objs = self.process(batch)?;
+    async fn compose<S: AsyncSocket>(&self, batch: &mut Batch, sock: &mut S) -> Result<()> {
+        let _objs = self.process(batch, sock).await?;
         for p in self.sub_props()? {
-            p.compose(batch)?;
+            p.compose(batch, sock).await?;
         }
         Ok(())
     }
@@ -169,8 +175,8 @@ impl Concrete for PTable {
 impl Subbed for NftState {
     type SP = PTable;
     type ST = Table;
-    fn sub_objs_existing(&self) -> Result<Self::STIter> {
-        Ok(list_tables()?)
+    async fn sub_objs_existing<S: AsyncSocket>(&self, sock: &mut S) -> Result<Self::STIter> {
+        Ok(list_tables_async(sock).await?)
     }
     fn sub_props(&self) -> Result<Self::SPIter<'_>> {
         Ok(&self.tables)
@@ -183,8 +189,8 @@ impl Subbed for PTable {
     fn sub_props(&self) -> Result<Self::SPIter<'_>> {
         Ok(&self.chains)
     }
-    fn sub_objs_existing(&self) -> Result<Self::STIter> {
-        Ok(list_chains_for_table(&self.table)?)
+    async fn sub_objs_existing<S: AsyncSocket>(&self, sock: &mut S) -> Result<Self::STIter> {
+        Ok(list_chains_for_table_async(&self.table, sock).await?)
     }
     fn exclusive() -> bool {
         true
@@ -205,8 +211,8 @@ impl Subbed for PChain {
     fn exclusive() -> bool {
         true
     }
-    fn sub_objs_existing(&self) -> Result<Self::STIter> {
-        Ok(list_rules_for_chain(&self.chain)?)
+    async fn sub_objs_existing<S: AsyncSocket>(&self, sock: &mut S) -> Result<Self::STIter> {
+        Ok(list_rules_for_chain_async(&self.chain, sock).await?)
     }
     fn sub_props(&self) -> Result<Self::SPIter<'_>> {
         Ok(&self.rules)
@@ -220,15 +226,16 @@ impl Concrete for Rule {
     }
 }
 
-pub fn print_all() -> Result<()> {
-    let nf = NftState::fetch(())?;
+pub async fn print_all() -> Result<()> {
+    let mut sock = TokioSocket::new(rtnetlink::netlink_sys::constants::NETLINK_NETFILTER)?;
+    let nf = NftState::fetch((), &mut sock).await?;
     dbg!(nf);
     Ok(())
 }
 
 pub enum NftConf {
     RedirDNS(u16),
-    ForwardPort(u16)
+    ForwardPort(u16),
 }
 
 /// redirect all DNS traffic to localhost:port
@@ -272,20 +279,12 @@ pub fn redirect_dns(port: u16) -> Result<NftState> {
     Ok(prop)
 }
 
-pub fn expose_port(port: u16) {
-    
-}
-
 impl NftState {
-    pub async fn apply(self) -> Result<Self> {
-        let x = tokio::task::spawn_blocking(move || {
-            let mut b = Batch::new();
-            self.compose(&mut b)?;
-            b.send()?;
-            Ok(self)
-        })
-        .await?;
-        Ok(x?)
+    pub async fn apply<S: AsyncSocket>(self, sock: &mut S) -> Result<Self> {
+        let mut b = Batch::new();
+        self.compose(&mut b, sock).await?;
+        b.send_async(sock).await?;
+        Ok(self)
     }
 }
 
@@ -314,7 +313,7 @@ pub async fn apply_block_forwad(veth_list: &[&str]) -> Result<()> {
         }],
     };
 
-    prop.apply().await?;
+    // prop.apply().await?;
 
     Ok(())
 }

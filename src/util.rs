@@ -18,26 +18,12 @@ use futures::{FutureExt, TryFutureExt};
 use nix::sys::signal::kill;
 use nix::sys::signal::Signal;
 use nix::sys::signal::Signal::SIGTERM;
-use nix::unistd::Gid;
-use nix::unistd::Pid;
-use nix::unistd::Uid;
-use pidfd::PidFd;
-use pidfd::PidFuture;
+use nix::unistd::{Gid, Pid, Uid};
+use pidfd::{PidFd, PidFuture};
 use procfs::process::Process;
 
 use tokio::io::BufStream;
-use tokio::signal::unix::SignalKind;
-use tokio::sync::mpsc;
-use tokio::sync::mpsc::unbounded_channel;
-use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::oneshot;
-use tokio::sync::oneshot::Receiver;
-use tokio::sync::Mutex;
-use tokio::task::AbortHandle;
-use tokio::task::JoinError;
-use tokio::task::JoinHandle;
-use tokio::task::JoinSet;
+use tokio::{signal::unix::SignalKind, sync::{mpsc::{self, unbounded_channel, UnboundedReceiver, UnboundedSender}, oneshot::{self, Receiver}, Mutex}, task::{AbortHandle, JoinError, JoinHandle, JoinSet}};
 
 use crate::data::FlatpakID;
 use crate::data::Pid as DPid;
@@ -316,15 +302,6 @@ pub fn kill_suspected() -> Result<()> {
     Ok(())
 }
 
-pub fn open_wo_cloexec(path: &Path) -> Result<File> {
-    use nix::fcntl::{open, OFlag};
-    use nix::sys::stat::Mode;
-    let fd = open(path, OFlag::O_RDONLY, Mode::empty())?;
-    let syncf = unsafe { File::from_raw_fd(fd) };
-
-    Ok(syncf)
-}
-
 pub mod ns {
     pub const NETNS_PATH: &str = "/run/netns/";
     use futures::TryFutureExt;
@@ -352,12 +329,6 @@ pub mod ns {
         }
     }
 
-    pub fn named_ns<N: ValidNamedNS>(ns_name: &N) -> Result<File> {
-        let mut p = PathBuf::from(NETNS_PATH);
-        p.push(&ns_name);
-        let f = open_wo_cloexec(p.as_path())?.into();
-        Ok(f)
-    }
 
     pub fn named_ns_exist<N: ValidNamedNS>(ns_name: &N) -> Result<bool> {
         let mut p = PathBuf::from(NETNS_PATH);
@@ -370,18 +341,7 @@ pub mod ns {
         Ok(r)
     }
 
-    pub async fn enter_ns_by_name<N: ValidNamedNS>(ns_name: &N) -> Result<()> {
-        let fd = named_ns(ns_name)?;
-        nix::sched::setns(fd.as_raw_fd(), CloneFlags::CLONE_NEWNET)?;
-        let got_ns = self_netns_identify().await?.ok_or_else(|| {
-            anyhow::anyhow!("failed to identify netns. no matches under the given netns directory")
-        })?;
-        let g_ns = Path::new(&got_ns.0);
-        anyhow::ensure!(g_ns == ns_name.as_ref());
-        log::info!("current ns {} (named and persistent)", got_ns.0);
 
-        Ok(())
-    }
 
     pub fn enter_ns_by_fd(ns_fd: RawFd) -> Result<()> {
         nix::sched::setns(ns_fd, CloneFlags::CLONE_NEWNET)?;
@@ -397,18 +357,6 @@ pub mod ns {
         let selfi = get_self_netns_inode()?;
         anyhow::ensure!(stat.st_ino != selfi);
         Ok(())
-    }
-
-    /// file opened w/o cloexec
-    pub fn get_ns_by_pid(pi: i32) -> Result<File> {
-        let process = procfs::process::Process::new(pi)?;
-        let o: OsString = OsString::from("net");
-        let nss = process.namespaces()?;
-        let proc_ns = nss
-            .get(&o)
-            .ok_or(anyhow!("ns/net not found for given pid"))?;
-        let r = open_wo_cloexec(&proc_ns.path)?.into();
-        Ok(r)
     }
 
     pub fn enter_ns_by_pid(pi: i32) -> Result<()> {
@@ -491,16 +439,9 @@ pub mod ns {
         }
         Ok(None) // means, "no matches under NETNS_PATH"
     }
-    /// unchecked
-    pub async fn add_netns<N: ValidNamedNS>(ns_name: &N) -> Result<()> {
-        use rtnetlink::NetworkNamespace;
-        NetworkNamespace::add(ns_name.as_ref().to_string_lossy().into_owned())
-            .await
-            .map_err(anyhow::Error::from)
-    }
+    
     use netns_rs::Env;
 
-    use super::open_wo_cloexec;
 
     pub struct NsEnv;
 
@@ -512,9 +453,6 @@ pub mod ns {
 }
 
 pub mod error {
-    use anyhow::Result;
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
     use thiserror::Error;
 
     #[derive(Error, Debug)]
@@ -793,7 +731,9 @@ pub fn branch_out() -> Result<()> {
             let fd = fd?;
             let fd: File = unsafe { File::from_raw_fd(fd) };
             let ns = NsFile(fd);
+            ns.unset_cloexec()?;
             ns.enter()?;
+            // NS must be entered before tokio starts, because setns doesn't affect existing threads
             return tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -806,7 +746,7 @@ pub fn branch_out() -> Result<()> {
 
                     let x = handle(f).await;
                     if let Err(e) = x {
-                        if let Some(x) = e.downcast_ref::<SocketEOF>() {
+                        if let Some(_) = e.downcast_ref::<SocketEOF>() {
                             if SIG_EXIT.load(Ordering::SeqCst) {
                                 // ignore
                             } else {

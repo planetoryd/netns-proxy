@@ -11,9 +11,13 @@
 #![feature(provide_any)]
 #![feature(error_generic_member_access)]
 #![feature(associated_type_defaults)]
-#![feature(min_specialization)]
 #![feature(iterator_try_collect)]
 #![feature(hash_extract_if)]
+#![feature(let_chains)]
+#![feature(impl_trait_in_assoc_type)]
+#![feature(decl_macro)]
+
+#[allow(unused_braces)]
 
 pub mod data;
 pub mod netlink;
@@ -22,6 +26,7 @@ pub mod sub;
 pub mod util;
 pub mod watcher;
 pub mod ctrl;
+pub mod state;
 
 // Standard procedure
 // Creates various netns, base-vpn, socks, i2p, lokinet, un-firewalled

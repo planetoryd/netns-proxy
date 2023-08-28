@@ -1,4 +1,8 @@
-use crate::util;
+use crate::{
+    netlink::NSCreate,
+    state::ExistenceMap,
+    util::{self, TaskCtx},
+};
 use derivative::Derivative;
 use ipnetwork::IpNetwork;
 use serde::{Deserialize, Serialize};
@@ -17,30 +21,31 @@ use tokio::{io::AsyncBufReadExt, process::Command};
 
 use crate::{
     ctrl::ToServer,
-    netlink::{ConnRef, MultiNS, VPairKey},
+    netlink::{MultiNS, NLTracked, VPairKey},
     nft,
     sub::{NsubState, ToMain, ToSub},
     util::{watch_both, TaskOutput},
 };
 use tokio::{self, io::AsyncReadExt};
 
-use anyhow::{anyhow, bail, ensure, Ok, Result};
+use anyhow::{anyhow, bail, ensure, Context, Ok, Result};
 
+use crate::netlink::nl_ctx;
 use crate::util::error::*;
 
 // generated info and state store
-#[derive(Serialize, Deserialize, Default, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct Derivative {
     // separate maps, separate indexing
     pub named_ns: HashMap<ProfileName, SubjectInfo<NamedV>>,
     pub flatpak: HashMap<Pid, SubjectInfo<FlatpakV>>,
-    pub root_ns: NSID,
+    pub root_ns: Option<NSID>,
 }
 
 #[derive(Hash)]
 pub enum SubjectKey {
     Named(ProfileName),
-    Flatpak(Pid)
+    Flatpak(Pid),
 }
 
 trait PidMap: Sized {
@@ -75,13 +80,11 @@ impl Derivative {
     }
     /// Update root_ns NSID's Pid
     pub fn update_rootns(&mut self) -> Result<()> {
-        let n = NSID::proc()?;
-        if self.root_ns.inode != 0 {
-            if n != self.root_ns {
-                bail!("Root NS mismatch. You are running this process from a different NS than what was recorded.");
-            }
+        if let Some(ns) = &self.root_ns {
+            ns.to_owned().ensure_sync().context("Root NS mismatch. You are running this process from a different NS than what was recorded.")?;
+        } else {
+            self.root_ns = Some(NSIDFrom::Root.to_id_sync(NSCreate::empty())?);
         }
-        self.root_ns = n;
         Ok(())
     }
     /// clear invalid ones
@@ -89,6 +92,7 @@ impl Derivative {
         &mut self,
         set: &HashMap<FlatpakID, ProfileName>,
         sys: &MultiNS,
+        ctx: &TaskCtx,
     ) -> Result<()> {
         let mut rm: HashMap<_, _> = self
             .flatpak
@@ -97,7 +101,7 @@ impl Derivative {
         let mut rm2 = self.flatpak.retain_running().await?;
         rm.extend(rm2.drain());
         for (_, s) in rm {
-            s.garbage_collect(sys, &self).await?;
+            s.garbage_collect(sys, &self, ctx).await?;
         }
         Ok(())
     }
@@ -105,13 +109,14 @@ impl Derivative {
         &mut self,
         conf: &HashMap<ProfileName, Arc<SubjectProfile>>,
         sys: &MultiNS,
+        ctx: &TaskCtx,
     ) -> Result<()> {
         let rm: HashMap<_, _> = self
             .named_ns
             .extract_if(|e, _| !conf.contains_key(e))
             .collect();
         for (_, s) in rm {
-            s.garbage_collect(sys, &self).await?;
+            s.garbage_collect(sys, &self, ctx).await?;
         }
         Ok(())
     }
@@ -119,7 +124,7 @@ impl Derivative {
     pub async fn update_nsid(&mut self) -> Result<()> {
         // This should be the only place where NSID exist in derivative
         for (_n, s) in self.named_ns.iter_mut() {
-            s.ns.may_create().await?;
+            s.ns.ensure().await?;
         }
 
         Ok(())
@@ -135,6 +140,13 @@ pub struct Settings {
 #[derive(Serialize, Deserialize, Default, Clone, Debug, Hash, PartialEq, Eq)]
 #[serde(transparent)]
 pub struct ProfileName(pub String);
+
+impl ProfileName {
+    pub fn ns_path(self) -> PathBuf {
+        use rtnetlink::NetworkNamespace;
+        NetworkNamespace::path_of(self.0)
+    }
+}
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, Hash, PartialEq, Eq)]
 #[serde(transparent)]
@@ -162,7 +174,7 @@ pub struct NetnspState {
     pub paths: Arc<ConfPaths>,
     pub nft_refresh_once: bool,
     pub ids: BinaryHeap<UniqueInstance>,
-    pub incre_nft: nft::IncrementalNft,
+    pub nft: nft::IncrementalNft,
 }
 
 pub trait UnIns {
@@ -357,42 +369,45 @@ pub struct SubjectInfo<V: VSpecifics> {
     /// socks5 proxy
     #[serde(default)]
     pub tun2socks: Option<SocketAddr>, // ip without CIDR
-    /// Daemons running
-    pub up: bool,
+}
+
+impl NSID {
+    pub async fn connect(&mut self, mn: &MultiNS) -> Result<()> {
+        log::debug!("Connect NS for subject {}", self);
+        self.ensure().await?;
+        let n = mn.get_nl(self.clone()).await?;
+        let nl = NLTracked::new(Arc::new(n));
+        let ns = nl.to_netns(self.clone()).await?;
+        mn.ns.write().await.insert(self.clone(), ns.into());
+        Ok(())
+    }
 }
 
 impl<V: VSpecifics> SubjectInfo<V> {
-    /// get or create a subprocess, and get the Netns instance
-    pub async fn connect(&self, mn: &MultiNS) -> Result<()> {
-        log::debug!("Connect NS for subject {}", self.ns);
-        let n = mn.get_nl(self.ns.clone()).await?;
-        let nl = ConnRef::new(Arc::new(n));
-        let ns = nl.to_netns(self.ns.clone()).await?;
-        mn.ns.write().await.insert(self.ns.clone(), ns.into());
-        Ok(())
-    }
     /// Completely GC the subject
-    pub async fn garbage_collect(&self, sys: &MultiNS, de: &Derivative) -> Result<()> {
+    pub async fn garbage_collect(
+        &self,
+        sys: &MultiNS,
+        de: &Derivative,
+        ctx: &TaskCtx,
+    ) -> Result<()> {
         log::info!("GC subject {}", self.ns);
-        if self.up {
 
-        }
+        ctx.pid.send(util::PidOp::Kill(self.ns.clone())).unwrap();
         let map = sys.ns.write().await;
         for (r, c) in &self.vaddrs {
             let re = r.resolve_derivative(de).await?;
             let mut n = map.get(&re).unwrap().write().await;
             let lk = c.key.link(crate::netlink::LinkAB::B);
-            if n.netlink.links.contains_key(&lk) {
+            if nl_ctx!(link, _conn, n.netlink, { matches!(link.g(&lk), Some(_)) }) {
                 n.netlink.remove_link(&lk).await?;
             }
         }
-        if let Some(n) = self.ns.name.clone() {
-            let _ = NSID::del(n).await;
-        }
+        self.ns.remove_if_duty()?;
         Ok(())
     }
     pub fn assure_in_ns(&self) -> Result<()> {
-        let c = NSID::proc()?;
+        let c = NSIDFrom::Thread.to_id_sync(NSCreate::empty())?;
         anyhow::ensure!(c == self.ns);
         Ok(())
     }
@@ -414,7 +429,10 @@ impl<V: VSpecifics> SubjectInfo<V> {
             tun2_async.stdout(Stdio::piped());
             let mut tun2h = tun2_async.spawn()?;
             let pid = Pid(tun2h.id().ok_or(anyhow!("Tun2socks stopped"))?);
-            st.ctx.pid.send(util::PidOp::Add(self.ns.clone(), pid)).unwrap();
+            st.ctx
+                .pid
+                .send(util::PidOp::Add(self.ns.clone(), pid))
+                .unwrap();
             use tokio_stream::wrappers::LinesStream;
             let stdout = tun2h.stdout.take().unwrap();
             let reader = LinesStream::new(tokio::io::BufReader::new(stdout).lines());
@@ -423,21 +441,22 @@ impl<V: VSpecifics> SubjectInfo<V> {
             tokio::spawn(watch_log(Box::pin(reader), Some(tx), pre.clone()));
             rx.await?; // wait for first line to appear
             let tunk: LinkKey = TUN_NAME.parse()?;
-            let tun = st.ns.netlink.links.get_mut(&tunk).ok_or(DevianceError)?;
-            tun.up(st.ns.netlink.conn.get()).await?;
-            let _ = st
+            let tun = {
+                nl_ctx!(link, conn, st.ns.netlink, {
+                    let tun = link.not_absent(&tunk)?.exist_mut()?;
+                    conn.set_up(tun).await?;
+                    tun.index
+                })
+            };
+            _ = st
                 .ns
                 .netlink
-                .conn
-                .get()
-                .ip_add_route(tun.index, None, Some(true))
+                .ip_add_route(tun, None, Some(true), RouteFor::TUNIpv4)
                 .await;
-            let _ = st
+            _ = st
                 .ns
                 .netlink
-                .conn
-                .get()
-                .ip_add_route(tun.index, None, Some(false))
+                .ip_add_route(tun, None, Some(false), RouteFor::TUNIpv6)
                 .await;
 
             let (t, _r) =
@@ -466,7 +485,10 @@ impl<V: VSpecifics> SubjectInfo<V> {
                 dnsp_a.stderr(Stdio::piped());
                 let mut dns_h = dnsp_a.spawn()?;
                 let pid = Pid(dns_h.id().ok_or(anyhow!("Dnsproxy stopped"))?);
-                st.ctx.pid.send(util::PidOp::Add(self.ns.clone(), pid)).unwrap();
+                st.ctx
+                    .pid
+                    .send(util::PidOp::Add(self.ns.clone(), pid))
+                    .unwrap();
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 let pre = format!("{}/dnsproxy", self.id);
                 watch_both(&mut dns_h, pre.clone(), Some(tx))?;
@@ -584,12 +606,12 @@ pub trait ResolvableS<V: VSpecifics, D> {
 impl NSRef {
     pub async fn resolve_derivative<'a>(&'a self, de: &'a Derivative) -> Result<NSID> {
         match self {
-            Self::Root => Ok(de.root_ns.to_owned()),
+            Self::Root => Ok(de.root_ns.as_ref().unwrap().to_owned()),
             Self::Pid(p) => {
                 let x = if let Some(k) = de.flatpak.get(p) {
                     k.ns.clone()
                 } else {
-                    NSID::from_pid(p.clone())?
+                    NSIDFrom::Pid(p.clone()).to_id(NSCreate::empty()).await?
                 };
                 Ok(x)
             }
@@ -597,7 +619,7 @@ impl NSRef {
                 let x = if let Some(k) = de.named_ns.get(n) {
                     k.ns.clone()
                 } else {
-                    NSID::from_name(n.to_owned()).await?
+                    NSIDFrom::Named(n.clone()).to_id(NSCreate::Named).await?
                 };
                 Ok(x)
             }
@@ -764,7 +786,6 @@ impl<V: VSpecifics> ResolvableG<V, SubjectInfo<V>> for Arc<SubjectProfile> {
                 .to_owned(),
             dnsproxy: self.dnsproxy.resolve_global(global, uq, v).await?,
             tun2socks: None,
-            up: false,
         };
         for vc in self.vconns.iter() {
             let v1 = vc.resolve_subject(&s)?;
@@ -776,23 +797,41 @@ impl<V: VSpecifics> ResolvableG<V, SubjectInfo<V>> for Arc<SubjectProfile> {
     }
 }
 
-#[derive(Derivative, Default, Serialize, Deserialize, Debug, Clone)]
+#[derive(Derivative, Serialize, Deserialize, Debug, Clone)]
 #[serde_with::skip_serializing_none]
 #[derivative(Hash, PartialEq, Eq)]
 pub struct NSID {
+    /// Only Inode is used as key
     pub inode: u64,
     #[derivative(Hash = "ignore")]
     #[derivative(PartialEq = "ignore")]
+    pub from: NSIDFrom,
+    /// Inode match with the from, and NS exists
+    /// It may be thread/process-dependent
+    #[serde(skip_serializing)]
     #[serde(default)]
-    pub pid: Option<Pid>,
     #[derivative(Hash = "ignore")]
     #[derivative(PartialEq = "ignore")]
+    pub validated: bool,
+    /// Cached path, only valid when validated
+    #[serde(skip_serializing)]
     #[serde(default)]
-    pub name: Option<ProfileName>,
     #[derivative(Hash = "ignore")]
     #[derivative(PartialEq = "ignore")]
-    #[serde(default)]
     pub path: Option<PathBuf>,
+}
+
+#[derive(Derivative, Serialize, Deserialize, Clone)]
+#[derivative(Debug)]
+pub enum NSIDFrom {
+    #[derivative(Debug="transparent")]
+    Named(ProfileName),
+    #[derivative(Debug="transparent")]
+    Pid(Pid),
+    #[derivative(Debug="transparent")]
+    Path(PathBuf),
+    Root,
+    Thread,
 }
 
 // bincode can not handle #[serde_with::skip_serializing_none]
@@ -802,7 +841,7 @@ pub struct NSID {
 /// 2. should support skip_serializing
 #[test]
 fn test_serde_state() -> Result<()> {
-    let ns = NSID::default();
+    let ns = NSIDFrom::Thread.to_id_sync(NSCreate::empty())?;
 
     let ser: Vec<u8> = util::to_vec_internal(&ns)?;
     let de: NSID = util::from_vec_internal(&ser)?;
@@ -823,15 +862,7 @@ fn test_serde_state() -> Result<()> {
 
 impl Display for NSID {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(ref name) = self.name {
-            f.write_fmt(format_args!("(NS {}, Inode {})", name.0, self.inode))
-        } else if let Some(ref p) = self.pid {
-            f.write_fmt(format_args!("(NS of PID {}, Inode {})", p.0, self.inode))
-        } else if let Some(ref p) = self.path {
-            f.write_fmt(format_args!("(NS {:?}, Inode {})", p, self.inode))
-        } else {
-            f.write_fmt(format_args!("(NS with inode {})", self.inode))
-        }
+        f.write_fmt(format_args!("[NS{}-{:?}]", self.inode, self.from))
     }
 }
 
@@ -908,7 +939,7 @@ mod presets {
     #[test]
     fn derivative_for_pass() -> Result<()> {
         let mut de = Derivative::default();
-        de.root_ns = NSID::proc()?;
+        de.root_ns = NSIDFrom::Root.to_id_sync(NSCreate::empty())?.into();
         let se = serde_json::to_string_pretty(&de)?;
         let mut ro: PathBuf = env!("CARGO_MANIFEST_DIR").parse()?;
         ro.push("testing/pass.json");

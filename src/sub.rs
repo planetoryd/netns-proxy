@@ -1,3 +1,4 @@
+use crate::netlink::nl_ctx;
 use crate::util;
 use anyhow::Result;
 use bytes::Bytes;
@@ -5,6 +6,7 @@ use dashmap::mapref::one::{Ref, RefMut};
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt, TryFutureExt};
 use rtnetlink::netlink_proto::new_connection_with_socket;
+use rtnetlink::netlink_sys::{AsyncSocket, TokioSocket};
 use rtnetlink::Handle;
 use serde::{Deserialize, Serialize};
 
@@ -41,7 +43,8 @@ use tokio_util::codec::Framed;
 // I briefly tried to proxy the netink socket. It feels like too much trouble.
 // And the kernel could do it without needless proxying
 
-use rtnetlink::proxy::{self, ProxySocketType};
+use crate::state::*;
+use rtnetlink::proxy;
 
 impl SubjectInfo<NamedV> {
     pub async fn run(&mut self, sub: &SubHub) -> Result<()> {
@@ -112,7 +115,7 @@ impl SubHub {
         let subs = Arc::new(DashMap::new());
         let sock = UnixListener::bind(sock_rpc.as_path())?;
         let sub_m = subs.clone();
-        let (sx, mut rx) = mpsc::unbounded_channel::<(NSID, oneshot::Sender<()>)>();
+        let (queue, mut rx) = mpsc::unbounded_channel::<(NSID, oneshot::Sender<()>)>();
         let sockr = sock_rpc.clone();
         let task = async move {
             let mut to_abort = Vec::new();
@@ -170,30 +173,29 @@ impl SubHub {
         Ok(Self {
             sock_path: sock_rpc,
             subs,
-            queue: sx,
+            queue,
             ctx,
         })
     }
-    /// start a new sub
-    /// new sub for each ns
-    fn new_sub(&self, fd: RawFd, id: NSID) -> Result<()> {
+    /// Starts the child process
+    fn run(&self, fd: RawFd, id: NSID) -> Result<()> {
         let sp = self.sock_path.as_path().to_owned();
 
         let sx = self.ctx.pid.clone();
+        let e = std::env::current_exe()?;
+        log::trace!("self exe {:?}", &e);
+        let mut cmd: tokio::process::Child = Command::new(e)
+            .arg("sub")
+            .arg(sp)
+            .arg(fd.to_string())
+            .uid(0) // run it as root
+            .spawn()?;
 
-        // TODO: logic for watching this process
+        let pid = cmd.id().unwrap();
+        log::debug!("Subprocess started {}", pid);
+        sx.send(util::PidOp::Add(id, Pid(pid))).unwrap();
+
         let h = async move {
-            let e = std::env::current_exe()?;
-            log::trace!("self exe {:?}", &e);
-            let mut cmd: tokio::process::Child = Command::new(e)
-                .arg("sub")
-                .arg(sp)
-                .arg(fd.to_string())
-                .uid(0) // run it as root
-                .spawn()?;
-            let pid = cmd.id().unwrap();
-            log::debug!("Subprocess started {}", pid);
-            sx.send(util::PidOp::Add(id, Pid(pid))).unwrap();
             let e = cmd.wait().await?;
             log::warn!("Subprocess exited {}, {}", e, pid);
             Ok(())
@@ -207,10 +209,13 @@ impl SubHub {
         let r = match self.subs.get_mut(&id) {
             None => {
                 log::trace!("create new rpc-sub");
-                let nf = id.open_wo_close()?;
+                let nf = id.open().await?;
                 let (sx, rx) = oneshot::channel::<()>();
                 self.queue.send((id.clone(), sx)).unwrap();
-                self.new_sub(nf.0.as_raw_fd(), id.clone())?;
+                // There is a brief period of time. Fork + execve can give a child process the NS fd
+                nf.unset_cloexec()?;
+                self.run(nf.0.as_raw_fd(), id.clone())?;
+                drop(nf);
                 rx.await?;
                 log::trace!("rpc-sub received");
                 (
@@ -286,16 +291,9 @@ pub async fn handle(mut f: Framed<UnixStream, LengthDelimitedCodec>) -> Result<(
     let p = next(&mut f, None, true).await?;
     match p {
         ToSub::Init(path, u, g, subject_ns) => {
-            let (t, _r) = TaskOutput::immediately(
-                Box::pin(async move {
-                    proxy::proxy::<{ ProxySocketType::PollRecvFrom }>(path.sock4proxy()).await
-                }),
-                "proxy-server".to_owned(),
-            );
-            dae.sender.send(t).unwrap();
-
+            proxy::proxy(path.sock4netlink(), None).await?;
             let mut st = NsubState {
-                ns: Netns::proc_current().await?,
+                ns: Netns::thread().await?,
                 ctx: TaskCtx {
                     dae: dae.sender,
                     pid: sx,
@@ -304,24 +302,15 @@ pub async fn handle(mut f: Framed<UnixStream, LengthDelimitedCodec>) -> Result<(
                 non_priv_gid: g,
             };
 
-            let fds: DashMap<NSID, NsFile<std::fs::File>> = DashMap::new();
-
             loop {
                 let p = next(&mut f, Some(&subject_ns), true).await?;
+                let mut nft = TokioSocket::new(rtnetlink::netlink_sys::constants::NETLINK_NETFILTER)?;
                 match p {
                     ToSub::Named(info) => {
-                        in_ns_task(info, &mut st, &subject_ns).await?;
+                        ns_task(info, &mut st, &subject_ns, &mut nft).await?;
                     }
                     ToSub::Flatpak(info) => {
-                        in_ns_task(info, &mut st, &subject_ns).await?;
-                    }
-                    ToSub::Open(id) => {
-                        log::trace!("Sub of {} opens ns {:?}", &subject_ns, id);
-                        if !fds.contains_key(&id) {
-                            let op: NsFile<std::fs::File> = id.open_sync()?;
-                            fds.insert(id.clone(), op);
-                        }
-                        send(&mut f, &ToMain::FD(fds.get(&id).unwrap().0.as_raw_fd())).await?;
+                        ns_task(info, &mut st, &subject_ns, &mut nft).await?;
                     }
                     _ => {
                         unimplemented!()
@@ -335,10 +324,11 @@ pub async fn handle(mut f: Framed<UnixStream, LengthDelimitedCodec>) -> Result<(
     Ok(())
 }
 
-async fn in_ns_task<V: VSpecifics>(
+async fn ns_task<V: VSpecifics>(
     info: SubjectInfo<V>,
     st: &mut NsubState,
     subject_ns: &NSID,
+    sock: &mut impl AsyncSocket,
 ) -> Result<()> {
     {
         let tun = tidy_tuntap::Tun::new(TUN_NAME, false)?;
@@ -358,11 +348,20 @@ async fn in_ns_task<V: VSpecifics>(
         tun_ops(tun)?;
     }
     let lo_k = &"lo".parse()?;
-    let lo = st.ns.netlink.links.get_mut(lo_k).ok_or(DevianceError)?;
-    lo.up(st.ns.netlink.conn.get()).await?;
+
+    nl_ctx!(link, conn, st.ns.netlink, {
+        let lo = link.not_absent(lo_k)?.exist_mut()?;
+        conn.set_up(lo).await?;
+    });
     st.ns.refresh().await?;
-    assert!(st.ns.netlink.links.get(lo_k).ok_or(DevianceError)?.up);
-    info.apply_nft_dns().await?;
+    nl_ctx!(link, _conn, st.ns.netlink, {
+        assert!(matches!(
+            link.not_absent(lo_k)?.exist_ref()?.up,
+            Exp::Confirmed(true)
+        ));
+    });
+
+    info.apply_nft_dns(sock).await?;
     info.run_tun2s(st).await?;
     info.run_dnsp(st).await?;
     Ok(())

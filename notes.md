@@ -1,3 +1,5 @@
+# unstructured whims
+
 
 - Package for Nix
 - Handle DNS better. 
@@ -91,6 +93,8 @@ Yggdrasil should not expose an IP interface (TUN). It should just expose a unix 
 - check all sockets have root perms
     - root owned sockets can only be connected by root procs
 
+instead of tun2socks+dnsproxy, I should use tun2proxy which resolves domains to fake IPs and they are handled by our TUN. alternatively use some LD_PRELOAD magic to hook functions.
+
 ## Conception
 
 - `Settings` is the seed configuration, which contains all user input ever needed. 
@@ -143,3 +147,63 @@ When deriving, resolution happens recursively. It may draw any from the global s
 - Settings covers the significant details.
 
 Profile + Runtime/Instance-specific-info = Derivation
+
+### Recorded inode in state file
+
+On start of each main_task, NSIDs should be checked that, their paths and inodes match. 
+
+- If paths exist, and inodes mismatch, derivatives are rejected, GCed.
+- If paths pointed files do not exist, they are created and derivatives are reused.
+
+It's always safe to create new empty NSes and instrument them. And the program should error less.
+
+---
+
+```rust
+impl<V: VSpecifics> SubjectInfo<V> {
+    /// places the veth and adds addrs. generic over V
+    pub async fn apply_veths(
+```
+
+Sometimes changes to netlink do not take effect immediate, resulting in problems.
+
+
+---
+
+The work will be similar to Sagernet/Singbox, but I will have an emphasis on security and anonymity
+
+Any domain name -> Virtual IP -> Any byte stream transport
+
+- Cross-NS fd passing. Proxied socket opening.
+- Transports
+    - Lokinet, Tor, I2P, Nym
+- Transport interface
+    - Socket FD
+    - UDP/TCP socket
+    - Socks5 (easily extensible, but more copying)
+
+Or, no, just fork singbox
+
+
+https://github.com/keith-packard/fdpassing
+
+> The sender constructs a mystic-looking sendmsg(2) call, placing the file descriptor in the control field of that operation. The kernel pulls the file descriptor out of the control field, allocates a file descriptor in the target process which references the same file object and then sticks the file descriptor in a queue for the receiving process to fetch. The receiver then constructs a matching call to recvmsg that provides a place for the kernel to stick the new file descriptor.
+
+
+### NSID
+
+- User configures an NS to have some config, `NSIDFrom::Named(some_ns)`.
+- Derived and inode stored.
+- Changes happen
+- Restart daemon, Inode mismatch
+
+Security should be based on intention. 
+
+- The user may intend to use the new named ns
+    - usually happens afte a reboot
+    - creating a new ns is always safe
+- The user may intend to restore network connection as it was. 
+    
+If it exists and inode mismatch, it may be created by `ip netns`, or some other tool.
+
+The NSIDFrom is always considered the intention, as it is the source. 
