@@ -1,4 +1,4 @@
-# Containerized solution to network proxying
+# Containerized OPSEC networking for Desktop
 
 `nsproxy` is a single binary that can run as a SUID daemon, or to control the daemon, along with some netns related utilities. 
 

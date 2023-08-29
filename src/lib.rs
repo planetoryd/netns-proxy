@@ -5,7 +5,6 @@
 #![feature(exit_status_error)]
 #![feature(setgroups)]
 #![feature(get_mut_unchecked)]
-#![feature(adt_const_params)]
 #![feature(assert_matches)]
 #![feature(generators, generator_trait)]
 #![feature(provide_any)]

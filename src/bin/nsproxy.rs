@@ -1,7 +1,11 @@
 #![feature(setgroups)]
+#![feature(decl_macro)]
+#![feature(associated_type_bounds)]
+
 use anyhow::{anyhow, bail, ensure, Ok, Result};
 use clap::{Parser, Subcommand};
 
+use futures::Future;
 use netns_proxy::ctrl::{ToClient, ToServer};
 use netns_proxy::util::branch_out;
 use netns_proxy::util::ns::self_netns_identify;
@@ -87,17 +91,13 @@ fn main() -> Result<()> {
             netns_proxy::util::kill_suspected()?;
         }
         Some(Commands::Id {}) => {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async move {
-                    let got_ns = self_netns_identify()
-                        .await?
-                        .ok_or_else(|| anyhow!("No matches under the given netns directory. It means it's not a persistent, named NS. "))?;
-                    println!("{:?}", got_ns);
-                    Ok(())
-                })?;
+            async_run(async move {
+                let got_ns = self_netns_identify()
+                    .await?
+                    .ok_or_else(|| anyhow!("No matches under the given netns directory. It means it's not a persistent, named NS. "))?;
+                println!("{:?}", got_ns);
+                Ok(())
+            });
         }
         Some(Commands::Exec {
             mut cmd,
@@ -110,7 +110,13 @@ fn main() -> Result<()> {
             let state = NetnspState::load_sync(Arc::new(ConfPaths::default()?))?;
             let current_ns = NSIDFrom::Thread.to_id_sync(NSCreate::empty())?;
             let (u, g) = get_non_priv_user(None, None, None, None)?;
-            if &current_ns != state.derivative.root_ns.as_ref().ok_or(anyhow!("No root_ns specified in derived file"))? {
+            if &current_ns
+                != state
+                    .derivative
+                    .root_ns
+                    .as_ref()
+                    .ok_or(anyhow!("No root_ns specified in derived file"))?
+            {
                 log::error!("Access denied. It's not allowed to exec from a non-root NS which is specified in the state file.");
                 log::info!(
                     "current {:?}, saved {:?}",
@@ -146,84 +152,73 @@ fn main() -> Result<()> {
                 drop_privs_id(nix::unistd::Gid::from_raw(u), nix::unistd::Uid::from_raw(g))?;
             }
             // Netns must be entered before the mess of multi threading
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async move {
-                    if dbg {
-                        let ns = Netns::thread().await?;
-                        dbg!(&ns.netlink);
-                        let k = netns_proxy::nft::print_all().await;
-                        if k.is_err() {
-                            log::error!("{:?}", k);
-                            if euid != 0.into() {
-                                log::warn!("You are not running as root. ");
-                            }
+            async_run(async move {
+                if dbg {
+                    let ns = Netns::thread().await?;
+                    dbg!(&ns.netlink);
+                    let k = netns_proxy::nft::print_all().await;
+                    if k.is_err() {
+                        log::error!("{:?}", k);
+                        if euid != 0.into() {
+                            log::warn!("You are not running as root. ");
                         }
-                    } else {
-                        let proc = std::process::Command::new(cmd.unwrap());
-                        let mut cmd_async: Command = proc.into();
-                        let mut t = cmd_async.spawn()?;
-                        t.wait().await?;
                     }
-                    Ok(())
-                })?;
+                } else {
+                    let proc = std::process::Command::new(cmd.unwrap());
+                    let mut cmd_async: Command = proc.into();
+                    let mut t = cmd_async.spawn()?;
+                    t.wait().await?;
+                }
+                Ok(())
+            });
         }
         Some(Commands::Reload) => {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async move {
-                    let p = ConfPaths::default()?;
-                    let p2 = p.sock4ctrl();
-                    log::warn!("Config will not take effect if there is a corresponding entry in the derivative/state file");
-                    let mut client = netns_proxy::ctrl::Client::new(p2.as_path()).await?;
-                    log::info!("connected");
-                    let res = client.req(ToServer::ReloadConfig).await?;
-                    ensure!(res == ToClient::ConfigReloaded);
-                    log::info!("reloaded");
-                    Ok(())
-                })?;
+            async_run(async move {
+                let p = ConfPaths::default()?;
+                let p2 = p.sock4ctrl();
+                log::warn!("Config will not take effect if there is a corresponding entry in the derivative/state file");
+                let mut client = netns_proxy::ctrl::Client::new(p2.as_path()).await?;
+                log::info!("connected");
+                let res = client.req(ToServer::ReloadConfig).await?;
+                ensure!(res == ToClient::ConfigReloaded);
+                log::info!("reloaded");
+                Ok(())
+            });
         }
         Some(Commands::GC { ns }) => {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async move {
-                    let p = ConfPaths::default()?;
-                    let p2 = p.sock4ctrl();
-                    let mut client = netns_proxy::ctrl::Client::new(p2.as_path()).await?;
-                    log::info!("connected");
-                    let res = client.req(ToServer::GC(ProfileName(ns))).await?;
-                    ensure!(res == ToClient::GCed);
-                    log::info!("cleaned");
-                    Ok(())
-                })?;
+            async_run(async move {
+                let p = ConfPaths::default()?;
+                let p2 = p.sock4ctrl();
+                let mut client = netns_proxy::ctrl::Client::new(p2.as_path()).await?;
+                log::info!("connected");
+                let res = client.req(ToServer::GC(ProfileName(ns))).await?;
+                ensure!(res == ToClient::GCed);
+                log::info!("cleaned");
+                Ok(())
+            });
         }
         None => {
             if cli.ctl {
                 bail!("a command is required.");
             }
-            let k = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async move {
-                    let paths = Arc::new(ConfPaths::default()?);
-                    // Paths shall not be changed, even across reloads
-                    let server = netns_proxy::ctrl::Server;
-                    server.serve(paths.clone()).await?;
-                    Ok(())
-                });
-            // must manually print it or something wont be displayed
-            println!("Main-process Errored, {:?}", k);
+            async_run(async move {
+                let paths = Arc::new(ConfPaths::default()?);
+                // Paths shall not be changed, even across reloads
+                let server = netns_proxy::ctrl::Server;
+                server.serve(paths.clone()).await?;
+                Ok(())
+            });
         }
     }
 
-
-
     Ok(())
+}
+
+fn async_run(f: impl Future<Output: std::fmt::Debug>) {
+    let k = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(f);
+    println!("Top-process Errored, {:?}", k);
 }

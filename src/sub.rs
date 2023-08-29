@@ -10,6 +10,7 @@ use rtnetlink::netlink_sys::{AsyncSocket, TokioSocket};
 use rtnetlink::Handle;
 use serde::{Deserialize, Serialize};
 
+use smoltcp::phy::{Medium, TunTapInterface};
 use tidy_tuntap::flags;
 use tokio::fs::remove_file;
 
@@ -240,6 +241,8 @@ pub enum ToSub {
     Flatpak(SubjectInfo<FlatpakV>),
     Named(SubjectInfo<NamedV>),
     Open(NSID),
+    TUN(String),
+    TAP(String)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -291,6 +294,7 @@ pub async fn handle(mut f: Framed<UnixStream, LengthDelimitedCodec>) -> Result<(
     let p = next(&mut f, None, true).await?;
     match p {
         ToSub::Init(path, u, g, subject_ns) => {
+            // Sends a netlink socket to the main process
             proxy::proxy(path.sock4netlink(), None).await?;
             let mut st = NsubState {
                 ns: Netns::thread().await?,
@@ -311,6 +315,10 @@ pub async fn handle(mut f: Framed<UnixStream, LengthDelimitedCodec>) -> Result<(
                     }
                     ToSub::Flatpak(info) => {
                         ns_task(info, &mut st, &subject_ns, &mut nft).await?;
+                    }
+                    ToSub::TUN(name) => {
+                        let tt = TunTapInterface::new(&name, Medium::Ip)?;
+                        
                     }
                     _ => {
                         unimplemented!()

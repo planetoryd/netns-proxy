@@ -7,6 +7,8 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use rtnetlink::netlink_sys::protocols::NETLINK_NETFILTER;
+use rtnetlink::netlink_sys::{AsyncSocket, TokioSocket};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::{
@@ -206,6 +208,7 @@ async fn main_task(
     };
 
     let mn: MultiNS = MultiNS::new(paths, ctx.clone()).await?;
+    let mut nl_socket = TokioSocket::new(NETLINK_NETFILTER)?;
     mn.init_current().await?;
     state.derivative.update_nsid().await?;
     state.derive_named_all().await?;
@@ -213,7 +216,7 @@ async fn main_task(
     // All named are derived and NSes are present.
     state.flatpak_ensure()?;
 
-    state.resume(&mn, ctx.clone()).await?;
+    state.resume(&mn, ctx.clone(), &mut nl_socket).await?;
     state.dump().await?;
 
     let (sx, rx) = unbounded_channel();
@@ -233,7 +236,7 @@ async fn main_task(
     ctx.dae.send(t).unwrap();
 
     let (t, _) = TaskOutput::immediately(
-        Box::pin(event_handler(rx, state, mn, sxx, ctx.clone())),
+        Box::pin(event_handler(rx, state, mn, sxx, ctx.clone(), nl_socket)),
         "event-handler".to_owned(),
     );
     ctx.dae.send(t).unwrap();
@@ -247,16 +250,21 @@ async fn main_task(
 async fn event_handler(
     mut rx: UnboundedReceiver<MainEvent>,
     mut state: NetnspState,
-    mut mn: MultiNS,
+    mn: MultiNS,
     sx: UnboundedSender<MainEvent>,
     ctx: TaskCtx,
+    mut sock: impl AsyncSocket + Send + Sync
 ) -> Result<()> {
     while let Some(ev) = rx.recv().await {
         match ev {
             MainEvent::Flatpak(fp) => {
                 match state.derive_flatpak(fp.clone()).await? {
                     DeriveRes::New => {
-                        let inf = state.derivative.flatpak.get_mut(&fp.pid).ok_or(DevianceError)?;
+                        let inf = state
+                            .derivative
+                            .flatpak
+                            .get_mut(&fp.pid)
+                            .ok_or(DevianceError)?;
                         let pf = PidAwaiter::wait(fp.pid);
                         if let Some(pf) = pf {
                             let s2 = sx.clone();
@@ -275,7 +283,7 @@ async fn event_handler(
                             let inf = state.derivative.flatpak.get(&fp.pid).ok_or(DevianceError)?;
                             inf.apply_veths(&mn, &state.derivative, &mut state.nft)
                                 .await?;
-                            state.nft.execute()?;
+                            state.nft.execute(&mut sock).await?;
                             state.dump().await?;
 
                             let inf = state.derivative.flatpak.get_mut(&fp.pid).unwrap();

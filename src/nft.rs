@@ -294,7 +294,7 @@ fn test_dns_prop() {
     dbg!(p);
 }
 
-pub async fn apply_block_forwad(veth_list: &[&str]) -> Result<()> {
+pub async fn apply_block_forwad(veth_list: &[&str], sock: &mut impl AsyncSocket) -> Result<()> {
     let table = Table::new(ProtocolFamily::Inet).with_name(TABLE_NAME.to_owned());
     let chain = Chain::new(&table)
         .with_name(FO_CHAIN)
@@ -313,7 +313,7 @@ pub async fn apply_block_forwad(veth_list: &[&str]) -> Result<()> {
         }],
     };
 
-    // prop.apply().await?;
+    prop.apply(sock).await?;
 
     Ok(())
 }
@@ -353,7 +353,7 @@ impl IncrementalNft {
         self.links.push(index);
     }
     // TODO: blocking socket
-    pub fn execute(&mut self) -> Result<()> {
+    pub async fn execute(&mut self, sock: &mut impl AsyncSocket) -> Result<()> {
         let table = Table::new(ProtocolFamily::Inet).with_name(TABLE_NAME.to_owned());
         let chain = Chain::new(&table)
             .with_hook(Hook::new(HookClass::Forward, 0))
@@ -364,7 +364,7 @@ impl IncrementalNft {
             let rule = drop_interface_rule_index(*index, &chain)?;
             batch.add(&rule, MsgType::Add);
         }
-        batch.send()?;
+        batch.send_async(sock).await?;
         self.links.clear();
 
         Ok(())

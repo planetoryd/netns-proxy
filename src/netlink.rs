@@ -99,7 +99,7 @@ impl NetnspState {
     }
     // do a full sync of firewall intention
     /// Caveat, do this before applying other nft
-    pub async fn initial_nft(&mut self) -> Result<()> {
+    pub async fn initial_nft(&mut self, sock: &mut impl AsyncSocket) -> Result<()> {
         let inames = self.pers_links_in_root().await?;
         let inames = inames.into_iter().map(|s| s.0).collect::<Vec<_>>();
         let x = convert_strings_to_strs(&inames);
@@ -107,7 +107,7 @@ impl NetnspState {
             "Apply nftables rules to block forwarding of {:?} in root_ns",
             &x
         );
-        nft::apply_block_forwad(&x).await?;
+        nft::apply_block_forwad(&x, sock).await?;
         // added the tables and chains
         self.nft_refresh_once = true;
         // after that only individual rules need to be added for each flatpak
@@ -262,7 +262,7 @@ impl NetnspState {
         Ok(())
     }
     /// Also, resume from persisted state
-    pub async fn resume(&mut self, mn: &MultiNS, ctx: TaskCtx) -> Result<()> {
+    pub async fn resume(&mut self, mn: &MultiNS, ctx: TaskCtx, sock: &mut impl AsyncSocket) -> Result<()> {
         // Some derivative do not have associated profiles
         // This is invalid, because the information is incomplete for configuration.
         self.derivative
@@ -283,7 +283,7 @@ impl NetnspState {
             info.apply_veths(&mn, &self.derivative, &mut self.nft)
                 .await?;
         }
-        self.initial_nft().await?;
+        self.initial_nft(sock).await?;
 
         // started after nft applied
         for (_, info) in &mut self.derivative.named_ns {
@@ -300,7 +300,7 @@ impl NetnspState {
             info.apply_veths(&mn, &self.derivative, &mut self.nft)
                 .await?;
         }
-        self.nft.execute()?;
+        self.nft.execute(sock).await?;
         // Config all first
         for (_n, info) in &mut self.derivative.flatpak {
             info.run(&mn.procs).await?;
@@ -327,7 +327,7 @@ pub enum DeriveRes {
 
 use futures::stream::TryStreamExt;
 use rtnetlink::netlink_packet_route::{
-    nlas::link::State, rtnl::link::LinkMessage, AddressMessage, IFF_UP,
+    rtnl::link::LinkMessage, AddressMessage, IFF_UP,
 };
 use rtnetlink::{Handle, NetworkNamespace};
 

@@ -23,7 +23,15 @@ use pidfd::{PidFd, PidFuture};
 use procfs::process::Process;
 
 use tokio::io::BufStream;
-use tokio::{signal::unix::SignalKind, sync::{mpsc::{self, unbounded_channel, UnboundedReceiver, UnboundedSender}, oneshot::{self, Receiver}, Mutex}, task::{AbortHandle, JoinError, JoinHandle, JoinSet}};
+use tokio::{
+    signal::unix::SignalKind,
+    sync::{
+        mpsc::{self, unbounded_channel, UnboundedReceiver, UnboundedSender},
+        oneshot::{self, Receiver},
+        Mutex,
+    },
+    task::{AbortHandle, JoinError, JoinHandle, JoinSet},
+};
 
 use crate::data::FlatpakID;
 use crate::data::Pid as DPid;
@@ -329,7 +337,6 @@ pub mod ns {
         }
     }
 
-
     pub fn named_ns_exist<N: ValidNamedNS>(ns_name: &N) -> Result<bool> {
         let mut p = PathBuf::from(NETNS_PATH);
         p.push(ns_name);
@@ -340,8 +347,6 @@ pub mod ns {
         }
         Ok(r)
     }
-
-
 
     pub fn enter_ns_by_fd(ns_fd: RawFd) -> Result<()> {
         nix::sched::setns(ns_fd, CloneFlags::CLONE_NEWNET)?;
@@ -439,9 +444,8 @@ pub mod ns {
         }
         Ok(None) // means, "no matches under NETNS_PATH"
     }
-    
-    use netns_rs::Env;
 
+    use netns_rs::Env;
 
     pub struct NsEnv;
 
@@ -717,7 +721,6 @@ pub async fn handle_sig(pw: Arc<PidAwaiter>) -> Result<()> {
     log::debug!("Sub received SIGINT.");
     pw.kill_all().await;
     exit(0);
-    Ok(())
 }
 
 static SIG_EXIT: AtomicBool = AtomicBool::new(false);
@@ -757,8 +760,6 @@ pub fn branch_out() -> Result<()> {
                         }
                         exit(1);
                     }
-                    return Ok(());
-
                     Ok(())
                 });
         }
