@@ -43,3 +43,4 @@ async-recursion = "1.0.4"
 bitflags = "2.4.0"
 tun2proxy = { path = "../tun2proxy" }
 smoltcp = "0.10.0"
+tokio-send-fd = "0.9.3"

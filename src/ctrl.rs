@@ -1,11 +1,13 @@
+use std::future::pending;
 use std::{path::Path, sync::Arc};
 
-use crate::util::{self, PidOp};
+use crate::sub::SubHub;
+use crate::util::{self, wait_pid, GroupTasks, KillMask, PidOp, ProcessGroup};
 use crate::{
     data::ConfPaths,
-    util::{PidAwaiter, TaskCtx},
+    util::{ProcessManager, TaskCtx},
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use bytes::Bytes;
 use rtnetlink::netlink_sys::protocols::NETLINK_NETFILTER;
 use rtnetlink::netlink_sys::{AsyncSocket, TokioSocket};
@@ -59,8 +61,13 @@ impl Server {
         let (restart, mut rx) = channel::<oneshot::Sender<()>>(1);
         let (sx_main, mut rx_main) = unbounded_channel::<UnboundedSender<ToServer>>();
         tokio::spawn(async move {
-            let mut h: _;
+            let mut th;
             let p2 = p2;
+
+            // Some tasks and processes are kept alive across reloads
+            let pm = ProcessManager::new();
+            let ctx = TaskCtx { pm: pm.sx.clone() };
+            let subs = SubHub::new(ctx.clone(), p2.clone()).await?;
 
             let mut cback: Option<oneshot::Sender<()>> = None;
             loop {
@@ -68,21 +75,25 @@ impl Server {
                     c.send(()).unwrap();
                 }
                 let p3 = p2.clone();
-                let pid_wait = PidAwaiter::new();
-                let sx = pid_wait.sx.clone();
+                let c2 = ctx.clone();
+                let s2 = subs.clone();
+
                 let (sx_cmd, rx_cmd) = unbounded_channel();
                 sx_main.send(sx_cmd).unwrap();
-                h = tokio::spawn(async move {
+                th = tokio::spawn(async move {
                     TaskOutput::handle_task_result(
-                        main_task(p3, sx, rx_cmd).await,
+                        main_task(p3, c2, s2, rx_cmd).await,
                         "main".to_owned(),
                     );
                     log::info!("I will continue running though. Try 'nsproxy -c reload'");
                 });
                 if let Some(cb) = rx.recv().await {
                     log::info!("Abort main task");
-                    pid_wait.kill_all().await;
-                    h.abort(); // drops all things.
+                    subs.broadcast(crate::sub::ToSub::KillAllSubjects).await?;
+                    pm.kill_subjects(KillMask::all()).await;
+                    pm.kill_await(Some(&ProcessGroup::Supervisor), KillMask::all())
+                        .await;
+                    th.abort(); // drops all things.
                     cback = Some(cb);
                 } else {
                     break;
@@ -175,7 +186,7 @@ impl Client {
 }
 
 use crate::util::error::DevianceError;
-use crate::util::{Awaitor, TaskOutput};
+use crate::util::TaskOutput;
 use crate::watcher::{FlatpakWatcher, MainEvent, Watcher};
 use anyhow::{anyhow, bail, Ok};
 use futures::{SinkExt, StreamExt};
@@ -187,9 +198,11 @@ use crate::netlink::*;
 
 async fn main_task(
     paths: Arc<ConfPaths>,
-    pid_wait: UnboundedSender<PidOp>,
+    ctx: TaskCtx,
+    subs: SubHub,
     mut cmd: UnboundedReceiver<ToServer>,
 ) -> Result<()> {
+    use util::*;
     // IP addresses etc. are fixed by putting derivation in the state file
     // Applying a SubjectInfo should work regardless how messed up the user's system state is.
     // Therefore all tasks may be aborted
@@ -201,11 +214,6 @@ async fn main_task(
         }
     };
     state.load_ids();
-    let mut dae = Awaitor::new();
-    let ctx = TaskCtx {
-        dae: dae.sender.clone(),
-        pid: pid_wait,
-    };
 
     let mn: MultiNS = MultiNS::new(paths, ctx.clone()).await?;
     let mut nl_socket = TokioSocket::new(NETLINK_NETFILTER)?;
@@ -216,13 +224,17 @@ async fn main_task(
     // All named are derived and NSes are present.
     state.flatpak_ensure()?;
 
-    state.resume(&mn, ctx.clone(), &mut nl_socket).await?;
+    state
+        .resume(&mn, ctx.clone(), &mut nl_socket, &subs)
+        .await?;
     state.dump().await?;
 
     let (sx, rx) = unbounded_channel();
     let flp = FlatpakWatcher::new(sx.clone());
     let (t, _) = TaskOutput::immediately(Box::pin(flp.daemon()), "flatpak-watcher".to_owned());
-    ctx.dae.send(t).unwrap();
+    ctx.pm
+        .send(PidOp::Add(ProcessGroup::Supervisor, TaskKind::Task(t)))
+        .unwrap();
     let sxx = sx.clone();
     let (t, _) = TaskOutput::immediately(
         Box::pin(async move {
@@ -233,17 +245,27 @@ async fn main_task(
         }),
         "command-to-watcher".to_owned(),
     );
-    ctx.dae.send(t).unwrap();
+    ctx.pm
+        .send(PidOp::Add(ProcessGroup::Supervisor, TaskKind::Task(t)))
+        .unwrap();
 
     let (t, _) = TaskOutput::immediately(
-        Box::pin(event_handler(rx, state, mn, sxx, ctx.clone(), nl_socket)),
+        Box::pin(event_handler(
+            rx,
+            state,
+            mn,
+            sxx,
+            ctx.clone(),
+            subs.clone(),
+            nl_socket,
+        )),
         "event-handler".to_owned(),
     );
-    ctx.dae.send(t).unwrap();
-    // finally. wait on all tasks.
-    log::info!("wait on all tasks");
-    dae.wait().await?;
+    ctx.pm
+        .send(PidOp::Add(ProcessGroup::Supervisor, TaskKind::Task(t)))
+        .unwrap();
 
+    pending::<()>().await;
     Ok(())
 }
 
@@ -253,7 +275,8 @@ async fn event_handler(
     mn: MultiNS,
     sx: UnboundedSender<MainEvent>,
     ctx: TaskCtx,
-    mut sock: impl AsyncSocket + Send + Sync
+    subs: SubHub,
+    mut sock: impl AsyncSocket + Send + Sync,
 ) -> Result<()> {
     while let Some(ev) = rx.recv().await {
         match ev {
@@ -265,7 +288,7 @@ async fn event_handler(
                             .flatpak
                             .get_mut(&fp.pid)
                             .ok_or(DevianceError)?;
-                        let pf = PidAwaiter::wait(fp.pid);
+                        let pf = wait_pid(fp.pid);
                         if let Some(pf) = pf {
                             let s2 = sx.clone();
                             let (t, _) = TaskOutput::immediately(
@@ -278,9 +301,14 @@ async fn event_handler(
                                 }),
                                 "flatpak-pidfd-".to_owned() + &fp.pid.0.to_string(),
                             );
-                            ctx.dae.send(t).unwrap();
-                            inf.ns.connect(&mn).await?;
-                            let inf = state.derivative.flatpak.get(&fp.pid).ok_or(DevianceError)?;
+                            ctx.pm
+                                .send(PidOp::Add(
+                                    util::ProcessGroup::Subject(inf.ns.clone()),
+                                    util::TaskKind::Task(t),
+                                ))
+                                .unwrap();
+                            inf.ns.connect(&mn, &subs).await?;
+                            let inf = state.derivative.flatpak.get(&fp.pid).unwrap();
                             inf.apply_veths(&mn, &state.derivative, &mut state.nft)
                                 .await?;
                             state.nft.execute(&mut sock).await?;
@@ -288,7 +316,7 @@ async fn event_handler(
 
                             let inf = state.derivative.flatpak.get_mut(&fp.pid).unwrap();
                             // start all daemons
-                            inf.run(&mn.procs).await?;
+                            inf.run(&subs).await?;
                         }
                         // else, process exited early
                     }
@@ -312,12 +340,17 @@ async fn event_handler(
                     let si = state.derivative.flatpak.remove(&fp);
                     if let Some(si) = si {
                         si.garbage_collect(&mn, &state.derivative, &ctx).await?;
-                        ctx.pid.send(PidOp::Kill(si.ns.clone())).with_context(|| {
-                            format!(
-                                "trying to kill the processes of {}, sending Pid failed",
-                                si.ns
-                            )
-                        })?;
+                        ctx.pm
+                            .send(PidOp::Kill(
+                                util::ProcessGroup::Subject(si.ns.clone()),
+                                KillMask::all(),
+                            ))
+                            .map_err(|_| {
+                                anyhow!(
+                                    "trying to kill the processes of {}, sending Pid failed",
+                                    si.ns
+                                )
+                            })?;
                         state.dump().await?;
                     } else {
                         // it prolly has been GCed

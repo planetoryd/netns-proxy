@@ -7,13 +7,19 @@ use clap::{Parser, Subcommand};
 
 use futures::Future;
 use netns_proxy::ctrl::{ToClient, ToServer};
-use netns_proxy::util::branch_out;
+use netns_proxy::sub::{SocketEOF, tuntap_};
 use netns_proxy::util::ns::self_netns_identify;
 use netns_proxy::util::perms::*;
 use nix::sched::CloneFlags;
 use nix::unistd::geteuid;
 
 use std::env;
+use std::net::SocketAddr;
+use std::os::fd::{FromRawFd, RawFd};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::process::exit;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::process::Command;
 
@@ -70,14 +76,21 @@ enum Commands {
     // Control commands
     /// Reload config by the daemon
     Reload,
+    TUNTAP(TUN2ProxyArgs),
+    Tuntap_ {
+        sock: RawFd,
+    },
+    Sub {
+        /// RPC socket
+        sock: PathBuf,
+        /// NS to enter
+        ns: RawFd,
+    },
 }
 
 fn main() -> Result<()> {
     let e = env_logger::Env::new().default_filter_or("warn,netns_proxy=debug,nsproxy=debug");
     env_logger::init_from_env(e);
-
-    // polymorphic binary
-    branch_out()?;
 
     let cli = Cli::parse();
 
@@ -87,6 +100,42 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
+        Some(Commands::Sub { sock: path, ns: fd }) => {
+            let fd: std::fs::File = unsafe { std::fs::File::from_raw_fd(fd) };
+            let ns = NsFile(fd);
+            ns.unset_cloexec()?;
+            ns.enter()?;
+            // NS must be entered before tokio starts, because setns doesn't affect existing threads
+            async_run(async move {
+                use netns_proxy::sub::handle;
+                use tokio::net::UnixStream;
+                use tokio_send_fd::SendFd;
+                use tokio_util::codec::Framed;
+                use tokio_util::codec::LengthDelimitedCodec;
+
+                let (pa, pb) = UnixStream::pair()?;
+                let conn = UnixStream::connect(path.as_path()).await?;
+                conn.send_stream(pa).await?;
+                let f: Framed<UnixStream, LengthDelimitedCodec> =
+                    Framed::new(conn, LengthDelimitedCodec::new());
+                let x = handle(f, pb).await;
+                if let Err(e) = x {
+                    if let Some(_) = e.downcast_ref::<SocketEOF>() {
+                        if netns_proxy::sub::SIG_EXIT.load(Ordering::SeqCst) {
+                            // ignore
+                        } else {
+                            log::error!("exit as sub \n Err: SocketEOF");
+                        }
+                    } else {
+                        log::error!("exit as sub \n Err: {:?}", e);
+                    }
+                    exit(1);
+                }
+                Ok(())
+            })
+        }
+        Some(Commands::TUNTAP(args)) => netns_proxy::tun2proxy::tun2proxy(args),
+        Some(Commands::Tuntap_ { sock }) => tuntap_(sock),
         Some(Commands::Stop {}) => {
             netns_proxy::util::kill_suspected()?;
         }
@@ -220,5 +269,5 @@ fn async_run(f: impl Future<Output: std::fmt::Debug>) {
         .build()
         .unwrap()
         .block_on(f);
-    println!("Top-process Errored, {:?}", k);
+    println!("{:?}", k);
 }

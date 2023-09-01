@@ -1,7 +1,8 @@
 use crate::{
     netlink::NSCreate,
     state::ExistenceMap,
-    util::{self, TaskCtx},
+    sub::SubHub,
+    util::{self, KillMask, TaskCtx},
 };
 use derivative::Derivative;
 use ipnetwork::IpNetwork;
@@ -10,7 +11,7 @@ use std::{
     collections::{BinaryHeap, HashMap, HashSet},
     fmt::Display,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
-    os::unix::process::CommandExt,
+    os::{fd::RawFd, unix::process::CommandExt},
     path::PathBuf,
     process::Stdio,
     str::FromStr,
@@ -32,6 +33,7 @@ use anyhow::{anyhow, bail, ensure, Context, Ok, Result};
 
 use crate::netlink::nl_ctx;
 use crate::util::error::*;
+use crate::util::*;
 
 // generated info and state store
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -267,6 +269,7 @@ pub struct SubjectProfile {
     pub procs: RProcTasks,
     pub tun2socks: RTUNedSocks,
     pub dnsproxy: DNSProxyR,
+    pub tun2proxy: TUN2ProxyR,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
@@ -338,6 +341,78 @@ pub struct DNSProxyC {
     pub args: Option<Vec<String>>,
 }
 
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+pub enum TUN2ProxyR {
+    #[default]
+    Disabled,
+    Enabled(TUN2ProxyC),
+}
+
+/// TUN will be put in the subject NS
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TUN2ProxyC {
+    /// Url to upstream proxy
+    pub url: String,
+    /// Where should network traffic be sent from
+    pub put: NSRef,
+    pub dns: TUN2DNS,
+    /// Disabling will remove ipv6 entries from DNS (if TUN2DNS::Upstream enabled)
+    #[serde(default)]
+    pub ipv6: bool,
+}
+
+/// Derived
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TUN2ProxyE {
+    pub source: TUN2ProxyC,
+    pub ns: NSID,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub enum TUN2ProxyD {
+    #[default]
+    Disabled,
+    Enabled(TUN2ProxyE),
+}
+
+#[derive(clap::Args, Serialize, Deserialize, Debug, Clone)]
+pub struct TUN2ProxyArgs {
+    /// Device FD, inherited from parent process
+    pub dev: RawFd,
+    pub upstream: String,
+    pub dns: Option<SocketAddr>,
+    #[arg(long)]
+    pub ipv6: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum TUN2DNS {
+    /// Resolve names with proxy
+    Proxy,
+    /// Resolve names through proxy
+    Upstream(SocketAddr),
+}
+
+impl TUN2ProxyE {
+    pub fn to_args(&self, dev: RawFd) -> TUN2ProxyArgs {
+        TUN2ProxyArgs {
+            dev,
+            upstream: self.source.url.clone(),
+            dns: self.source.dns.clone().into(),
+            ipv6: self.source.ipv6,
+        }
+    }
+}
+
+impl From<TUN2DNS> for Option<SocketAddr> {
+    fn from(value: TUN2DNS) -> Self {
+        match value {
+            TUN2DNS::Proxy => None,
+            TUN2DNS::Upstream(s) => Some(s),
+        }
+    }
+}
+
 impl Default for DNSProxyC {
     fn default() -> Self {
         Self {
@@ -369,13 +444,15 @@ pub struct SubjectInfo<V: VSpecifics> {
     /// socks5 proxy
     #[serde(default)]
     pub tun2socks: Option<SocketAddr>, // ip without CIDR
+    /// Resolved NS to put tun2proxy
+    pub tun2proxy: TUN2ProxyD,
 }
 
 impl NSID {
-    pub async fn connect(&mut self, mn: &MultiNS) -> Result<()> {
+    pub async fn connect(&mut self, mn: &MultiNS, subs: &SubHub) -> Result<()> {
         log::debug!("Connect NS for subject {}", self);
         self.ensure().await?;
-        let n = mn.get_nl(self.clone()).await?;
+        let n = mn.netlink_for_sub(self.clone(), subs).await?;
         let nl = NLTracked::new(Arc::new(n));
         let ns = nl.to_netns(self.clone()).await?;
         mn.ns.write().await.insert(self.clone(), ns.into());
@@ -393,7 +470,12 @@ impl<V: VSpecifics> SubjectInfo<V> {
     ) -> Result<()> {
         log::info!("GC subject {}", self.ns);
 
-        ctx.pid.send(util::PidOp::Kill(self.ns.clone())).unwrap();
+        ctx.pm
+            .send(PidOp::Kill(
+                ProcessGroup::Subject(self.ns.clone()),
+                KillMask::all(),
+            ))
+            .unwrap();
         let map = sys.ns.write().await;
         for (r, c) in &self.vaddrs {
             let re = r.resolve_derivative(de).await?;
@@ -413,7 +495,7 @@ impl<V: VSpecifics> SubjectInfo<V> {
     }
     /// These two methods return shortly. Tasks are passed to the awaiter
     /// Conforms to PidAwaiter
-    pub async fn run_tun2s(&self, st: &mut NsubState) -> Result<()> {
+    pub async fn may_run_tun2socks(&self, st: &mut NsubState) -> Result<()> {
         use crate::netlink::*;
         use crate::util::watch_log;
 
@@ -430,8 +512,11 @@ impl<V: VSpecifics> SubjectInfo<V> {
             let mut tun2h = tun2_async.spawn()?;
             let pid = Pid(tun2h.id().ok_or(anyhow!("Tun2socks stopped"))?);
             st.ctx
-                .pid
-                .send(util::PidOp::Add(self.ns.clone(), pid))
+                .pm
+                .send(PidOp::Add(
+                    ProcessGroup::Subject(self.ns.clone()),
+                    TaskKind::Process(pid),
+                ))
                 .unwrap();
             use tokio_stream::wrappers::LinesStream;
             let stdout = tun2h.stdout.take().unwrap();
@@ -458,15 +543,11 @@ impl<V: VSpecifics> SubjectInfo<V> {
                 .netlink
                 .ip_add_route(tun, None, Some(false), RouteFor::TUNIpv6)
                 .await;
-
-            let (t, _r) =
-                TaskOutput::immediately_std(Box::pin(async move { tun2h.wait().await }), pre);
-            st.ctx.dae.send(t).unwrap();
         }
 
         Ok(())
     }
-    pub async fn run_dnsp(&self, st: &mut NsubState) -> Result<()> {
+    pub async fn may_run_dnsproxy(&self, st: &mut NsubState) -> Result<()> {
         use crate::netlink::*;
 
         match self.dnsproxy {
@@ -486,16 +567,16 @@ impl<V: VSpecifics> SubjectInfo<V> {
                 let mut dns_h = dnsp_a.spawn()?;
                 let pid = Pid(dns_h.id().ok_or(anyhow!("Dnsproxy stopped"))?);
                 st.ctx
-                    .pid
-                    .send(util::PidOp::Add(self.ns.clone(), pid))
+                    .pm
+                    .send(PidOp::Add(
+                        ProcessGroup::Subject(self.ns.clone()),
+                        TaskKind::Process(pid),
+                    ))
                     .unwrap();
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 let pre = format!("{}/dnsproxy", self.id);
                 watch_both(&mut dns_h, pre.clone(), Some(tx))?;
                 rx.await?; // wait for first line to appear
-                let (t, _r) =
-                    TaskOutput::immediately_std(Box::pin(async move { dns_h.wait().await }), pre);
-                st.ctx.dae.send(t).unwrap();
             }
         }
 
@@ -676,6 +757,18 @@ impl<D: RC, T: ResolvableS<FlatpakV, D>> ResolvableG<FlatpakV, D> for T {
     }
 }
 
+impl TUN2ProxyR {
+    pub async fn resolve_derivative<'a>(&'a self, de: &'a Derivative) -> Result<TUN2ProxyD> {
+        match self {
+            Self::Disabled => Ok(TUN2ProxyD::Disabled),
+            Self::Enabled(k) => Ok(TUN2ProxyD::Enabled(TUN2ProxyE {
+                source: k.clone(),
+                ns: k.put.resolve_derivative(de).await?,
+            })),
+        }
+    }
+}
+
 /// It's possible that dns args might need paras from global state. Therefore as such
 impl<V: VSpecifics> ResolvableG<V, DNSProxyR> for DNSProxyR {
     async fn resolve_global(
@@ -786,6 +879,10 @@ impl<V: VSpecifics> ResolvableG<V, SubjectInfo<V>> for Arc<SubjectProfile> {
                 .to_owned(),
             dnsproxy: self.dnsproxy.resolve_global(global, uq, v).await?,
             tun2socks: None,
+            tun2proxy: self
+                .tun2proxy
+                .resolve_derivative(&global.derivative)
+                .await?,
         };
         for vc in self.vconns.iter() {
             let v1 = vc.resolve_subject(&s)?;
@@ -824,11 +921,11 @@ pub struct NSID {
 #[derive(Derivative, Serialize, Deserialize, Clone)]
 #[derivative(Debug)]
 pub enum NSIDFrom {
-    #[derivative(Debug="transparent")]
+    #[derivative(Debug = "transparent")]
     Named(ProfileName),
-    #[derivative(Debug="transparent")]
+    #[derivative(Debug = "transparent")]
     Pid(Pid),
-    #[derivative(Debug="transparent")]
+    #[derivative(Debug = "transparent")]
     Path(PathBuf),
     Root,
     Thread,
@@ -848,7 +945,7 @@ fn test_serde_state() -> Result<()> {
 
     let ser = util::to_vec_internal(&ToServer::ReloadConfig)?;
 
-    let n = ToMain::FD(2);
+    let n = ToMain::NSFD(2);
     let ser: Vec<u8> = util::to_vec_internal(&n)?;
     let de: ToMain = util::from_vec_internal(&ser)?;
 
@@ -888,6 +985,7 @@ mod presets {
                     v6: false,
                 }),
                 dnsproxy: DNSProxyR::Enabled(DNSProxyC::default()),
+                tun2proxy: TUN2ProxyR::Disabled,
             }),
         );
         s.profiles.insert(
@@ -897,6 +995,7 @@ mod presets {
                 procs: RProcTasks::default(),
                 tun2socks: RTUNedSocks::Disabled,
                 dnsproxy: DNSProxyR::Disabled,
+                tun2proxy: TUN2ProxyR::Disabled,
             }),
         );
         s.profiles.insert(
@@ -911,6 +1010,7 @@ mod presets {
                 procs: RProcTasks::default(),
                 tun2socks: RTUNedSocks::Disabled,
                 dnsproxy: DNSProxyR::Disabled,
+                tun2proxy: TUN2ProxyR::Disabled,
             }),
         );
         s.flatpak.insert(

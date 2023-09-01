@@ -26,6 +26,7 @@ pub mod util;
 pub mod watcher;
 pub mod ctrl;
 pub mod state;
+pub mod tun2proxy;
 
 // Standard procedure
 // Creates various netns, base-vpn, socks, i2p, lokinet, un-firewalled

@@ -22,6 +22,8 @@ use nix::unistd::{Gid, Pid, Uid};
 use pidfd::{PidFd, PidFuture};
 use procfs::process::Process;
 
+use serde::Deserialize;
+use serde::Serialize;
 use tokio::io::BufStream;
 use tokio::{
     signal::unix::SignalKind,
@@ -32,6 +34,7 @@ use tokio::{
     },
     task::{AbortHandle, JoinError, JoinHandle, JoinSet},
 };
+
 
 use crate::data::FlatpakID;
 use crate::data::Pid as DPid;
@@ -468,52 +471,116 @@ pub mod error {
     pub struct MissingError;
 }
 
-/// A way to wait on all tasks before quitting
-pub struct Awaitor {
-    pub sender: DaemonSender,
-    recver: UnboundedReceiver<Pin<Box<dyn Future<Output = TaskOutput> + Send>>>,
-    daemons: JoinSet<TaskOutput>,
-}
+#[derive(Debug, PartialEq, Eq, Hash, Deserialize, Serialize, Clone)]
+pub enum ProcessGroup {
+    /// Kept across reloads
+    Top,
+    /// Daemons for all NS, killed when reloading
+    Supervisor,
+    /// Of specific subject
+    Subject(NSID),
+    /// Daemon processes. 
+    Sub(NSID)
+}  
 
 pub enum PidOp {
-    Kill(NSID),
-    Add(NSID, DPid),
+    Kill(ProcessGroup, KillMask),
+    Add(ProcessGroup, TaskKind),
 }
 
-pub struct PidAwaiter {
-    pub sx: UnboundedSender<PidOp>,
-    pub groups: Arc<Mutex<HashMap<NSID, Vec<DPid>>>>,
-    server: Option<AbortHandle>,
+pub enum TaskKind {
+    Process(DPid),
+    Task(Pin<Box<dyn (Future<Output = TaskOutput>) + Send>>),
 }
+
+/// Awaiter for both async tasks and processes
+pub struct ProcessManager {
+    pub sx: UnboundedSender<PidOp>,
+    pub groups: Arc<Mutex<HashMap<ProcessGroup, GroupTasks>>>,
+    // server: Option<AbortHandle>,
+}
+
+#[derive(Default)]
+pub struct GroupTasks {
+    pids: Vec<DPid>,
+    tasks: JoinSet<TaskOutput>,
+}
+
+pub mod flags {
+    use bitflags::bitflags;
+    use serde::{Serialize, Deserialize};
+
+    bitflags! {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        pub struct KillMask: u8 {
+            const Task = 1;
+            const Process = 2;
+        }
+    }
+}
+pub use flags::*;
+
+impl GroupTasks {
+    pub async fn kill(&mut self, mask: KillMask) {
+        if mask.intersects(KillMask::Process) {
+            Self::kill_pids(&mut self.pids).await;
+        }
+        if mask.intersects(KillMask::Task) {
+            self.tasks.abort_all();
+        }
+    }
+    async fn kill_pids(ve: &mut Vec<DPid>) {
+        let mut h = vec![];
+        while let Some(x) = ve.pop() {
+            if let Some(e) = wait_pid(x) {
+                h.push(e);
+            }
+        }
+        futures::future::join_all(h).await;
+    }
+}
+
+pub fn wait_pid(x: DPid) -> Option<PidFuture> {
+    if let Result::Ok(f) = unsafe { PidFd::open(x.0 as i32, 0) } {
+        unsafe {
+            let _ = f.send_raw_signal(libc::SIGINT, std::ptr::null(), 0);
+        };
+        Some(f.into_future())
+    } else {
+        None
+    }
+}
+
 use std::collections::hash_map::Entry;
-impl PidAwaiter {
+impl ProcessManager {
     pub fn new() -> Arc<Self> {
         let (sx, mut rx) = unbounded_channel::<PidOp>();
-        let groups: Arc<Mutex<HashMap<NSID, Vec<DPid>>>> = Default::default();
-        let g = groups.clone();
+        let groups: Arc<_> = Default::default();
         let p = Arc::new(Self {
             sx,
             groups,
-            server: None,
         });
+        let g = p.groups.clone();
         let p2 = p.clone();
-        let k = tokio::spawn(async move {
+        tokio::spawn(async move {
             while let Some(p) = rx.recv().await {
                 match p {
-                    PidOp::Add(ns, pid) => {
+                    PidOp::Add(ns, tsk) => {
                         let mut w = g.lock().await;
-                        match w.entry(ns) {
-                            Entry::Occupied(mut v) => {
-                                v.get_mut().push(pid);
+                        let mut e = w.entry(ns);
+                        let v = match e {
+                            Entry::Occupied(ref mut v) => v.get_mut(),
+                            Entry::Vacant(v) => v.insert(GroupTasks::default()),
+                        };
+                        match tsk {
+                            TaskKind::Process(pid) => v.pids.push(pid),
+                            TaskKind::Task(t) => {
+                                v.tasks.spawn(t);
                             }
-                            Entry::Vacant(v) => {
-                                let v = v.insert(vec![]);
-                                v.push(pid);
-                            }
-                        }
+                        };
                     }
-                    PidOp::Kill(ns) => {
-                        p2.kill_await(Some(&ns)).await;
+                    PidOp::Kill(ns, mask) => {
+                        p2.kill_await(Some(&ns), mask).await;
                     }
                 }
             }
@@ -521,45 +588,25 @@ impl PidAwaiter {
 
         p
     }
-    pub async fn kill_await(&self, ns: Option<&NSID>) {
+    pub async fn kill_await(&self, ns: Option<&ProcessGroup>, mask: KillMask) {
         let mut g = self.groups.lock().await;
         if let Some(ns) = ns {
             if let Some(ve) = g.get_mut(ns) {
-                Self::kill_vec(ve, &ns).await;
+                ve.kill(mask).await;
             }
         } else {
-            for (ns, ve) in g.iter_mut() {
-                Self::kill_vec(ve, &ns).await;
+            for (_ns, ve) in g.iter_mut() {
+                ve.kill(mask).await;
             }
         }
     }
-    pub fn wait(x: DPid) -> Option<PidFuture> {
-        if let Result::Ok(f) = unsafe { PidFd::open(x.0 as i32, 0) } {
-            unsafe {
-                let _ = f.send_raw_signal(libc::SIGINT, std::ptr::null(), 0);
-            };
-            Some(f.into_future())
-        } else {
-            None
-        }
-    }
-    /// each killed pid is removed
-    async fn kill_vec(ve: &mut Vec<DPid>, ns: &NSID) {
-        let mut h = vec![];
-        while let Some(x) = ve.pop() {
-            if let Some(e) = Self::wait(x) {
-                h.push(e);
+    pub async fn kill_subjects(&self, mask: KillMask) {
+        let mut g = self.groups.lock().await;
+        for (ns, ve) in g.iter_mut() {
+            if matches!(ns, ProcessGroup::Subject(_)) {
+                ve.kill(mask).await;
             }
         }
-        log::info!("Kill process group {ns}, num {}", h.len());
-        futures::future::join_all(h).await;
-    }
-    pub async fn kill_all(&self) {
-        if let Some(ref s) = self.server {
-            s.abort();
-        }
-        self.kill_await(None).await;
-        log::debug!("All processes stopped");
     }
 }
 
@@ -568,15 +615,14 @@ pub type DaemonSender = UnboundedSender<Pin<Box<dyn Future<Output = TaskOutput> 
 /// Senders.
 #[derive(Debug, Clone)]
 pub struct TaskCtx {
-    pub dae: DaemonSender,
-    pub pid: UnboundedSender<PidOp>,
+    pub pm: UnboundedSender<PidOp>,
 }
 
 pub struct TaskOutput {
     pub name: String,
     pub result: Result<()>,
     /// notified in case the task stops
-    pub sig: Option<oneshot::Sender<()>>,
+    pub signal: Option<oneshot::Sender<()>>,
 }
 
 impl TaskOutput {
@@ -595,7 +641,7 @@ impl TaskOutput {
                 TaskOutput {
                     name,
                     result: Ok(()),
-                    sig: Some(sx),
+                    signal: Some(sx),
                 }
             }),
             rx,
@@ -623,7 +669,7 @@ impl TaskOutput {
                 TaskOutput {
                     name,
                     result: r,
-                    sig: Some(sx),
+                    signal: Some(sx),
                 }
             }),
             rx,
@@ -673,99 +719,6 @@ impl TaskOutput {
             log::trace!("Task {} has result {:?}", name, x.unwrap());
         }
     }
-}
-
-impl Awaitor {
-    pub fn new() -> Self {
-        let (s, r) = mpsc::unbounded_channel();
-        Awaitor {
-            sender: s,
-            recver: r,
-            daemons: JoinSet::new(),
-        }
-    }
-    pub async fn wait(&mut self) -> Result<()> {
-        loop {
-            tokio::select! {
-                maybe_task = self.recver.recv() => {
-                    if let Some(task) = maybe_task {
-                        self.daemons.spawn(task);
-                    }
-                },
-                maybe_res = self.daemons.join_next() => {
-                    if let Some(res) = maybe_res {
-                        let res = res?;
-                        log::info!("Daemon {} stopped. {:?}", res.name, res.result);
-                        if let Some(x) = res.sig {
-                            let _ = x.send(());
-                        }
-                        // TODO: can I get traceback by logging ?
-                    }
-                }
-            }
-        }
-    }
-}
-
-use crate::sub::handle;
-use std::sync::atomic::Ordering;
-use tokio::net::UnixStream;
-use tokio_util::codec::Framed;
-use tokio_util::codec::LengthDelimitedCodec;
-
-pub async fn handle_sig(pw: Arc<PidAwaiter>) -> Result<()> {
-    tokio::signal::unix::signal(SignalKind::interrupt())?
-        .recv()
-        .await;
-    SIG_EXIT.store(true, Ordering::SeqCst);
-    log::debug!("Sub received SIGINT.");
-    pw.kill_all().await;
-    exit(0);
-}
-
-static SIG_EXIT: AtomicBool = AtomicBool::new(false);
-
-pub fn branch_out() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() == 4 {
-        let path: Result<PathBuf, _> = args[2].parse();
-        let fd: Result<i32, _> = args[3].parse();
-        if path.is_ok() && fd.is_ok() && args[1] == "sub" {
-            let fd = fd?;
-            let fd: File = unsafe { File::from_raw_fd(fd) };
-            let ns = NsFile(fd);
-            ns.unset_cloexec()?;
-            ns.enter()?;
-            // NS must be entered before tokio starts, because setns doesn't affect existing threads
-            return tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async move {
-                    let sock_path = path.unwrap();
-                    let conn = UnixStream::connect(sock_path.as_path()).await?;
-                    let f: Framed<UnixStream, LengthDelimitedCodec> =
-                        Framed::new(conn, LengthDelimitedCodec::new());
-
-                    let x = handle(f).await;
-                    if let Err(e) = x {
-                        if let Some(_) = e.downcast_ref::<SocketEOF>() {
-                            if SIG_EXIT.load(Ordering::SeqCst) {
-                                // ignore
-                            } else {
-                                log::error!("exit as sub \n Err: SocketEOF");
-                            }
-                        } else {
-                            log::error!("exit as sub \n Err: {:?}", e);
-                        }
-                        exit(1);
-                    }
-                    Ok(())
-                });
-        }
-    }
-
-    Ok(())
 }
 
 pub struct AbortOnDrop<T>(pub JoinHandle<T>);

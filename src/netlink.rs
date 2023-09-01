@@ -36,6 +36,7 @@ use std::{
     hash::Hash,
     net::Ipv6Addr,
     ops::{Deref, Index},
+    os::fd::FromRawFd,
     str::FromStr,
     sync::Arc,
 };
@@ -55,11 +56,11 @@ use crate::util::ns::*;
 use rtnetlink::{
     netlink_packet_route::{nlas::link::InfoKind, rtnl::link::nlas, IFF_LOWER_UP},
     netlink_proto::{new_connection_from_socket, NetlinkCodec},
-    netlink_sys::AsyncSocket,
-    proxy::NProxyID,
+    netlink_sys::{AsyncSocket, TokioSocket},
 };
 
 use crate::util::error::*;
+use crate::util::*;
 
 use crate::state::*;
 use fixed_map::{Key, Map};
@@ -262,7 +263,13 @@ impl NetnspState {
         Ok(())
     }
     /// Also, resume from persisted state
-    pub async fn resume(&mut self, mn: &MultiNS, ctx: TaskCtx, sock: &mut impl AsyncSocket) -> Result<()> {
+    pub async fn resume(
+        &mut self,
+        mn: &MultiNS,
+        ctx: TaskCtx,
+        sock: &mut impl AsyncSocket,
+        subs: &SubHub,
+    ) -> Result<()> {
         // Some derivative do not have associated profiles
         // This is invalid, because the information is incomplete for configuration.
         self.derivative
@@ -275,7 +282,7 @@ impl NetnspState {
         log::debug!("Resume from saved state");
 
         for (_, info) in &mut self.derivative.named_ns {
-            info.ns.connect(mn).await?;
+            info.ns.connect(mn, subs).await?;
         }
         // Must init all Netns first
 
@@ -287,13 +294,13 @@ impl NetnspState {
 
         // started after nft applied
         for (_, info) in &mut self.derivative.named_ns {
-            info.run(&mn.procs).await?;
+            info.run(subs).await?;
         }
 
         // Resume flatpaks
 
         for (_n, info) in &mut self.derivative.flatpak {
-            info.ns.connect(mn).await?;
+            info.ns.connect(mn, subs).await?;
         }
         // Must init all Netns first
         for (_n, info) in &self.derivative.flatpak {
@@ -303,7 +310,7 @@ impl NetnspState {
         self.nft.execute(sock).await?;
         // Config all first
         for (_n, info) in &mut self.derivative.flatpak {
-            info.run(&mn.procs).await?;
+            info.run(subs).await?;
         }
 
         Ok(())
@@ -326,9 +333,7 @@ pub enum DeriveRes {
 }
 
 use futures::stream::TryStreamExt;
-use rtnetlink::netlink_packet_route::{
-    rtnl::link::LinkMessage, AddressMessage, IFF_UP,
-};
+use rtnetlink::netlink_packet_route::{rtnl::link::LinkMessage, AddressMessage, IFF_UP};
 use rtnetlink::{Handle, NetworkNamespace};
 
 /// Stateless connection
@@ -502,20 +507,31 @@ impl<F: AsRawFd> NsFile<F> {
         Ok(())
     }
     pub fn set_cloexec(&self) -> Result<i32> {
+        self.0.set_cloexec()
+    }
+    pub fn unset_cloexec(&self) -> Result<i32> {
+        self.0.unset_cloexec()
+    }
+}
+
+pub trait Fcntl: AsRawFd {
+    fn set_cloexec(&self) -> Result<i32> {
         nix::fcntl::fcntl(
-            self.0.as_raw_fd(),
+            self.as_raw_fd(),
             nix::fcntl::FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC),
         )
         .map_err(anyhow::Error::from)
     }
-    pub fn unset_cloexec(&self) -> Result<i32> {
+    fn unset_cloexec(&self) -> Result<i32> {
         nix::fcntl::fcntl(
-            self.0.as_raw_fd(),
+            self.as_raw_fd(),
             nix::fcntl::FcntlArg::F_SETFD(FdFlag::empty()),
         )
         .map_err(anyhow::Error::from)
     }
 }
+
+impl<F: AsRawFd> Fcntl for F {}
 
 #[derive(Derivative)]
 #[derivative(PartialEq, Eq, Debug)]
@@ -1215,16 +1231,11 @@ pub fn tun_ops(tun: tidy_tuntap::Tun) -> Result<()> {
     Ok(())
 }
 
-use rtnetlink::proxy;
-
 #[derive(Debug)]
 /// About multiple ns-es
 pub struct MultiNS {
-    /// RPC.
-    pub procs: SubHub,
     /// Take mut reference when operating on an NS.
     pub ns: RwLock<HashMap<NSID, RwLock<Netns>>>,
-    pending: Arc<RwLock<HashMap<NProxyID, proxy::ProxyParam>>>,
     paths: Arc<ConfPaths>,
     ctx: TaskCtx,
 }
@@ -1243,16 +1254,10 @@ impl ConfPaths {
 
 impl MultiNS {
     pub async fn new(paths: Arc<ConfPaths>, ctx: TaskCtx) -> Result<MultiNS> {
-        let ct = proxy::NetlinkProxy::new(paths.sock4netlink())?;
-        let pending = ct.pending.clone();
-        let (t, _r) = TaskOutput::immediately(Box::pin(ct.serve()), "netlink-proxy-hub".to_owned());
-        ctx.dae.send(t).unwrap();
         let mn = MultiNS {
-            procs: SubHub::new(ctx.clone(), paths.clone()).await?,
             ns: Default::default(),
             paths,
             ctx,
-            pending,
         };
 
         Ok(mn)
@@ -1264,30 +1269,24 @@ impl MultiNS {
         Ok(())
     }
     /// may be called only once per NSID
-    pub async fn get_nl(&self, id: NSID) -> Result<NLHandle> {
-        use proxy::*;
+    pub async fn netlink_for_sub(&self, id: NSID, subs: &SubHub) -> Result<NLHandle> {
         use rtnetlink::netlink_sys::constants::NETLINK_ROUTE;
 
-        let (mut stream, r) = self.procs.op(id.clone()).await?;
+        let (mut stream, r) = subs.op(id.clone()).await?;
         match r {
             sub::OpRes::NewSub => {
                 log::trace!("Handle newly created sub for {}", id);
-                let mut g = self.pending.write().await;
-                let (cb, r_socket) = oneshot::channel();
-                g.insert(
-                    NProxyID(id.inode.clone()),
-                    ProxyParam {
-                        cb,
-                        proto: NETLINK_ROUTE,
-                    },
-                );
-                log::debug!("Add pending NProxy {}", id.inode);
-                drop(g); // must drop guard ASAP
+                let (sx, rx) = oneshot::channel();
                 let (u, g) = get_non_priv_user(None, None, None, None)?;
                 stream
                     .send(ToSub::Init((*self.paths).clone(), u, g, id.clone()))
                     .await?;
-                let ts = r_socket.await?;
+                stream.netlink_q.send(sx).unwrap();
+                stream
+                    .send(ToSub::FetchFd(sub::FDReq::Netlink(NETLINK_ROUTE)))
+                    .await?;
+                let fd = rx.await?;
+                let ts = unsafe { TokioSocket::from_raw_fd(fd) };
                 let (conn, handle, _m) = new_connection_from_socket::<_, _, NetlinkCodec>(ts);
 
                 let (t, _r) = TaskOutput::immediately(
@@ -1298,7 +1297,13 @@ impl MultiNS {
                     "netlink-conn-".to_owned() + &id.inode.to_string(), // this waits on the conn. it ends when the conn ends
                 );
 
-                self.ctx.dae.send(t).unwrap();
+                self.ctx
+                    .pm
+                    .send(PidOp::Add(
+                        ProcessGroup::Subject(id.clone()),
+                        TaskKind::Task(t),
+                    ))
+                    .unwrap();
                 let rth = Handle::new(handle);
                 let nc = NLHandle { handle: rth };
                 log::trace!("Got netlink for {}", id.inode);
