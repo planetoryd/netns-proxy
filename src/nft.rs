@@ -10,25 +10,102 @@ use rustables::{
     Batch, Chain, Hook, MsgType, ProtocolFamily, Rule, Table,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map, HashMap, HashSet},
     hash::Hash,
 };
 
-use anyhow::{Ok, Result};
+use anyhow::{anyhow, Ok, Result};
 
 pub const TABLE_NAME: &str = "netnsp";
 pub const FO_CHAIN: &str = "block-forward";
 
+pub trait NameKey {
+    fn name(&self) -> Result<String>;
+}
+
+pub trait Mergeable {
+    fn merge(&mut self, Δ: Self) -> Result<()>;
+}
+
+impl Mergeable for PChain {
+    fn merge(&mut self, Δ: Self) -> Result<()> {
+        assert!(self.name()? == Δ.name()?);
+        self.rules.extend(Δ.rules);
+        Ok(())
+    }
+}
+
+impl Mergeable for PTable {
+    fn merge(&mut self, Δ: Self) -> Result<()> {
+        assert!(self.name()? == Δ.name()?);
+        for (name, chain) in Δ.chains {
+            match self.chains.entry(name) {
+                hash_map::Entry::Vacant(vac) => {
+                    vac.insert(chain);
+                }
+                hash_map::Entry::Occupied(mut oc) => {
+                    oc.get_mut().merge(chain)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Mergeable for NftState {
+    fn merge(&mut self, Δ: Self) -> Result<()> {
+        for (name, table) in Δ.tables {
+            match self.tables.entry(name) {
+                hash_map::Entry::Vacant(vac) => {
+                    vac.insert(table);
+                }
+                hash_map::Entry::Occupied(mut oc) => {
+                    oc.get_mut().merge(table)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn iter_conv<V: NameKey>(
+    items: impl IntoIterator<Item = V>,
+) -> impl IntoIterator<Item = Result<(String, V)>> {
+    items.into_iter().map(|k| k.name().map(|n| (n, k)))
+}
+
+pub macro conv_collect($e:expr) {
+    iter_conv($e).into_iter().try_collect()?
+}
+
 #[derive(Default, Debug)]
 pub struct NftState {
     // name -> table. indexed
-    tables: Vec<PTable>,
+    tables: HashMap<String, PTable>,
 }
 
 #[derive(Default, Debug)]
 pub struct PTable {
     table: Table,
-    chains: Vec<PChain>,
+    chains: HashMap<String, PChain>,
+}
+
+impl NameKey for PTable {
+    fn name(&self) -> Result<String> {
+        self.table
+            .get_name()
+            .map(|k| k.to_owned())
+            .ok_or_else(|| anyhow!("unexpected, table doesn't have a name"))
+    }
+}
+
+impl NameKey for PChain {
+    fn name(&self) -> Result<String> {
+        self.chain
+            .get_name()
+            .map(|k| k.to_owned())
+            .ok_or_else(|| anyhow!("unexpected. got chain without name"))
+    }
 }
 
 #[derive(Default, Debug)]
@@ -95,10 +172,12 @@ impl Fetch<()> for NftState {
     async fn fetch<S: AsyncSocket>(_ext: (), sock: &mut S) -> Result<Self> {
         let mut nf = NftState::default();
         let k = nf.sub_objs_existing(sock).await?;
-        nf.tables.clear();
+        let mut pt = Vec::default();
         for p in k {
-            nf.tables.push(PTable::fetch(p, sock).await?);
+            let t = PTable::fetch(p, sock).await?;
+            pt.push(t);
         }
+        nf.tables = iter_conv(pt).into_iter().try_collect()?;
 
         Ok(nf)
     }
@@ -111,11 +190,12 @@ impl Fetch<Table> for PTable {
             ..Default::default()
         };
         let k = t.sub_objs_existing(sock).await?;
-
-        t.chains.clear();
+        let mut vec = Vec::default();
         for p in k {
-            t.chains.push(PChain::fetch(p, sock).await?);
+            let c = PChain::fetch(p, sock).await?;
+            vec.push(c);
         }
+        t.chains = iter_conv(vec).into_iter().try_collect()?;
         Ok(t)
     }
 }
@@ -132,7 +212,7 @@ impl Fetch<Chain> for PChain {
 }
 
 pub trait Fat {
-    /// process recursively for state application
+    /// Compose the batch based on proposal and the status quo
     async fn compose<S: AsyncSocket>(&self, batch: &mut Batch, sock: &mut S) -> Result<()>;
 }
 
@@ -175,19 +255,22 @@ impl Concrete for PTable {
 impl Subbed for NftState {
     type SP = PTable;
     type ST = Table;
+    type SPIter<'a> = hash_map::Values<'a, String, Self::SP>;
     async fn sub_objs_existing<S: AsyncSocket>(&self, sock: &mut S) -> Result<Self::STIter> {
         Ok(list_tables_async(sock).await?)
     }
     fn sub_props(&self) -> Result<Self::SPIter<'_>> {
-        Ok(&self.tables)
+        Ok(self.tables.values())
     }
+    // not exclusive
 }
 
 impl Subbed for PTable {
     type SP = PChain;
     type ST = Chain;
+    type SPIter<'a> = hash_map::Values<'a, String, Self::SP>;
     fn sub_props(&self) -> Result<Self::SPIter<'_>> {
-        Ok(&self.chains)
+        Ok(self.chains.values())
     }
     async fn sub_objs_existing<S: AsyncSocket>(&self, sock: &mut S) -> Result<Self::STIter> {
         Ok(list_chains_for_table_async(&self.table, sock).await?)
@@ -270,21 +353,43 @@ pub fn redirect_dns(port: u16) -> Result<NftState> {
     rules.insert(r1);
 
     let prop = NftState {
-        tables: vec![PTable {
+        tables: conv_collect!([PTable {
             table,
-            chains: vec![PChain { chain, rules }],
-        }],
+            chains: conv_collect!([PChain { chain, rules }]),
+        }]),
     };
 
     Ok(prop)
 }
 
+use rustables::*;
+
+pub fn block_forward(index: impl IntoIterator<Item = u32>) -> Result<NftState> {
+    let table = Table::new(ProtocolFamily::Inet).with_name(TABLE_NAME.to_owned());
+    let chain = Chain::new(&table)
+        .with_hook(Hook::new(HookClass::Forward, 0))
+        .with_name(FO_CHAIN)
+        .with_policy(ChainPolicy::Accept);
+
+    let mut rules = HashSet::new();
+    for k in index {
+        rules.insert(drop_interface_rule_index(k, &chain)?);
+    }
+    Ok(NftState {
+        tables: conv_collect!([PTable {
+            table,
+            chains: conv_collect!([PChain { chain, rules }]),
+        }]),
+    })
+}
+
 impl NftState {
-    pub async fn apply<S: AsyncSocket>(self, sock: &mut S) -> Result<Self> {
+    /// Mutate netlink to the desired state
+    pub async fn apply<S: AsyncSocket>(&self, sock: &mut S) -> Result<()> {
         let mut b = Batch::new();
         self.compose(&mut b, sock).await?;
         b.send_async(sock).await?;
-        Ok(self)
+        Ok(())
     }
 }
 
@@ -307,10 +412,10 @@ pub async fn apply_block_forwad(veth_list: &[&str], sock: &mut impl AsyncSocket)
     }
 
     let prop = NftState {
-        tables: vec![PTable {
+        tables: conv_collect!([PTable {
             table,
-            chains: vec![PChain { chain, rules }],
-        }],
+            chains: conv_collect!([PChain { chain, rules }]),
+        }]),
     };
 
     prop.apply(sock).await?;
@@ -339,34 +444,4 @@ pub fn drop_interface_rule_index(index: u32, chain: &Chain) -> Result<Rule> {
         .with_expr(Immediate::new_verdict(VerdictKind::Drop));
 
     Ok(r)
-}
-
-#[derive(Default, Debug)]
-pub struct IncrementalNft {
-    links: Vec<u32>,
-}
-
-use rustables::*;
-impl IncrementalNft {
-    pub fn drop_packets_from(&mut self, index: u32) {
-        log::info!("Add nft rule for {}", index);
-        self.links.push(index);
-    }
-    // TODO: blocking socket
-    pub async fn execute(&mut self, sock: &mut impl AsyncSocket) -> Result<()> {
-        let table = Table::new(ProtocolFamily::Inet).with_name(TABLE_NAME.to_owned());
-        let chain = Chain::new(&table)
-            .with_hook(Hook::new(HookClass::Forward, 0))
-            .with_name(FO_CHAIN)
-            .with_policy(ChainPolicy::Accept);
-        let mut batch: Batch = Batch::new();
-        for index in self.links.iter() {
-            let rule = drop_interface_rule_index(*index, &chain)?;
-            batch.add(&rule, MsgType::Add);
-        }
-        batch.send_async(sock).await?;
-        self.links.clear();
-
-        Ok(())
-    }
 }

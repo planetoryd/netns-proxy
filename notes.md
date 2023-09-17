@@ -207,3 +207,100 @@ Security should be based on intention.
 If it exists and inode mismatch, it may be created by `ip netns`, or some other tool.
 
 The NSIDFrom is always considered the intention, as it is the source. 
+
+### Concurrency
+
+- Allocation of exclusive use of Netns, and Sub.
+
+1. Share the map across threads and take locks
+2. Make an executor that allocate the resource on one thread.
+
+- Graph
+    - Each task can depend on other tasks
+    - Each task is marked with done or not.
+    - A task is executable if all the deps are done
+    - Executing a task changes its state to done
+    - Goal: An algo that finds a subset of executable tasks
+- Allocation
+    - Global state: A set of available resources. 
+        - Resource Type1, HashMap<ResourceID, ResourceInstance>
+        - Resource Type2, ...
+    - A schedule loop that triggers allocation when we begin the program or when there is available resource, when a task finishes.
+    - Spawn tasks concurrently with mutually exclusive allocated resources, each iteration.
+    - Goal: An algo that finds a subset of executable tasks that can be concurrently executed in this iteration, which uses up all the available resources. 
+
+- Subset of executable tasks
+    - Subset of concurrentable tasks.
+
+
+```log
+    Analyzing target/debug/rust_sat
+
+File  .text     Size Crate
+1.5%  44.5% 816.1KiB rustsat_cadical
+0.7%  21.0% 384.8KiB std
+0.5%  15.6% 285.9KiB rustsat
+0.2%   5.7% 104.5KiB rustsat_glucose
+0.1%   2.8%  51.6KiB maxpre
+0.1%   2.4%  44.8KiB scuttle
+0.1%   1.8%  32.8KiB anyhow
+0.0%   1.3%  24.6KiB strsim
+0.0%   1.1%  19.8KiB [Unknown]
+0.0%   0.8%  15.3KiB rustsat_minisat
+0.0%   0.8%  13.9KiB rustsat_kissat
+0.0%   0.2%   4.2KiB rust_sat
+0.0%   0.1%   1.8KiB cpu_time
+0.0%   0.1%   1.7KiB flate2
+0.0%   0.1%   1.5KiB nom
+0.0%   0.1%   1.5KiB xz2
+0.0%   0.1%   1.1KiB memchr
+0.0%   0.0%     222B cnfgen
+0.0%   0.0%     192B clap_builder
+0.0%   0.0%     190B bzip2
+0.0%   0.0%     166B termcolor
+0.0%   0.0%     140B crc32fast
+0.0%   0.0%     101B rustc_hash
+0.0%   0.0%       5B libc
+3.4% 100.0%   1.8MiB .text section size, the file size is 53.4MiB
+
+File  .text     Size Crate
+2.9%  46.1% 388.6KiB std
+2.1%  34.1% 287.5KiB rustsat
+0.4%   6.2%  52.0KiB rustsat_minisat
+0.3%   5.0%  42.4KiB scuttle
+0.2%   3.9%  32.8KiB anyhow
+0.0%   0.5%   4.1KiB rust_sat
+
+File  .text     Size Crate
+2.8%  42.9% 388.6KiB std
+2.1%  31.8% 287.5KiB rustsat
+0.8%  12.3% 111.1KiB rustsat_glucose
+0.3%   4.7%  42.4KiB scuttle
+0.2%   3.6%  32.8KiB anyhow
+```
+
+```log
+
+    Analyzing target/release/rust_sat
+
+ File  .text     Size Crate
+ 6.1%  60.1% 301.6KiB std
+ 1.6%  16.3%  81.8KiB rustsat_glucose
+
+     Analyzing target/release/rust_sat
+
+File  .text     Size Crate
+6.2%  68.9% 301.6KiB std
+1.4%  15.4%  67.4KiB rustsat
+0.5%   5.8%  25.2KiB rustsat_minisat
+0.4%   4.6%  20.0KiB scuttle
+```
+
+upkeep
+
+- get avail subjects
+- for each, get the avail task (fnplan(reqs, exec), final_state)
+- feed into SAT solver
+- (tasks -> resources)
+
+

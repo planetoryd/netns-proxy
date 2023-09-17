@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 default-run = "nsproxy"
 
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
@@ -44,3 +45,7 @@ bitflags = "2.4.0"
 tun2proxy = { path = "../tun2proxy" }
 smoltcp = "0.10.0"
 tokio-send-fd = "0.9.3"
+simple-stream = "0.11.0"
+leapfrog = "0.3.0"
+async_scheduler = { path = "../async_scheduler" }
+bimap = { version = "0.6.3", features = ["serde"] }

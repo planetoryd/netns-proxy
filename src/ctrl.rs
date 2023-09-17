@@ -1,7 +1,8 @@
 use std::future::pending;
 use std::{path::Path, sync::Arc};
 
-use crate::sub::SubHub;
+use crate::schedule::{DeriveRes, NSWaitfree, NetnspState};
+use crate::sub::{self, Sub, SubHub};
 use crate::util::{self, wait_pid, GroupTasks, KillMask, PidOp, ProcessGroup};
 use crate::{
     data::ConfPaths,
@@ -89,7 +90,7 @@ impl Server {
                 });
                 if let Some(cb) = rx.recv().await {
                     log::info!("Abort main task");
-                    subs.broadcast(crate::sub::ToSub::KillAllSubjects).await?;
+                    subs.kill_all_subjects().await?;
                     pm.kill_subjects(KillMask::all()).await;
                     pm.kill_await(Some(&ProcessGroup::Supervisor), KillMask::all())
                         .await;
@@ -199,71 +200,45 @@ use crate::netlink::*;
 async fn main_task(
     paths: Arc<ConfPaths>,
     ctx: TaskCtx,
-    subs: SubHub,
+    subs: SubHub<NSWaitfree<Sub, NSID>>,
     mut cmd: UnboundedReceiver<ToServer>,
 ) -> Result<()> {
     use util::*;
     // IP addresses etc. are fixed by putting derivation in the state file
     // Applying a SubjectInfo should work regardless how messed up the user's system state is.
     // Therefore all tasks may be aborted
-    let state_r = NetnspState::load(paths.clone()).await;
-    let mut state: NetnspState = match state_r {
+    let state = NetnspState::load(subs, ctx.clone(), paths.clone()).await;
+    let mut state: NetnspState = match state {
         Result::Ok(e) => e,
         Err(e) => {
             bail!(e.context("There may be an error in your configuration or state files"));
         }
     };
-    state.load_ids();
 
-    let mn: MultiNS = MultiNS::new(paths, ctx.clone()).await?;
-    let mut nl_socket = TokioSocket::new(NETLINK_NETFILTER)?;
-    mn.init_current().await?;
-    state.derivative.update_nsid().await?;
-    state.derive_named_all().await?;
-    state.dump().await?;
-    // All named are derived and NSes are present.
-    state.flatpak_ensure()?;
-
-    state
-        .resume(&mn, ctx.clone(), &mut nl_socket, &subs)
-        .await?;
+    state.resume().await?;
     state.dump().await?;
 
     let (sx, rx) = unbounded_channel();
     let flp = FlatpakWatcher::new(sx.clone());
-    let (t, _) = TaskOutput::immediately(Box::pin(flp.daemon()), "flatpak-watcher".to_owned());
-    ctx.pm
-        .send(PidOp::Add(ProcessGroup::Supervisor, TaskKind::Task(t)))
-        .unwrap();
+    let (t, _) = TaskOutput::immediately(flp.daemon(), "flatpak-watcher".to_owned());
+    ctx.reg(ProcessGroup::Supervisor, TaskKind::Task(t));
     let sxx = sx.clone();
     let (t, _) = TaskOutput::immediately(
-        Box::pin(async move {
+        async move {
             while let Some(c) = cmd.recv().await {
                 sx.send(MainEvent::Command(c)).unwrap();
             }
             Ok(())
-        }),
+        },
         "command-to-watcher".to_owned(),
     );
-    ctx.pm
-        .send(PidOp::Add(ProcessGroup::Supervisor, TaskKind::Task(t)))
-        .unwrap();
+    ctx.reg(ProcessGroup::Supervisor, TaskKind::Task(t));
 
     let (t, _) = TaskOutput::immediately(
-        Box::pin(event_handler(
-            rx,
-            state,
-            mn,
-            sxx,
-            ctx.clone(),
-            subs.clone(),
-            nl_socket,
-        )),
+        event_handler(rx, state, sxx, ctx.clone()),
         "event-handler".to_owned(),
     );
-    ctx.pm
-        .send(PidOp::Add(ProcessGroup::Supervisor, TaskKind::Task(t)))
-        .unwrap();
+    ctx.reg(ProcessGroup::Supervisor, TaskKind::Task(t));
 
     pending::<()>().await;
     Ok(())
@@ -272,18 +247,16 @@ async fn main_task(
 async fn event_handler(
     mut rx: UnboundedReceiver<MainEvent>,
     mut state: NetnspState,
-    mn: MultiNS,
     sx: UnboundedSender<MainEvent>,
     ctx: TaskCtx,
-    subs: SubHub,
-    mut sock: impl AsyncSocket + Send + Sync,
 ) -> Result<()> {
     while let Some(ev) = rx.recv().await {
         match ev {
             MainEvent::Flatpak(fp) => {
+                
                 match state.derive_flatpak(fp.clone()).await? {
                     DeriveRes::New => {
-                        let inf = state
+                        let si = state
                             .derivative
                             .flatpak
                             .get_mut(&fp.pid)
@@ -292,31 +265,25 @@ async fn event_handler(
                         if let Some(pf) = pf {
                             let s2 = sx.clone();
                             let (t, _) = TaskOutput::immediately(
-                                Box::pin(async move {
+                                async move {
                                     pf.await?;
-                                    s2.send(MainEvent::SubjectExpire(SubjectKey::Flatpak(fp.pid)))
+                                    s2.send(MainEvent::SubjectExpire(si.id.clone()))
                                         .unwrap();
                                     // even if flatpak exits right now it has to finish this iteration first.
                                     Ok(())
-                                }),
+                                },
                                 "flatpak-pidfd-".to_owned() + &fp.pid.0.to_string(),
                             );
-                            ctx.pm
-                                .send(PidOp::Add(
-                                    util::ProcessGroup::Subject(inf.ns.clone()),
-                                    util::TaskKind::Task(t),
-                                ))
-                                .unwrap();
-                            inf.ns.connect(&mn, &subs).await?;
+                            ctx.reg(
+                                util::ProcessGroup::Subject(si.ns.clone()),
+                                util::TaskKind::Task(t),
+                            );
+
                             let inf = state.derivative.flatpak.get(&fp.pid).unwrap();
-                            inf.apply_veths(&mn, &state.derivative, &mut state.nft)
-                                .await?;
-                            state.nft.execute(&mut sock).await?;
                             state.dump().await?;
 
                             let inf = state.derivative.flatpak.get_mut(&fp.pid).unwrap();
                             // start all daemons
-                            inf.run(&subs).await?;
                         }
                         // else, process exited early
                     }
@@ -326,7 +293,8 @@ async fn event_handler(
             MainEvent::Command(cmd) => match cmd {
                 ToServer::GC(p) => {
                     if let Some(k) = state.derivative.named_ns.get(&p) {
-                        k.garbage_collect(&mn, &state.derivative, &ctx).await?;
+                        k.garbage_collect(&mn, &state.derivative, &mut state.sche)
+                            .await?;
                         state.derivative.named_ns.remove(&p);
                         state.dump().await?;
                     } else {
@@ -339,18 +307,8 @@ async fn event_handler(
                 SubjectKey::Flatpak(fp) => {
                     let si = state.derivative.flatpak.remove(&fp);
                     if let Some(si) = si {
-                        si.garbage_collect(&mn, &state.derivative, &ctx).await?;
-                        ctx.pm
-                            .send(PidOp::Kill(
-                                util::ProcessGroup::Subject(si.ns.clone()),
-                                KillMask::all(),
-                            ))
-                            .map_err(|_| {
-                                anyhow!(
-                                    "trying to kill the processes of {}, sending Pid failed",
-                                    si.ns
-                                )
-                            })?;
+                        si.garbage_collect(&mn, &state.derivative, &mut state.sche)
+                            .await?;
                         state.dump().await?;
                     } else {
                         // it prolly has been GCed

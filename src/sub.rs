@@ -1,15 +1,20 @@
 use crate::netlink::nl_ctx;
+use crate::nft::Mergeable;
+use crate::schedule::{NMap, NSMap, NSWaitfree};
 use crate::{tun2proxy, util};
 use anyhow::{bail, Result};
 use bytes::{Buf, Bytes, BytesMut};
 use dashmap::mapref::one::{Ref, RefMut};
+use derivative::Derivative;
 use futures::stream::{SplitSink, SplitStream};
-use futures::{SinkExt, StreamExt, TryFutureExt};
+use futures::{Future, SinkExt, StreamExt, TryFutureExt};
+use nix::sys::memfd;
 use rtnetlink::netlink_proto::new_connection_with_socket;
 use rtnetlink::netlink_sys::{AsyncSocket, TokioSocket};
 use rtnetlink::Handle;
 use serde::{Deserialize, Serialize};
 
+use simple_stream::frame::SimpleFrameBuilder;
 use smoltcp::phy::{Medium, TunTapInterface};
 use tidy_tuntap::flags;
 use tokio::fs::remove_file;
@@ -52,22 +57,6 @@ use tokio_util::codec::Framed;
 use crate::state::*;
 use crate::util::*;
 
-impl SubjectInfo<NamedV> {
-    pub async fn run(&mut self, sub: &SubHub) -> Result<()> {
-        let (mut s, _) = sub.op(self.ns.clone()).await?;
-        s.send(ToSub::Named(self.clone())).await?;
-        Ok(())
-    }
-}
-
-impl SubjectInfo<FlatpakV> {
-    pub async fn run(&mut self, sub: &SubHub) -> Result<()> {
-        let (mut s, _) = sub.op(self.ns.clone()).await?;
-        s.send(ToSub::Flatpak(self.clone())).await?;
-        Ok(())
-    }
-}
-
 pub struct NsubState {
     pub ns: Netns,
     pub ctx: TaskCtx,
@@ -88,18 +77,62 @@ pub async fn handle_signal(pw: Arc<ProcessManager>) -> Result<()> {
     exit(0);
 }
 
-pub struct TUNFD {
-    fd: RawFd,
-    mtu: i32,
+#[derive(Default)]
+pub struct NLFilter<N: NMap<V = TokioSocket>> {
+    subs: SubHub<NSWaitfree<Sub, NSID>>,
+    map: Arc<N>,
 }
 
-/// Not cloneable
+impl<N: NMap<V = TokioSocket>> NLFilter<N> {
+    pub async fn init_sock(&self, k: &NSIDKey) -> Result<TokioSocket> {
+        let (_g, sub, _): (_, _, _) = self.subs.get(k).await?;
+        let fd = sub
+            .get_fd(FDReq::Netlink(
+                rtnetlink::netlink_sys::constants::NETLINK_NETFILTER,
+            ))
+            .await?;
+        let ts = unsafe { TokioSocket::from_raw_fd(fd.fd) };
+
+        Ok(ts)
+    }
+}
+
+impl<N: NMap<V = TokioSocket>> NSMap for NLFilter<N> {
+    type Inner = N;
+    type V = N::V;
+    async fn get<'r, Fut: Future<Output = Result<Self::V>>>(
+        &'r self,
+        k: &<Self::Inner as NMap>::K,
+    ) -> Result<(
+        <Self::Inner as NMap>::ReadGuard<'r>,
+        fn(&'r <Self::Inner as NMap>::ReadGuard<'r>) -> &'r Self::V,
+        bool,
+    )> {
+        self.map
+            .get(k, async move |x| self.init_sock(x).await)
+            .await
+    }
+    async fn get_mut<'w, Fut: Future<Output = Result<Self::V>>>(
+        &'w self,
+        k: &<Self::Inner as NMap>::K,
+    ) -> Result<(
+        <Self::Inner as NMap>::WriteGuard<'w>,
+        fn(&'w mut <Self::Inner as NMap>::WriteGuard<'w>) -> &'w mut Self::V,
+        bool,
+    )>
+    where
+        Self::V: 'w,
+    {
+        self.map
+            .get_mut(k, async move |x| self.init_sock(x).await)
+            .await
+    }
+}
+
 #[derive(Debug)]
 pub struct Sub {
     pub sink: SplitSink<Framed<UnixStream, LengthDelimitedCodec>, Bytes>,
-    pub ns_q: mpsc::UnboundedSender<oneshot::Sender<RawFd>>,
-    pub tun_q: mpsc::UnboundedSender<oneshot::Sender<TUNFD>>,
-    pub netlink_q: mpsc::UnboundedSender<oneshot::Sender<RawFd>>,
+    pub fd_queue: mpsc::UnboundedSender<oneshot::Sender<FdPre>>,
     pub fd_counter: AtomicU32,
 }
 
@@ -108,14 +141,14 @@ impl Sub {
         self.sink.send(util::to_vec_internal(&x)?.into()).await?;
         Ok(())
     }
-    /// get an fd opened by the sub process
-    pub async fn get_nsfd(&mut self, ns: NSID) -> Result<RawFd> {
+    /// This fn has to be atomic therefore &mut
+    pub async fn get_fd(&mut self, req: FDReq) -> Result<FdPre> {
         let (sx, rx) = oneshot::channel();
-        // must send the sx before
-        self.ns_q.send(sx).unwrap();
-        self.send(ToSub::FetchFd(FDReq::Open(ns))).await?;
-        let fd = rx.await?;
-        Ok(fd)
+        // atmoic begins
+        self.fd_queue.send(sx).unwrap();
+        self.send(ToSub::FetchFd(req)).await?;
+        // atomic ends
+        Ok(rx.await?)
     }
     pub fn new_fd_token(&mut self) -> FdToken {
         FdToken(
@@ -125,28 +158,26 @@ impl Sub {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct SubHub {
-    pub subs: Arc<DashMap<NSID, Sub>>,
+#[derive(Debug, Derivative)]
+#[derivative(Clone(bound = ""))]
+pub struct SubHub<N: NMap<V = Sub, K = NSID> + Default> {
+    pub map: Arc<N>,
     sock_path: PathBuf,
-    queue: mpsc::UnboundedSender<(NSID, oneshot::Sender<()>)>,
+    queue: mpsc::UnboundedSender<(NSID, oneshot::Sender<Sub>)>,
     ctx: TaskCtx,
 }
 
-/// to manipulate an NS
-pub type NsubClient<'a> = Ref<'a, NSID, Sub>;
-
-impl SubHub {
+impl<N: NMap<V = Sub, K = NSID> + Default> SubHub<N> {
     /// only need one per program
     pub async fn new(ctx: TaskCtx, paths: Arc<ConfPaths>) -> Result<Self> {
         let sock_rpc = paths.sock4rpc();
         if sock_rpc.exists() {
             remove_file(sock_rpc.as_path()).await?;
         }
-        let subs = Arc::new(DashMap::new());
+        let subs = Arc::new(N::default());
         let sock = UnixListener::bind(sock_rpc.as_path())?;
         let sub_m = subs.clone();
-        let (queue, mut rx) = mpsc::unbounded_channel::<(NSID, oneshot::Sender<()>)>();
+        let (queue, mut rx) = mpsc::unbounded_channel::<(NSID, oneshot::Sender<Sub>)>();
         let sockr = sock_rpc.clone();
         let task = async move {
             let mut to_abort = Vec::new();
@@ -157,15 +188,11 @@ impl SubHub {
                 let f: Framed<UnixStream, LengthDelimitedCodec> =
                     Framed::new(stream, LengthDelimitedCodec::new());
                 let (sink, mut stream) = f.split();
-                let (fds, mut fdr) = mpsc::unbounded_channel();
-                let (tun_sx, mut tun_r) = mpsc::unbounded_channel();
-                let (nl_sx, mut nl_r) = mpsc::unbounded_channel();
+                let (fd_q, mut fd_rx) = mpsc::unbounded_channel();
 
                 let f = Sub {
                     sink,
-                    ns_q: fds,
-                    tun_q: tun_sx,
-                    netlink_q: nl_sx,
+                    fd_queue: fd_q,
                     fd_counter: AtomicU32::new(0),
                 };
 
@@ -173,41 +200,16 @@ impl SubHub {
                     while let Some(byt) = stream.next().await {
                         let pack: ToMain = util::from_vec_internal(&byt?)?;
                         match pack {
-                            ToMain::FD(res) => match res {
-                                FDRes::NSFD(rfd) => {
-                                    if let Some(sx) = fdr.recv().await {
-                                        sx.send(rfd)
-                                            .map_err(|_| anyhow!("sending NS fd failed"))?;
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                FDRes::TUN(mtu) => {
-                                    let fd = fd_stream.recv_fd().await?;
+                            ToMain::FD(res) => {
+                                let fd = fd_stream.recv_fd().await?;
 
-                                    if let Some(sx) = tun_r.recv().await {
-                                        sx.send(TUNFD { fd, mtu })
-                                            .map_err(|_| anyhow!("sending TUN fd failed"))?;
-                                    } else {
-                                        break;
-                                    }
-
-                                    // getting TUN fd happens in reverse order.
-                                    // push into TUN queue, request sub
+                                if let Some(sx) = fd_rx.recv().await {
+                                    sx.send(FdPre { fd, kind: res })
+                                        .map_err(|_| anyhow!("sending TUN fd failed"))?;
+                                } else {
+                                    break;
                                 }
-                                FDRes::Netlink => {
-                                    let fd = fd_stream.recv_fd().await?;
-                                    if let Some(sx) = nl_r.recv().await {
-                                        sx.send(fd)
-                                            .map_err(|_| anyhow!("sending netlink fd failed"))?;
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                FDRes::TAP => {
-                                    todo!()
-                                }
-                            },
+                            }
                             _ => unimplemented!(),
                         }
                     }
@@ -219,9 +221,7 @@ impl SubHub {
                 log::trace!("wait for rpc-sub assignment");
                 if let Some((id, sx)) = rx.recv().await {
                     log::trace!("rpc-sub assigned {}", id);
-                    let r = sub_m.insert(id, f);
-                    assert!(r.is_none());
-                    sx.send(()).map_err(|_| anyhow!("sending failed"))?;
+                    sx.send(f).map_err(|_| anyhow!("sending failed"))?;
                 } else {
                     // channel closed. should not happen
                     anyhow::bail!("queue channel closed");
@@ -229,24 +229,21 @@ impl SubHub {
             }
             Ok(())
         }; // must start it now
-        let (t, _r) = TaskOutput::immediately(Box::pin(task), "rpc-listener".to_owned());
-        ctx.pm
-            .send(PidOp::Add(ProcessGroup::Top, TaskKind::Task(t)))
-            .unwrap();
+        let (t, _r) = TaskOutput::immediately(task, "rpc-listener".to_owned());
+        ctx.reg(ProcessGroup::Top, TaskKind::Task(t));
         // ends when the listener closes
 
         Ok(Self {
             sock_path: sock_rpc,
-            subs,
+            map: subs,
             queue,
             ctx,
         })
     }
-    /// Starts the child process
+    /// Starts a child process
     fn run(&self, fd: RawFd, id: NSID) -> Result<()> {
         let sp = self.sock_path.as_path().to_owned();
 
-        let sx = self.ctx.pm.clone();
         let e = std::env::current_exe()?;
         log::trace!("self exe {:?}", &e);
         let mut cmd: tokio::process::Child = Command::new(e)
@@ -258,53 +255,84 @@ impl SubHub {
 
         let pid = cmd.id().unwrap();
         log::debug!("Subprocess started {}", pid);
-        sx.send(util::PidOp::Add(
-            ProcessGroup::Sub(id.clone()),
-            util::TaskKind::Process(Pid(pid)),
-        ))
-        .unwrap();
+        self.ctx
+            .reg(ProcessGroup::Sub(id.as_key()), TaskKind::Process(Pid(pid)));
 
         let h = async move {
             let e = cmd.wait().await?;
             log::warn!("Subprocess exited {}, {}", e, pid);
             Ok(())
         };
-        let (t, _r) = TaskOutput::immediately(Box::pin(h), "rpc-proc".to_owned());
+        let (t, _r) = TaskOutput::immediately(h, "rpc-proc".to_owned());
         self.ctx
-            .pm
-            .send(PidOp::Add(ProcessGroup::Sub(id), TaskKind::Task(t)))
-            .unwrap();
+            .reg(ProcessGroup::Sub(id.as_key()), TaskKind::Task(t));
         Ok(())
     }
-    // gets the handle to operate on an NS
-    pub async fn op(&self, id: NSID) -> Result<(RefMut<'_, NSID, Sub>, OpRes)> {
-        // Subprocess is started on first use
-        let p = match self.subs.get_mut(&id) {
-            None => {
-                log::trace!("create new rpc-sub");
-                let nf = id.open().await?;
-                let (sx, rx) = oneshot::channel::<()>();
-                self.queue.send((id.clone(), sx)).unwrap();
-                // There is a brief period of time. Fork + execve can give a child process the NS fd
-                nf.unset_cloexec()?;
-                self.run(nf.0.as_raw_fd(), id.clone())?;
-                drop(nf);
-                rx.await?;
-                log::trace!("rpc-sub received");
-                (
-                    self.subs.get_mut(&id).ok_or(anyhow!("ns missing"))?,
-                    OpRes::NewSub,
-                )
-            }
-            Some(k) => (k, OpRes::Existing),
-        };
-        Ok(p)
-    }
-    pub async fn broadcast(&self, msg: ToSub) -> Result<()> {
-        for mut k in self.subs.iter_mut() {
+    /// Unsafe because some operations have to be atomic, or you may cause UB
+    pub async unsafe fn broadcast(&self, msg: ToSub) -> Result<()> {
+        for mut k in self.map.iter_mut() {
             k.send(msg.clone()).await?;
         }
         Ok(())
+    }
+    pub async fn kill_subject(&self, subject: NSIDKey) -> Result<()> {
+        unsafe {
+            self.broadcast(ToSub::Kill(
+                ProcessGroup::Subject(subject),
+                KillMask::all(),
+            ))
+            .await
+        }
+    }
+    pub async fn kill_all_subjects(&self) -> Result<()> {
+        unsafe {
+            self.broadcast(crate::sub::ToSub::KillAllSubjects).await
+        }
+    }
+    pub async fn init_sub(&self, ns: &NSID) -> Result<Sub> {
+        let nf = ns.open().await?;
+        let (sx, rx) = oneshot::channel::<Sub>();
+        self.queue.send((ns.clone(), sx)).unwrap();
+        nf.unset_cloexec()?;
+        self.run(nf.0.as_raw_fd(), ns.clone())?;
+        drop(nf);
+        let sub = rx.await?;
+        let (u, g) = get_non_priv_user(None, None, None, None)?;
+        sub.send(ToSub::Init((*self.paths).clone(), u, g, ns.clone()))
+            .await?;
+        Ok(sub)
+    }
+}
+
+impl<N: NMap<V = Sub, K = NSID> + Default> NSMap for SubHub<N> {
+    type V = Sub;
+    type Inner = N;
+    async fn get<'r, Fut: Future<Output = Result<Self::V>>>(
+        &'r self,
+        k: &<Self::Inner as NMap>::K,
+    ) -> Result<(
+        <Self::Inner as NMap>::ReadGuard<'r>,
+        fn(&'r <Self::Inner as NMap>::ReadGuard<'r>) -> &'r Self::V,
+        bool,
+    )> {
+        self.map
+            .get(k, async move |ns| self.init_sub(ns).await)
+            .await
+    }
+    async fn get_mut<'w, Fut: Future<Output = Result<Self::V>>>(
+        &'w self,
+        k: &<Self::Inner as NMap>::K,
+    ) -> Result<(
+        <Self::Inner as NMap>::WriteGuard<'w>,
+        fn(&'w mut <Self::Inner as NMap>::WriteGuard<'w>) -> &'w mut Self::V,
+        bool,
+    )>
+    where
+        Self::V: 'w,
+    {
+        self.map
+            .get_mut(k, async move |ns| self.init_sub(ns).await)
+            .await
     }
 }
 
@@ -320,6 +348,7 @@ pub enum ToSub {
     Named(SubjectInfo<NamedV>),
     PutFd(FdToken, FDRes),
     FetchFd(FDReq),
+    /// spawn a tun2proxy process in this NS
     TUN2Proxy(TUN2ProxyE, FdToken),
     Kill(ProcessGroup, KillMask),
     KillAllSubjects,
@@ -343,21 +372,16 @@ pub enum ToMain {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum FDRes {
-    NSFD(RawFd),
     /// MTU
     TUN(i32),
-    TAP,
+    TAP(i32),
     Netlink,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FdPre {
-    fd: RawFd,
-    kind: FDRes,
-}
-
-impl FdPre {
-    /// produce the FD and consume it
-    pub fn consume(self) {}
+    pub fd: RawFd,
+    pub kind: FDRes,
 }
 
 pub async fn next<T: for<'a> Deserialize<'a> + Debug>(
@@ -395,22 +419,43 @@ pub async fn send(
         .map_err(anyhow::Error::from)
 }
 
-pub fn send_blocking(stream: &mut impl std::io::Write, v: impl Serialize) -> Result<()> {
-    let mut state = LengthDelimitedCodec::new();
-    let mut buf = BytesMut::new();
-    state.encode(util::to_vec_internal(&v)?.into(), &mut buf)?;
-    while buf.has_remaining() {
-        let k = stream.write(buf.chunk())?;
-        buf.advance(k);
-    }
-    Ok(())
-}
-
 #[derive(Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize, Clone)]
 pub struct FdToken(u32);
 
-pub fn tuntap_(sock: RawFd) {
-    let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(sock) };
+#[cfg(test)]
+mod test_stream {
+    use super::ToSub;
+    use crate::util::from_vec_internal;
+    use crate::util::to_vec_internal;
+    use anyhow::Ok;
+    use anyhow::Result as Res;
+    use simple_stream::{
+        frame::{FrameBuilder, SimpleFrame, SimpleFrameBuilder},
+        Blocking, Plain,
+    };
+    use std::os::unix::net::UnixStream;
+    use std::thread::spawn;
+
+    #[test]
+    fn test_simple_stream() -> Res<()> {
+        let (sa, sb) = UnixStream::pair()?;
+        spawn(move || {
+            let mut f: Plain<UnixStream, SimpleFrameBuilder> = Plain::new(sa);
+            let buf = to_vec_internal(&ToSub::FetchFd(super::FDReq::TAP("a".to_owned())))?;
+            let f1 = SimpleFrame::new(&buf);
+            f.b_send(&f1)?;
+            Ok(())
+        });
+        let b = spawn(move || {
+            let mut f: Plain<UnixStream, SimpleFrameBuilder> = Plain::new(sb);
+            let k = f.b_recv()?;
+            let p: ToSub = from_vec_internal(&k.payload())?;
+            dbg!(p);
+            Ok(())
+        });
+        b.join();
+        Ok(())
+    }
 }
 
 pub async fn handle(
@@ -480,12 +525,18 @@ pub async fn handle(
                         }
                     }
                     ToSub::TUN2Proxy(args, token) => {
+                        use simple_stream::{
+                            frame::{FrameBuilder, SimpleFrame, SimpleFrameBuilder},
+                            Blocking, Plain,
+                        };
+                        use std::os::unix::net::UnixStream;
+
                         let dev = fd_map.remove(&token).ok_or(anyhow!("Fd doesn't exsit"))?;
                         let (sa, sb) = UnixStream::pair()?;
                         sb.unset_cloexec()?;
                         dev.fd.unset_cloexec()?;
                         let process = Command::new(std::env::current_exe()?)
-                            .arg("tuntap_")
+                            .arg("tuntap")
                             .arg(sb.as_raw_fd().to_string())
                             .spawn()?;
                         drop(sb);
@@ -493,13 +544,17 @@ pub async fn handle(
                             nsub.ctx
                                 .pm
                                 .send(PidOp::Add(
-                                    ProcessGroup::Subject(args.ns.clone()),
+                                    ProcessGroup::Subject(args.ns.as_key()),
                                     TaskKind::Process(Pid(alive)),
                                 ))
                                 .unwrap();
-                            let k = args.to_args(dev.fd);
-                            let mut f = Framed::new(sa, LengthDelimitedCodec::new());
-                            send(&mut f, &k).await?;
+                            let mut f: Plain<UnixStream, SimpleFrameBuilder> = Plain::new(sa);
+                            let buf = to_vec_internal(&args)?;
+                            let f1 = SimpleFrame::new(&buf);
+                            f.b_send(&f1)?;
+                            let buf = to_vec_internal(&dev)?;
+                            let f1 = SimpleFrame::new(&buf);
+                            f.b_send(&f1)?;
                         } else {
                             log::error!("Tun2proxy stopped early");
                         }
@@ -524,6 +579,7 @@ async fn ns_task<V: VSpecifics>(
     subject_ns: &NSID,
     sock: &mut impl AsyncSocket,
 ) -> Result<()> {
+    let mut eff = Remainder::default();
     {
         let tun = tidy_tuntap::Tun::new(TUN_NAME, false)?;
         let flags = tun.flags().unwrap();
@@ -554,8 +610,9 @@ async fn ns_task<V: VSpecifics>(
             Exp::Confirmed(true)
         ));
     });
-
-    info.apply_nft_dns(sock).await?;
+    let k = info.apply_nft_dns().await?;
+    eff.merge(k)?;
+    eff.apply(sock).await?;
     info.may_run_tun2socks(nsub).await?;
     info.may_run_dnsproxy(nsub).await?;
     Ok(())

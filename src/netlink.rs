@@ -3,24 +3,27 @@ use ron::ser::PrettyConfig;
 
 use crate::{
     data::*,
-    nft::redirect_dns,
-    sub::ToSub,
+    nft::{redirect_dns, Mergeable, NftState},
+    schedule::{
+        DerivationEvent, FnPlan, NMap, NSIDs, NSMap, NSWaitfree, RsrcReqList, SATVar, SubjectT,
+    },
+    sub::{NsubState, Sub, ToSub},
     util::{flatpak_perms_checkup, perms::get_non_priv_user, TaskCtx, TaskOutput},
 };
 
-use futures::{future::Ready, FutureExt, SinkExt, StreamExt, TryFutureExt};
+use futures::{future::Ready, Future, FutureExt, SinkExt, StreamExt, TryFutureExt};
 use ipnetwork::IpNetwork;
 
 use serde::{Deserialize, Serialize};
 
 use tokio::{
     io::AsyncWriteExt,
+    process::Command,
     sync::{oneshot, RwLock},
 };
 
 use crate::{
     data::Pid,
-    nft::IncrementalNft,
     sub::{self, SubHub},
     util::{self, convert_strings_to_strs},
 };
@@ -30,6 +33,7 @@ use anyhow::{anyhow, bail, Ok, Result};
 use nix::{fcntl::FdFlag, sched::CloneFlags};
 
 use std::{
+    any::{Any, TypeId},
     collections::{BTreeMap, BTreeSet, HashSet},
     default,
     fmt::Debug,
@@ -37,6 +41,8 @@ use std::{
     net::Ipv6Addr,
     ops::{Deref, Index},
     os::fd::FromRawFd,
+    pin::Pin,
+    process::Stdio,
     str::FromStr,
     sync::Arc,
 };
@@ -56,7 +62,7 @@ use crate::util::ns::*;
 use rtnetlink::{
     netlink_packet_route::{nlas::link::InfoKind, rtnl::link::nlas, IFF_LOWER_UP},
     netlink_proto::{new_connection_from_socket, NetlinkCodec},
-    netlink_sys::{AsyncSocket, TokioSocket},
+    netlink_sys::{protocols::NETLINK_ROUTE, AsyncSocket, TokioSocket},
 };
 
 use crate::util::error::*;
@@ -73,263 +79,6 @@ pub macro nl_ctx {
         let (mut $sub, mut $conn) = $nl.$sub();
         $body
     }}
-}
-
-impl NetnspState {
-    // for nftables
-    pub async fn pers_links_in_root(&self) -> Result<Vec<LinkKey>> {
-        let base_names: Vec<&VPairKey> = self
-            .derivative
-            .named_ns
-            .iter()
-            .flat_map(|(_p, info)| {
-                info.vaddrs.iter().filter_map(|(k, v)| {
-                    if matches!(k, NSRef::Root) {
-                        Some(&v.key)
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect();
-
-        // a for subject, b for target=root
-        // VConn always connects from subject ns to other ns. Subject ns can not be root ns. Therefore it's always `false`.
-        let veth_host: Vec<LinkKey> = base_names.iter().map(|base| base.link(LinkAB::B)).collect();
-        Ok(veth_host)
-    }
-    // do a full sync of firewall intention
-    /// Caveat, do this before applying other nft
-    pub async fn initial_nft(&mut self, sock: &mut impl AsyncSocket) -> Result<()> {
-        let inames = self.pers_links_in_root().await?;
-        let inames = inames.into_iter().map(|s| s.0).collect::<Vec<_>>();
-        let x = convert_strings_to_strs(&inames);
-        log::info!(
-            "Apply nftables rules to block forwarding of {:?} in root_ns",
-            &x
-        );
-        nft::apply_block_forwad(&x, sock).await?;
-        // added the tables and chains
-        self.nft_refresh_once = true;
-        // after that only individual rules need to be added for each flatpak
-        Ok(())
-    }
-    /// places empty defaults if they dont exist
-    pub async fn load(paths: Arc<ConfPaths>) -> Result<NetnspState> {
-        log::info!("{:?}", paths);
-        let path = Path::new(&paths.settings);
-        let sett: Settings;
-        if path.exists() {
-            let mut file = File::open(path).await?;
-            let mut contents = String::new();
-            file.read_to_string(&mut contents).await?;
-            sett = serde_json::from_str(&contents)?;
-        } else {
-            sett = Default::default();
-            log::info!("Generating default settings");
-            let serialized = serde_json::to_string_pretty(&sett)?;
-            let mut file = tokio::fs::File::create(path).await?;
-            file.write_all(serialized.as_bytes()).await?;
-            log::warn!("Blank settings written to {:?}", &path);
-        }
-
-        let path = Path::new(&paths.derivative);
-        let deri: Derivative = if path.exists() {
-            let mut file = File::open(path).await?;
-            let mut contents = String::new();
-            file.read_to_string(&mut contents).await?;
-            let mut k: Derivative = ron::from_str(&contents)?;
-            k.update_rootns()?;
-            k
-        } else {
-            // allow it to not exist
-            let mut n = Derivative::default();
-            n.init().await?;
-            n
-        };
-
-        let r = Self {
-            derivative: deri,
-            settings: sett,
-            paths,
-            nft_refresh_once: false,
-            ids: Default::default(),
-            nft: Default::default(),
-        };
-
-        Ok(r)
-    }
-
-    pub fn load_sync(paths: Arc<ConfPaths>) -> Result<NetnspState> {
-        use std::fs::File;
-        use std::io::{Read, Write};
-        log::info!("{:?}", paths);
-        let path = Path::new(&paths.settings);
-        let sett: Settings;
-        if path.exists() {
-            let mut file = File::open(path)?;
-            let mut contents = String::new();
-            file.read_to_string(&mut contents)?;
-            sett = serde_json::from_str(&contents)?;
-        } else {
-            sett = Default::default();
-            log::info!("Generating default settings");
-            let serialized = serde_json::to_string_pretty(&sett)?;
-            let mut file = std::fs::File::create(path)?;
-            file.write_all(serialized.as_bytes())?;
-            log::info!("Blank settings written to {:?}", &path);
-        }
-
-        let path = Path::new(&paths.derivative);
-        let deri: Derivative = if path.exists() {
-            let mut file = File::open(path)?;
-            let mut contents = String::new();
-            file.read_to_string(&mut contents)?;
-            let mut k: Derivative = ron::from_str(&contents)?;
-            k.update_rootns()?;
-            k
-        } else {
-            // allow it to not exist
-            let mut n = Derivative::default();
-            n.update_rootns()?;
-            n
-        };
-
-        let r = Self {
-            derivative: deri,
-            settings: sett,
-            paths,
-            nft_refresh_once: false,
-            ids: Default::default(),
-            nft: Default::default(),
-        };
-
-        Ok(r)
-    }
-    /// derive for named ns that are not not yet derived
-    pub async fn derive_named_all(&mut self) -> Result<()> {
-        for ns in self.settings.profiles.keys() {
-            match self.derivative.named_ns.get(&ns) {
-                None => {
-                    self.ids.new_unique(ns.clone());
-                    let p = self.settings.profiles.get(&ns).ok_or(DevianceError)?;
-                    let res = p
-                        .resolve_global(&self, self.ids.last_unique().unwrap(), &NamedV(ns.clone()))
-                        .await?;
-                    log::info!("Derive for {}", res.ns);
-                    self.derivative.named_ns.insert(ns.to_owned(), res);
-                }
-                Some(n) => {
-                    log::info!("Derivative for {} exists. Will not override", n.ns);
-                    // Skip if there is a persisted version
-                }
-            }
-        }
-        Ok(())
-    }
-    pub async fn derive_flatpak(&mut self, fv: FlatpakV) -> Result<DeriveRes> {
-        match self.derivative.flatpak.get(&fv.pid) {
-            Some(n) => {
-                log::info!("Derivative for {} exists. Will not override", n.ns);
-                Ok(DeriveRes::Existent)
-            }
-            None => {
-                let n = FlatpakBaseName::new(&fv.id, fv.pid.clone());
-                self.ids.new_unique(n);
-                let r = self.settings.flatpak.get(&fv.id);
-                if let Some(r) = r {
-                    let p = self.settings.profiles.get(&r).ok_or(DevianceError)?;
-                    let res = p
-                        .resolve_global(&self, self.ids.last_unique().unwrap(), &fv)
-                        .await?;
-                    log::info!("Derive for {}", res.ns);
-                    self.derivative.flatpak.insert(fv.pid, res);
-                    Ok(DeriveRes::New)
-                } else {
-                    Ok(DeriveRes::NoProfile)
-                }
-            }
-        }
-    }
-    pub async fn dump(&self) -> Result<()> {
-        let derivative = ron::ser::to_string_pretty(&self.derivative, PrettyConfig::new())?;
-        let mut file = tokio::fs::File::create(&self.paths.derivative).await?;
-        file.write_all(derivative.as_bytes()).await?;
-        Ok(())
-    }
-    pub fn flatpak_ensure(&self) -> Result<()> {
-        let li = self.settings.flatpak.keys().collect();
-        flatpak_perms_checkup(li)?;
-        Ok(())
-    }
-    /// Also, resume from persisted state
-    pub async fn resume(
-        &mut self,
-        mn: &MultiNS,
-        ctx: TaskCtx,
-        sock: &mut impl AsyncSocket,
-        subs: &SubHub,
-    ) -> Result<()> {
-        // Some derivative do not have associated profiles
-        // This is invalid, because the information is incomplete for configuration.
-        self.derivative
-            .clean_named(&self.settings.profiles, &mn, &ctx)
-            .await?;
-        self.derivative
-            .clean_flatpak(&self.settings.flatpak, &mn, &ctx)
-            .await?; // Non-existent NSes are cleaned
-
-        log::debug!("Resume from saved state");
-
-        for (_, info) in &mut self.derivative.named_ns {
-            info.ns.connect(mn, subs).await?;
-        }
-        // Must init all Netns first
-
-        for (_, info) in &self.derivative.named_ns {
-            info.apply_veths(&mn, &self.derivative, &mut self.nft)
-                .await?;
-        }
-        self.initial_nft(sock).await?;
-
-        // started after nft applied
-        for (_, info) in &mut self.derivative.named_ns {
-            info.run(subs).await?;
-        }
-
-        // Resume flatpaks
-
-        for (_n, info) in &mut self.derivative.flatpak {
-            info.ns.connect(mn, subs).await?;
-        }
-        // Must init all Netns first
-        for (_n, info) in &self.derivative.flatpak {
-            info.apply_veths(&mn, &self.derivative, &mut self.nft)
-                .await?;
-        }
-        self.nft.execute(sock).await?;
-        // Config all first
-        for (_n, info) in &mut self.derivative.flatpak {
-            info.run(subs).await?;
-        }
-
-        Ok(())
-    }
-    /// this must be done after loading from state, before any new derivation
-    pub fn load_ids(&mut self) {
-        for (_, s) in &self.derivative.flatpak {
-            self.ids.push(s.id.clone());
-        }
-        for (_, s) in &self.derivative.named_ns {
-            self.ids.push(s.id.clone());
-        }
-    }
-}
-
-pub enum DeriveRes {
-    New,
-    Existent,
-    NoProfile,
 }
 
 use futures::stream::TryStreamExt;
@@ -515,6 +264,7 @@ impl<F: AsRawFd> NsFile<F> {
 }
 
 pub trait Fcntl: AsRawFd {
+    /// This flag specifies that the file descriptor should be closed when an exec function is invoked
     fn set_cloexec(&self) -> Result<i32> {
         nix::fcntl::fcntl(
             self.as_raw_fd(),
@@ -992,7 +742,6 @@ impl Netns {
         let netlink = NLStateful::new(netlink).await?;
         Ok(Netns { id: entry, netlink })
     }
-
     pub async fn thread() -> Result<Netns> {
         let id = NSIDFrom::Thread.to_id(NSCreate::empty()).await?;
         let mut netlink =
@@ -1230,14 +979,14 @@ pub fn tun_ops(tun: tidy_tuntap::Tun) -> Result<()> {
 
     Ok(())
 }
-
-#[derive(Debug)]
+#[derive(Clone)]
 /// About multiple ns-es
-pub struct MultiNS {
+pub struct NetnsMap<N: NMap<V = Netns>> {
     /// Take mut reference when operating on an NS.
-    pub ns: RwLock<HashMap<NSID, RwLock<Netns>>>,
+    map: Arc<N>,
     paths: Arc<ConfPaths>,
-    ctx: TaskCtx,
+    pub ctx: TaskCtx,
+    pub subs: SubHub<NSWaitfree<Sub, NSID>>,
 }
 
 impl ConfPaths {
@@ -1252,120 +1001,183 @@ impl ConfPaths {
     }
 }
 
-impl MultiNS {
-    pub async fn new(paths: Arc<ConfPaths>, ctx: TaskCtx) -> Result<MultiNS> {
-        let mn = MultiNS {
-            ns: Default::default(),
+impl<N: NMap<V = Netns, K = NSID> + Default> NSMap for NetnsMap<N> {
+    type Inner = N;
+    type V = Netns;
+    async fn get<'r, Fut: Future<Output = Result<Self::V>>>(
+        &'r self,
+        k: &<Self::Inner as NMap>::K,
+    ) -> Result<(
+        <Self::Inner as NMap>::ReadGuard<'r>,
+        fn(&'r <Self::Inner as NMap>::ReadGuard<'r>) -> &'r Self::V,
+        bool,
+    )> {
+        self.map
+            .get(k, async move |ns| self.init_ns(ns).await)
+            .await
+    }
+    async fn get_mut<'w, Fut: Future<Output = Result<Self::V>>>(
+        &'w self,
+        k: &<Self::Inner as NMap>::K,
+    ) -> Result<(
+        <Self::Inner as NMap>::WriteGuard<'w>,
+        fn(&'w mut <Self::Inner as NMap>::WriteGuard<'w>) -> &'w mut Self::V,
+        bool,
+    )>
+    where
+        Self::V: 'w,
+    {
+        self.map
+            .get_mut(k, async move |ns| self.init_ns(ns).await)
+            .await
+    }
+}
+
+impl<N: NMap<V = Netns, K = NSID> + Default> NetnsMap<N> {
+    pub fn new(
+        paths: Arc<ConfPaths>,
+        ctx: TaskCtx,
+        subs: SubHub<NSWaitfree<Sub, NSID>>,
+    ) -> Result<Self> {
+        let mn = NetnsMap {
+            map: Default::default(),
             paths,
             ctx,
+            subs,
         };
 
         Ok(mn)
     }
-    pub async fn init_current(&self) -> Result<()> {
-        let ro = Netns::thread().await?;
-        let mut m = self.ns.write().await;
-        m.insert(ro.id.clone(), ro.into());
-        Ok(())
-    }
-    /// may be called only once per NSID
-    pub async fn netlink_for_sub(&self, id: NSID, subs: &SubHub) -> Result<NLHandle> {
-        use rtnetlink::netlink_sys::constants::NETLINK_ROUTE;
-
-        let (mut stream, r) = subs.op(id.clone()).await?;
-        match r {
-            sub::OpRes::NewSub => {
-                log::trace!("Handle newly created sub for {}", id);
-                let (sx, rx) = oneshot::channel();
-                let (u, g) = get_non_priv_user(None, None, None, None)?;
-                stream
-                    .send(ToSub::Init((*self.paths).clone(), u, g, id.clone()))
-                    .await?;
-                stream.netlink_q.send(sx).unwrap();
-                stream
-                    .send(ToSub::FetchFd(sub::FDReq::Netlink(NETLINK_ROUTE)))
-                    .await?;
-                let fd = rx.await?;
-                let ts = unsafe { TokioSocket::from_raw_fd(fd) };
+    pub async fn init_ns(&self, id: &NSID) -> Result<Netns> {
+        match id.from {
+            // root is assumed to = thread
+            NSIDFrom::Root | NSIDFrom::Thread => Netns::thread().await,
+            // the rest needs separate processes
+            _ => {
+                let (g, sub, _): (_, _, _) = self.subs.get_mut(id).await?;
+                let sub = sub(&mut g);
+                let fd = sub.get_fd(sub::FDReq::Netlink(NETLINK_ROUTE)).await?;
+                let ts = unsafe { TokioSocket::from_raw_fd(fd.fd) };
                 let (conn, handle, _m) = new_connection_from_socket::<_, _, NetlinkCodec>(ts);
 
                 let (t, _r) = TaskOutput::immediately(
-                    Box::pin(async move {
+                    async move {
                         conn.await;
                         Ok(())
-                    }),
+                    },
                     "netlink-conn-".to_owned() + &id.inode.to_string(), // this waits on the conn. it ends when the conn ends
                 );
 
                 self.ctx
                     .pm
                     .send(PidOp::Add(
-                        ProcessGroup::Subject(id.clone()),
+                        ProcessGroup::Subject(id.as_key()),
                         TaskKind::Task(t),
                     ))
                     .unwrap();
                 let rth = Handle::new(handle);
                 let nc = NLHandle { handle: rth };
-                log::trace!("Got netlink for {}", id.inode);
-
-                Ok(nc)
-                // then insert nc into self.netlinks. then call init_for
+                let nl = NLTracked::new(Arc::new(nc));
+                let ns = nl.to_netns(self.clone()).await?;
+                Ok(ns)
             }
-            sub::OpRes::Existing => unreachable!(), // this method shouldn't be called twice
         }
     }
 }
 
-impl<V: VSpecifics> SubjectInfo<V> {
-    /// places the veth and adds addrs. generic over V
-    pub async fn apply_veths(
-        &self,
-        sys: &MultiNS,
-        de: &Derivative,
-        nft: &mut IncrementalNft,
-    ) -> Result<()> {
-        let map = sys.ns.read().await;
-        let subject_ns_lock = map.get(&self.ns).ok_or(DevianceError)?;
-        let mut subject_ns = subject_ns_lock.write().await;
-        // let (mut subject_sub, _) = sys.procs.op(self.ns.clone()).await?;
-        log::trace!("{}, iterate over vaddrs", self.ns);
-        for (n, c) in self.vaddrs.iter() {
-            let id = n.resolve_derivative(&de).await?;
-            if id == self.ns {
-                // Would cause a deadlock.
-                bail!("VethConn can not have a connection to subject NS itself");
-            }
-            let t_ns_lock = map.get(&id).ok_or(DevianceError)?;
-            let mut t_ns = t_ns_lock.write().await;
-            c.apply(&mut subject_ns, &mut t_ns).await?;
-            match n {
-                NSRef::Root => {
-                    let k = c.key.link(LinkAB::B);
-                    t_ns.netlink.get_link(k.clone()).await?;
-                    nl_ctx!(link, _conn, t_ns.netlink, {
-                        let li = link.not_absent(&k)?.exist_ref()?;
-                        nft.drop_packets_from(li.index);
-                    });
-                }
-                _ => (),
-            }
-            c.apply_addr_up(&mut subject_ns, &mut t_ns).await?;
-        }
+pub trait Subject {
+    async fn assure_in_ns(&self) -> Result<()>;
+    async fn may_run_tun2socks(&self, state: &mut NsubState) -> Result<()>;
+    async fn may_run_dnsproxy(&self, state: &mut NsubState) -> Result<()>;
+}
+
+impl<V: VSpecifics> Subject for SubjectInfo<V> {
+    fn assure_in_ns(&self) -> Result<()> {
+        let c = NSIDFrom::Thread.to_id_sync(NSCreate::empty())?;
+        anyhow::ensure!(c == self.ns);
         Ok(())
     }
-    pub async fn apply_nft_dns(&self, sock: &mut impl AsyncSocket) -> Result<()> {
-        match &self.dnsproxy {
+    /// These two methods return shortly. Tasks are passed to the awaiter
+    /// Conforms to PidAwaiter
+    async fn may_run_tun2socks(&self, st: &mut NsubState) -> Result<()> {
+        use crate::netlink::*;
+        use crate::util::watch_log;
+
+        if let Some(addr) = self.tun2socks {
+            log::info!("Run tun2socks for {}", self.ns);
+            let mut tun2 = std::process::Command::new("tun2socks");
+            tun2.uid(st.non_priv_uid.into())
+                .gid(st.non_priv_gid.into())
+                .groups(&[st.non_priv_gid.into()]);
+            let prxy = format!("socks5://{}", addr.to_string());
+            tun2.args(&["-device", TUN_NAME, "-proxy", &prxy]);
+            let mut tun2_async: Command = tun2.into();
+            tun2_async.stdout(Stdio::piped());
+            let mut tun2h = tun2_async.spawn()?;
+            let pid = Pid(tun2h.id().ok_or(anyhow!("Tun2socks stopped"))?);
+            st.ctx.reg(ProcessGroup::Subject(self.ns.clone()), TaskKind::Process(pid));
+            use tokio_stream::wrappers::LinesStream;
+            let stdout = tun2h.stdout.take().unwrap();
+            let reader = LinesStream::new(tokio::io::BufReader::new(stdout).lines());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let pre = format!("{}/tun2socks", self.id);
+            tokio::spawn(watch_log(Box::pin(reader), Some(tx), pre.clone()));
+            rx.await?; // wait for first line to appear
+            let tunk: LinkKey = TUN_NAME.parse()?;
+            let tun = {
+                nl_ctx!(link, conn, st.ns.netlink, {
+                    let tun = link.not_absent(&tunk)?.exist_mut()?;
+                    conn.set_up(tun).await?;
+                    tun.index
+                })
+            };
+            _ = st
+                .ns
+                .netlink
+                .ip_add_route(tun, None, Some(true), RouteFor::TUNIpv4)
+                .await;
+            _ = st
+                .ns
+                .netlink
+                .ip_add_route(tun, None, Some(false), RouteFor::TUNIpv6)
+                .await;
+        }
+
+        Ok(())
+    }
+    async fn may_run_dnsproxy(&self, state: &mut NsubState) -> Result<()> {
+        use crate::netlink::*;
+
+        match self.dnsproxy {
             DNSProxyR::Disabled => (),
-            DNSProxyR::Enabled(conf) => {
-                let p = conf.port;
-                log::info!(
-                    "{} Apply nft rules, redirect all TCP/UDP requests to :53 to localhost:{p}",
-                    self.ns
-                );
-                let s = redirect_dns(p)?;
-                s.apply(sock).await?;
+            DNSProxyR::Enabled(ref conf) => {
+                log::info!("Run dnsproxy for {}", self.ns);
+                let mut dns1 = std::process::Command::new("dnsproxy");
+                dns1.uid(state.non_priv_uid.into())
+                    .gid(state.non_priv_gid.into())
+                    .groups(&[state.non_priv_gid.into()]);
+                if let Some(ref k) = conf.args {
+                    dns1.args(k);
+                }
+                let mut dns2: Command = dns1.into();
+                dns2.stdout(Stdio::piped());
+                dns2.stderr(Stdio::piped());
+                let mut dns3 = dns2.spawn()?;
+                let pid = Pid(dns3.id().ok_or(anyhow!("Dnsproxy stopped"))?);
+                state.ctx
+                    .pm
+                    .send(PidOp::Add(
+                        ProcessGroup::Subject(self.ns.clone()),
+                        TaskKind::Process(pid),
+                    ))
+                    .unwrap();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let pre = format!("{}/dnsproxy", self.id);
+                watch_both(&mut dns3, pre.clone(), Some(tx))?;
+                rx.await?; // wait for first line to appear
             }
         }
+
         Ok(())
     }
 }

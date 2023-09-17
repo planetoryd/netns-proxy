@@ -1,6 +1,6 @@
 # Containerized OPSEC networking for Desktop
 
-`nsproxy` is a single binary that can run as a SUID daemon, or to control the daemon, along with some netns related utilities. 
+`nsproxy` is a general networking tool aimed at personal OPSEC networking, primarily for desktop.
 
 - set your firewall to allow `10.0.0.0/8` of incoming connections (input)
 - install the following, make them available in `$PATH`

@@ -22,7 +22,7 @@ pub enum MainEvent {
     Flatpak(FlatpakV),
     Command(ToServer),
     /// Some subjects have bounded lifetime
-    SubjectExpire(SubjectKey)
+    SubjectExpire(UniqueInstance)
 }
 
 pub struct FlatpakWatcher {

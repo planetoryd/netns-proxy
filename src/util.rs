@@ -35,8 +35,8 @@ use tokio::{
     task::{AbortHandle, JoinError, JoinHandle, JoinSet},
 };
 
-
 use crate::data::FlatpakID;
+use crate::data::NSIDKey;
 use crate::data::Pid as DPid;
 use crate::data::NSID;
 use crate::netlink::NsFile;
@@ -469,6 +469,22 @@ pub mod error {
     #[derive(Error, Debug)]
     #[error("Something is missing, and it can be handled")]
     pub struct MissingError;
+
+    #[derive(Error, Debug)]
+    #[error("Errors that shouldn't happen")]
+    pub struct ProgrammingError;
+}
+
+pub trait AssumeUnwrap {
+    type T;
+    fn assume(self) -> Result<Self::T>;
+}
+
+impl<T> AssumeUnwrap for Option<T> {
+    type T = T;
+    fn assume(self) -> Result<Self::T> {
+        self.ok_or(ProgrammingError.into())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Deserialize, Serialize, Clone)]
@@ -478,10 +494,10 @@ pub enum ProcessGroup {
     /// Daemons for all NS, killed when reloading
     Supervisor,
     /// Of specific subject
-    Subject(NSID),
-    /// Daemon processes. 
-    Sub(NSID)
-}  
+    Subject(NSIDKey),
+    /// Daemon processes.
+    Sub(NSIDKey),
+}
 
 pub enum PidOp {
     Kill(ProcessGroup, KillMask),
@@ -493,6 +509,7 @@ pub enum TaskKind {
     Task(Pin<Box<dyn (Future<Output = TaskOutput>) + Send>>),
 }
 
+/// Actor model
 /// Awaiter for both async tasks and processes
 pub struct ProcessManager {
     pub sx: UnboundedSender<PidOp>,
@@ -508,7 +525,7 @@ pub struct GroupTasks {
 
 pub mod flags {
     use bitflags::bitflags;
-    use serde::{Serialize, Deserialize};
+    use serde::{Deserialize, Serialize};
 
     bitflags! {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -552,14 +569,13 @@ pub fn wait_pid(x: DPid) -> Option<PidFuture> {
 }
 
 use std::collections::hash_map::Entry;
+
+use self::error::ProgrammingError;
 impl ProcessManager {
     pub fn new() -> Arc<Self> {
         let (sx, mut rx) = unbounded_channel::<PidOp>();
         let groups: Arc<_> = Default::default();
-        let p = Arc::new(Self {
-            sx,
-            groups,
-        });
+        let p = Arc::new(Self { sx, groups });
         let g = p.groups.clone();
         let p2 = p.clone();
         tokio::spawn(async move {
@@ -618,6 +634,12 @@ pub struct TaskCtx {
     pub pm: UnboundedSender<PidOp>,
 }
 
+impl TaskCtx {
+    pub fn reg(&self, pg: ProcessGroup, k: TaskKind) {
+        self.pm.send(PidOp::Add(pg, k)).unwrap()
+    }
+}
+
 pub struct TaskOutput {
     pub name: String,
     pub result: Result<()>,
@@ -627,7 +649,7 @@ pub struct TaskOutput {
 
 impl TaskOutput {
     pub fn new(
-        f: Pin<Box<dyn Future<Output = Result<()>> + Send>>,
+        f: impl Future<Output = Result<()>> + Send + 'static,
         name: String,
     ) -> (
         Pin<Box<dyn Future<Output = TaskOutput> + Send>>,
@@ -647,8 +669,9 @@ impl TaskOutput {
             rx,
         )
     }
+
     pub fn wrapped<E2: std::error::Error + Send + Sync + 'static, T: 'static + Debug>(
-        f: Pin<Box<dyn Future<Output = Result<Result<T>, E2>> + Send>>,
+        f: impl Future<Output = Result<Result<T>, E2>> + Send + 'static,
         name: String,
     ) -> (
         Pin<Box<dyn Future<Output = TaskOutput> + Send>>,
@@ -676,7 +699,7 @@ impl TaskOutput {
         )
     }
     pub fn immediately<T: Send + 'static + Debug>(
-        f: Pin<Box<dyn Future<Output = Result<T>> + Send>>,
+        f: impl Future<Output = Result<T>> + Send + 'static,
         name: String,
     ) -> (
         Pin<Box<dyn Future<Output = TaskOutput> + Send>>,
@@ -689,13 +712,13 @@ impl TaskOutput {
             Ok(())
         })
         .into();
-        Self::wrapped(Box::pin(h), n2)
+        Self::wrapped(h, n2)
     }
     pub fn immediately_std<
         T: Send + 'static + Debug,
         E: std::error::Error + Send + Sync + 'static,
     >(
-        f: Pin<Box<dyn Future<Output = Result<T, E>> + Send>>,
+        f: impl Future<Output = Result<T, E>> + Send + 'static,
         name: String,
     ) -> (
         Pin<Box<dyn Future<Output = TaskOutput> + Send>>,
@@ -708,7 +731,7 @@ impl TaskOutput {
             Ok(())
         })
         .into();
-        Self::wrapped(Box::pin(h), n2)
+        Self::wrapped(h, n2)
     }
     pub fn handle_task_result<T: Debug, E: Debug>(x: Result<T, E>, name: String) {
         // a task can error before Awaiter start awaiting, which produces an error

@@ -7,7 +7,8 @@ use clap::{Parser, Subcommand};
 
 use futures::Future;
 use netns_proxy::ctrl::{ToClient, ToServer};
-use netns_proxy::sub::{SocketEOF, tuntap_};
+use netns_proxy::sub::SocketEOF;
+use netns_proxy::tun2proxy::tuntap;
 use netns_proxy::util::ns::self_netns_identify;
 use netns_proxy::util::perms::*;
 use nix::sched::CloneFlags;
@@ -76,8 +77,7 @@ enum Commands {
     // Control commands
     /// Reload config by the daemon
     Reload,
-    TUNTAP(TUN2ProxyArgs),
-    Tuntap_ {
+    Tuntap {
         sock: RawFd,
     },
     Sub {
@@ -103,7 +103,7 @@ fn main() -> Result<()> {
         Some(Commands::Sub { sock: path, ns: fd }) => {
             let fd: std::fs::File = unsafe { std::fs::File::from_raw_fd(fd) };
             let ns = NsFile(fd);
-            ns.unset_cloexec()?;
+            ns.set_cloexec()?;
             ns.enter()?;
             // NS must be entered before tokio starts, because setns doesn't affect existing threads
             async_run(async move {
@@ -134,8 +134,7 @@ fn main() -> Result<()> {
                 Ok(())
             })
         }
-        Some(Commands::TUNTAP(args)) => netns_proxy::tun2proxy::tun2proxy(args),
-        Some(Commands::Tuntap_ { sock }) => tuntap_(sock),
+        Some(Commands::Tuntap { sock: fd }) => tuntap(fd)?,
         Some(Commands::Stop {}) => {
             netns_proxy::util::kill_suspected()?;
         }
