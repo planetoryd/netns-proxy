@@ -16,9 +16,11 @@
 #![feature(decl_macro)]
 #![feature(return_position_impl_trait_in_trait)]
 #![feature(type_changing_struct_update)]
+#![feature(adt_const_params)]
 // #![allow(unused)]
 #![deny(unused_must_use)]
 #![allow(unused_braces)]
+#![allow(incomplete_features)]
 #![allow(unreachable_code)]
 
 // pub mod watcher;

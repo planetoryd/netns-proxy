@@ -25,6 +25,7 @@ use procfs::process::Process;
 use netlink_ops::netns::Pid as DPid;
 use serde::Deserialize;
 use serde::Serialize;
+use thiserror::Error;
 use tokio::io::BufStream;
 use tokio::{
     signal::unix::SignalKind,
@@ -469,3 +470,7 @@ pub fn from_vec_internal<'a, T: for<'b> serde::Deserialize<'b>>(b: &'a [u8]) -> 
     let k = ron::from_str(&String::from_utf8_lossy(b))?;
     Ok(k)
 }
+
+#[derive(Error, Debug)]
+#[error("sender or receiver failure")]
+pub struct ChannelFailure;

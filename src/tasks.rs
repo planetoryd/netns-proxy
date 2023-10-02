@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     fmt::Display,
-    marker,
+    marker::{self, ConstParamTy},
     net::IpAddr,
     os::fd::RawFd,
     path::{Path, PathBuf},
@@ -52,6 +52,8 @@ use crate::{
     util::{from_vec_internal, to_vec_internal, wait_pid, AbortOnDropTokio},
 };
 
+use crate::util::ChannelFailure;
+
 #[derive(Debug, Default)]
 /// Use this instead of [tokio::spawn]
 pub struct ServerTasks {
@@ -97,7 +99,7 @@ impl SubjectData {
         dev: DevFd,
         conf: TUN2Proxy,
         ns: NSFd,
-        confstate: &ProgramConfig<Validated>,
+        confstate: &ProgramConfig<{ Validate::Done }>,
         id: &SubjectKey,
         spawn: impl FnOnce(PidFuture) -> AbortHandle,
     ) -> Result<()> {
@@ -105,6 +107,8 @@ impl SubjectData {
         ns.fd.unset_cloexec()?;
         let mut command = std::process::Command::new(std::env::current_exe()?);
         let path = confstate.tuntap_conf_path(id.0);
+        todo!();
+        // serialize, write file
         command
             .arg("tuntap")
             .arg(dev.fd.to_string())
@@ -117,6 +121,8 @@ impl SubjectData {
         Ok(())
     }
 }
+
+assert_impl_all!(PidFuture: marker::Send, Sync);
 
 // All subprocesses should be monitored with pidfd.
 // Drop the Pidfd Future to kill the process. or the usual way.
@@ -189,7 +195,7 @@ pub macro FDType( $t:ident, $inner:ident ) {
 pub enum CtrlMsg {
     SubjectMsg(),
     /// Allow setting config through protocol
-    ProgramConfig(ProgramConfig<()>),
+    ProgramConfig(ProgramConfig<{ Validate::Undone }>),
 }
 
 #[choices]
@@ -304,7 +310,7 @@ impl<'k> ChoiceB<'k> for Sub {
     type BrancherSession = End;
 }
 
-impl<'k> ChoiceB<'k> for ProgramConfig<()> {
+impl<'k> ChoiceB<'k> for ProgramConfig<{ Validate::Undone }> {
     #[session('k Client)]
     type SelectorSession = End;
     #[session('k Server)]
@@ -340,13 +346,13 @@ pub type BoxFunc =
     Box<dyn for<'a, 'b> FnOnce(&mut Listener, FutSetW<'a, 'b>) -> Result<()> + marker::Send>;
 pub type FutOut = Option<BoxFunc>;
 
+pub type AbortaFut<'f> = Pin<Box<dyn Future<Output = Result<FutOut>> + marker::Send + Sync + 'f>>;
+
 #[derive(Clone, Copy)]
 /// To break type recursion
 pub struct FutSetW<'a, 'b>(pub &'a FutSet<'b>);
 
-pub type FutSet<'f> = FuturesUnordered<
-    Abortable<Pin<Box<dyn Future<Output = Result<FutOut>> + marker::Send + Sync + 'f>>>,
->;
+pub type FutSet<'f> = FuturesUnordered<Abortable<AbortaFut<'f>>>;
 
 assert_impl_all!(FutSet: marker::Send, Sync);
 
@@ -369,10 +375,10 @@ pub macro boxfn {
         }) as BoxFunc
     },
     ( $s:ident, $a:ident, $b:ident, $c:block ) => {
-        $s.send(Box::new(move |$a: &mut Listener, $b: FutSetW| {
+        $s.unbounded_send(Box::new(move |$a: &mut Listener, $b: FutSetW| {
             $c
             Ok(())
-        }) as BoxFunc).await?;
+        }) as BoxFunc).map_err(|_|ChannelFailure)?;
     }
 }
 
@@ -391,6 +397,16 @@ pub macro add_abortable_some($f:expr, $v:expr, $s:expr) {
         $s.push(f);
         $v = Some(h);
     }
+}
+
+pub macro ignored_abortable($f:expr, $s:expr) {
+    let (f, _h) = abortable($f);
+    $s.push(f);
+}
+
+pub async fn wrap_fut(f: impl Future<Output = Result<()>> + marker::Send + Sync) -> Result<FutOut> {
+    f.await?;
+    Ok(None)
 }
 
 impl<I: for<'a> Deserialize<'a>> Recving<I> for FramedUS {
@@ -423,28 +439,30 @@ impl<I: Serialize> Sending<I> for FramedUS {
 
 /// All config should be centralized here
 #[derive(Serialize, Deserialize, Clone)]
-pub struct ProgramConfig<S> {
+pub struct ProgramConfig<const V: Validate> {
     pub slirp4netns: PathBuf,
     pub server: PathBuf,
     /// Directory for tuntap confs
     pub tuntap_conf: PathBuf,
-    pub state: S,
 }
 
-pub struct Validated;
+#[derive(ConstParamTy, PartialEq, Eq)]
+pub enum Validate {
+    Done,
+    Undone,
+}
 
-impl Default for ProgramConfig<()> {
+impl Default for ProgramConfig<{ Validate::Undone }> {
     fn default() -> Self {
         Self {
             slirp4netns: "/usr/bin/slirp4netns".parse().unwrap(),
             server: "/var/lib/netns-proxy/sock".parse().unwrap(),
             tuntap_conf: "/run/netns-proxy/tuntap/".parse().unwrap(),
-            state: (),
         }
     }
 }
 
-impl ProgramConfig<Validated> {
+impl ProgramConfig<{ Validate::Done }> {
     pub fn tuntap_conf_path(&self, subject: impl ConfFile) -> PathBuf {
         let mut path = self.tuntap_conf.clone();
         path.set_file_name(subject.conf_file_name());
@@ -462,15 +480,12 @@ impl ConfFile for id_alloc::ID {
     }
 }
 
-impl TryFrom<ProgramConfig<()>> for ProgramConfig<Validated> {
+impl TryFrom<ProgramConfig<{ Validate::Undone }>> for ProgramConfig<{ Validate::Done }> {
     type Error = anyhow::Error;
-    fn try_from(value: ProgramConfig<()>) -> SResult<Self, Self::Error> {
+    fn try_from(value: ProgramConfig<{ Validate::Undone }>) -> SResult<Self, Self::Error> {
         todo!();
 
-        Ok(Self {
-            state: Validated,
-            ..value
-        })
+        Ok(Self { ..value })
     }
 }
 

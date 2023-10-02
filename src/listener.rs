@@ -1,15 +1,7 @@
 use crate::tasks::*;
 use std::{
-    collections::HashMap,
-    convert::Infallible,
-    fmt::Display,
-    marker,
-    net::IpAddr,
-    os::fd::RawFd,
     path::{Path, PathBuf},
-    pin::Pin,
-    process::exit,
-    result::Result as SResult,
+    result::Result as SResult, marker, pin::Pin,
 };
 
 use amplify::{From, Wrapper};
@@ -38,7 +30,6 @@ use static_assertions::{assert_impl_all, assert_not_impl_all};
 use thiserror::Error;
 use tokio::{
     net::{UnixListener, UnixStream},
-    task::JoinHandle,
 };
 use tokio_send_fd::SendFd;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
@@ -53,12 +44,12 @@ use crate::{
 };
 
 pub struct Listener {
-    conf: ProgramConfig<Validated>,
+    conf: ProgramConfig<{ Validate::Done }>,
     tasks: ServerTasks,
     serve_loop: Option<AbortHandle>,
     cb_loop: Option<AbortHandle>,
     sx: UnboundedSender<BoxFunc>,
- }
+}
 
 impl Listener {
     #[async_recursion(Sync)]
@@ -82,6 +73,18 @@ impl Listener {
             .await?;
             Ok(Some(Box::new(move |state: &mut Listener, set: FutSetW| {
                 // schedule the task to wait for new conns.
+                match id {
+                    Identify::Control(_) => {
+                        let f = Self::handle_ctrl(k, state.sx.clone());
+                        ignored_abortable!(Box::pin(async move {
+                            f.await?;
+                            Ok(None)
+                        }) as AbortaFut, set.0);
+                    }  
+                    Identify::Sub(_) => {
+                        todo!()
+                    }
+                }
                 add_abortable_some!(Self::sock_accept(sock), state.serve_loop, set.0);
                 Ok(())
             }) as BoxFunc))
@@ -119,7 +122,6 @@ impl Listener {
                             let mut recv = se.next(&k);
                             let (dev, cont) = recv.receive().await?;
                             let (ns, cont) = cont.receive().await?;
-
                             boxfn!(main, state, set, {
                                 let sname = k.0;
                                 let id = state.tasks.sids.alloc_or()?;
@@ -133,6 +135,7 @@ impl Listener {
                                     .run_tuntap(dev, k.1.tun2proxy, ns, &state.conf, &skey, |p| {
                                         abortable_spawn(
                                             Box::pin(async {
+                                                // error in PidFuture causes the entire program to crash
                                                 let rx = p.await?;
                            
                                                 Ok(Some(Box::new(move |state: &mut Listener, set: FutSetW| {
@@ -151,12 +154,11 @@ impl Listener {
                     },
                     CtrlMsg::ProgramConfig(c) => {
                         se = se.next(&c);
+                        todo!();
                         boxfn!(main, state, set, {
-                            unreachable!();
 
-                            let conf: ProgramConfig<Validated> = c.try_into()?;
-                            state.conf = conf;
-                            // conf may not take effect
+                            // let conf: ProgramConfig<Validated> = c.try_into()?;
+                            // state.conf = conf;
                         });
                     }
                 }
@@ -194,3 +196,4 @@ impl Listener {
         Ok(())
     }
 }
+
