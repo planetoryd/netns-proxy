@@ -303,4 +303,13 @@ upkeep
 - feed into SAT solver
 - (tasks -> resources)
 
+### reduce complexity
+
+usage of slirp
+
+- `unshare --map-root-user --net fish` creates a new netns and userns
+- `slirp4netns --configure --mtu=65520 --disable-host-loopback $pid tap0` 
+    - It gets into the netns, which doesn't need root, creates the TAP device and sends the FD out.
+    - The parent process gets the FD and handles it.
+    - The network routing in the unshared netns has been configured, and slirp forwards the traffic to outside.
 

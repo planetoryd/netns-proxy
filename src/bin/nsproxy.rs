@@ -1,20 +1,22 @@
 #![feature(setgroups)]
 #![feature(decl_macro)]
 #![feature(associated_type_bounds)]
+#![allow(unused)]
 
 use anyhow::{anyhow, bail, ensure, Ok, Result};
 use clap::{Parser, Subcommand};
 
-use futures::Future;
-use netns_proxy::ctrl::{ToClient, ToServer};
-use netns_proxy::sub::SocketEOF;
+use futures::{Future, SinkExt, StreamExt};
+use netlink_ops::netns::{Fcntl, NSCreate, NSIDFrom, Netns, NsFile, Pid};
+use netns_proxy::tasks::{Client, FDStream, TUN2Proxy};
 use netns_proxy::tun2proxy::tuntap;
-use netns_proxy::util::ns::self_netns_identify;
-use netns_proxy::util::perms::*;
 use nix::sched::CloneFlags;
-use nix::unistd::geteuid;
+use nix::unistd::{geteuid, Gid, Uid};
 
+use netns_proxy::util::{ns::*, perms::*, from_vec_internal};
 use std::env;
+use std::fs::File;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -24,9 +26,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::process::Command;
 
-use netns_proxy::data::*;
-use netns_proxy::netlink::*;
-
 #[derive(Parser)]
 #[command(
     author,
@@ -35,19 +34,15 @@ use netns_proxy::netlink::*;
     long_about = "utility for using netns as socks proxy containers, and other related tasks. It can run as a SUID daemon, a cli controller, or a standalone utility"
 )]
 struct Cli {
-    #[arg(short, long)]
-    ctl: bool,
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Stops all suspected netns-proxy processes/daemons
-    Stop {},
-    /// Exec in the netns, with everything else untampered. requires SUID
+    /// Exec in the netns, with everything else untampered. You may run this command with, or without SUID, or with sudo.
     Exec {
-        /// Enter a persistent NS. Their names are the same as the corresponding profiles'.
+        /// Enter a persistent NS.
         #[arg(short, long)]
         ns: Option<String>,
         /// Use an empty, new network namespace. This uses syscall unshare, but without the need of sudo.
@@ -74,11 +69,11 @@ enum Commands {
         #[arg(short, long)]
         ns: String,
     },
-    // Control commands
-    /// Reload config by the daemon
-    Reload,
     Tuntap {
-        sock: RawFd,
+        dev: RawFd,
+        conf: RawFd,
+        /// Can be PIDFD, or Netns
+        ns: RawFd,
     },
     Sub {
         /// RPC socket
@@ -91,61 +86,42 @@ enum Commands {
 fn main() -> Result<()> {
     let e = env_logger::Env::new().default_filter_or("warn,netns_proxy=debug,nsproxy=debug");
     env_logger::init_from_env(e);
-
     let cli = Cli::parse();
-
-    let euid = geteuid();
-    if euid != 0.into() {
-        log::warn!("Not running as root.");
-    }
-
     match cli.command {
-        Some(Commands::Sub { sock: path, ns: fd }) => {
-            let fd: std::fs::File = unsafe { std::fs::File::from_raw_fd(fd) };
+        Some(Commands::Sub { sock, ns }) => {
+            let fd: File = unsafe { File::from_raw_fd(ns) };
             let ns = NsFile(fd);
             ns.set_cloexec()?;
-            ns.enter()?;
+            ns.enter_net()?;
             // NS must be entered before tokio starts, because setns doesn't affect existing threads
             async_run(async move {
-                use netns_proxy::sub::handle;
-                use tokio::net::UnixStream;
-                use tokio_send_fd::SendFd;
-                use tokio_util::codec::Framed;
-                use tokio_util::codec::LengthDelimitedCodec;
-
-                let (pa, pb) = UnixStream::pair()?;
-                let conn = UnixStream::connect(path.as_path()).await?;
-                conn.send_stream(pa).await?;
-                let f: Framed<UnixStream, LengthDelimitedCodec> =
-                    Framed::new(conn, LengthDelimitedCodec::new());
-                let x = handle(f, pb).await;
-                if let Err(e) = x {
-                    if let Some(_) = e.downcast_ref::<SocketEOF>() {
-                        if netns_proxy::sub::SIG_EXIT.load(Ordering::SeqCst) {
-                            // ignore
-                        } else {
-                            log::error!("exit as sub \n Err: SocketEOF");
-                        }
-                    } else {
-                        log::error!("exit as sub \n Err: {:?}", e);
-                    }
-                    exit(1);
-                }
+                let c = Client::connect(&sock).await?;
+                unimplemented!();
                 Ok(())
             })
         }
-        Some(Commands::Tuntap { sock: fd }) => tuntap(fd)?,
-        Some(Commands::Stop {}) => {
-            netns_proxy::util::kill_suspected()?;
+        Some(Commands::Tuntap { dev, conf, ns }) => {
+            ns.set_cloexec()?;
+            conf.set_cloexec()?;
+            dev.set_cloexec()?;
+            let ns: File = unsafe { File::from_raw_fd(ns) };
+            let ns = NsFile(ns);
+            ns.enter_ner_user()?;
+            let mut conf: File = unsafe { File::from_raw_fd(conf) };
+            let mut buf = Default::default();
+            conf.read_to_end(&mut buf)?;
+            let conf: TUN2Proxy = from_vec_internal(&buf)?;
+            tuntap(conf, dev)?;
+            Ok(())
         }
         Some(Commands::Id {}) => {
             async_run(async move {
-                let got_ns = self_netns_identify()
+                let ns = self_netns_identify()
                     .await?
                     .ok_or_else(|| anyhow!("No matches under the given netns directory. It means it's not a persistent, named NS. "))?;
-                println!("{:?}", got_ns);
+                println!("{:?}", ns);
                 Ok(())
-            });
+            })
         }
         Some(Commands::Exec {
             mut cmd,
@@ -155,24 +131,8 @@ fn main() -> Result<()> {
             new,
             su,
         }) => {
-            let state = NetnspState::load_sync(Arc::new(ConfPaths::default()?))?;
-            let current_ns = NSIDFrom::Thread.to_id_sync(NSCreate::empty())?;
+            let current_ns = NSIDFrom::Thread.create_sync(NSCreate::empty())?;
             let (u, g) = get_non_priv_user(None, None, None, None)?;
-            if &current_ns
-                != state
-                    .derivative
-                    .root_ns
-                    .as_ref()
-                    .ok_or(anyhow!("No root_ns specified in derived file"))?
-            {
-                log::error!("Access denied. It's not allowed to exec from a non-root NS which is specified in the state file.");
-                log::info!(
-                    "current {:?}, saved {:?}",
-                    current_ns,
-                    state.derivative.root_ns
-                );
-                std::process::exit(1);
-            }
             if cmd.is_none() {
                 cmd = Some(
                     env::var("SHELL").map_err(|x| anyhow!("argument cmd not provided; {}", x))?,
@@ -182,11 +142,11 @@ fn main() -> Result<()> {
                 bail!("You can't specify both PID and NS");
             }
             if let Some(ns) = ns {
-                let n = NSIDFrom::Named(ProfileName(ns.clone()));
-                n.open_sync()?.enter()?;
+                let n = NSIDFrom::Named(ns);
+                n.open_sync()?.enter_net()?;
             } else if let Some(pi) = pid {
                 let n = NSIDFrom::Pid(Pid(pi.try_into()?));
-                n.open_sync()?.enter()?;
+                n.open_sync()?.enter_ner_user()?;
             } else {
                 if dbg {
                     log::info!("Will not change NS");
@@ -197,14 +157,15 @@ fn main() -> Result<()> {
                 }
             };
             if !dbg && !su {
-                drop_privs_id(nix::unistd::Gid::from_raw(u), nix::unistd::Uid::from_raw(g))?;
+                drop_privs_id(Gid::from_raw(u), Uid::from_raw(g))?;
             }
             // Netns must be entered before the mess of multi threading
             async_run(async move {
                 if dbg {
                     let ns = Netns::thread().await?;
+                    let euid = geteuid();
                     dbg!(&ns.netlink);
-                    let k = netns_proxy::nft::print_all().await;
+                    let k = netlink_ops::nft::print_all().await;
                     if k.is_err() {
                         log::error!("{:?}", k);
                         if euid != 0.into() {
@@ -218,55 +179,35 @@ fn main() -> Result<()> {
                     t.wait().await?;
                 }
                 Ok(())
-            });
-        }
-        Some(Commands::Reload) => {
-            async_run(async move {
-                let p = ConfPaths::default()?;
-                let p2 = p.sock4ctrl();
-                log::warn!("Config will not take effect if there is a corresponding entry in the derivative/state file");
-                let mut client = netns_proxy::ctrl::Client::new(p2.as_path()).await?;
-                log::info!("connected");
-                let res = client.req(ToServer::ReloadConfig).await?;
-                ensure!(res == ToClient::ConfigReloaded);
-                log::info!("reloaded");
-                Ok(())
-            });
+            })
         }
         Some(Commands::GC { ns }) => {
             async_run(async move {
-                let p = ConfPaths::default()?;
-                let p2 = p.sock4ctrl();
-                let mut client = netns_proxy::ctrl::Client::new(p2.as_path()).await?;
-                log::info!("connected");
-                let res = client.req(ToServer::GC(ProfileName(ns))).await?;
-                ensure!(res == ToClient::GCed);
-                log::info!("cleaned");
+                // send command 
                 Ok(())
-            });
+            })
         }
         None => {
-            if cli.ctl {
-                bail!("a command is required.");
-            }
             async_run(async move {
-                let paths = Arc::new(ConfPaths::default()?);
-                // Paths shall not be changed, even across reloads
-                let server = netns_proxy::ctrl::Server;
-                server.serve(paths.clone()).await?;
+                // start the server
+
                 Ok(())
-            });
+            })
         }
     }
-
-    Ok(())
 }
 
-fn async_run(f: impl Future<Output: std::fmt::Debug>) {
-    let k = tokio::runtime::Builder::new_multi_thread()
+fn async_run(f: impl Future<Output = Result<()>>) -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(f);
-    println!("{:?}", k);
+        .block_on(f)
+}
+
+fn require_root() {
+    let euid = geteuid();
+    if euid != 0.into() {
+        log::warn!("Not running as root.");
+    }
 }

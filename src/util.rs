@@ -22,6 +22,7 @@ use nix::unistd::{Gid, Pid, Uid};
 use pidfd::{PidFd, PidFuture};
 use procfs::process::Process;
 
+use netlink_ops::netns::Pid as DPid;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::io::BufStream;
@@ -35,13 +36,6 @@ use tokio::{
     task::{AbortHandle, JoinError, JoinHandle, JoinSet},
 };
 
-use crate::data::FlatpakID;
-use crate::data::NSIDKey;
-use crate::data::Pid as DPid;
-use crate::data::NSID;
-use crate::netlink::NsFile;
-use crate::sub::SocketEOF;
-
 use nix::unistd::setgroups;
 
 use std::collections::HashMap;
@@ -54,10 +48,6 @@ use tokio::{
 
 use std::cmp::Eq;
 use std::hash::Hash;
-
-pub fn convert_strings_to_strs(strings: &Vec<String>) -> Vec<&str> {
-    strings.iter().map(|s| s.as_str()).collect()
-}
 
 /// get v in mb with key from ma
 pub fn hashmap_chain<'a, A, B, C>(
@@ -245,56 +235,6 @@ use sysinfo::SystemExt;
 #[cfg(test)]
 use std::println as info;
 
-/// adapt the flatpak settings of given list
-pub fn flatpak_perms_checkup(list: Vec<&FlatpakID>) -> Result<()> {
-    let basedirs = xdg::BaseDirectories::with_prefix("flatpak")?;
-    info!("Trying to adapt flatpak app permissions. \n This turns 'Network' off which causes flatpak to use isolated network namespaces. \n This must be done early to prevent accidental unsandboxed use of network");
-    for appid in list {
-        let mut sub = PathBuf::from("overrides");
-        sub.push(&appid.0);
-        let p = basedirs.get_data_file(&sub);
-        if p.exists() {
-            let mut conf = ini::Ini::load_from_file(p.as_path())?;
-            let k = conf.get_from(Some("Context"), "shared");
-            if k.is_some() {
-                if k.unwrap().contains("!network") {
-                    info!("{} found. it has correct config", p.to_string_lossy());
-                } else {
-                    let o = k.unwrap().to_owned();
-                    let v = o + ";!network";
-                    conf.set_to(Some("Context"), "shared".to_owned(), v);
-                    conf.write_to_file(p.as_path())?;
-                    info!("{} written", p.to_string_lossy());
-                }
-            } else {
-                conf.set_to(Some("Context"), "shared".to_owned(), "!network".to_owned());
-                conf.write_to_file(p.as_path())?;
-                info!("{} written", p.to_string_lossy());
-            }
-        } else {
-            // create a new file for it
-            let mut conf = ini::Ini::new();
-            conf.set_to(Some("Context"), "shared".to_owned(), "!network".to_owned());
-            conf.write_to_file(p.as_path())?;
-            info!("{} written. New file", p.to_string_lossy());
-        }
-    }
-    Ok(())
-}
-
-#[test]
-fn test_flatpakperm() -> Result<()> {
-    flatpak_perms_checkup(
-        [
-            &"org.mozilla.firefox".parse()?,
-            &"im.fluffychat.Fluffychat".parse()?,
-        ]
-        .to_vec(),
-    )
-    .unwrap();
-    Ok(())
-}
-
 use sysinfo::System;
 
 pub fn kill_suspected() -> Result<()> {
@@ -317,8 +257,6 @@ pub mod ns {
     pub const NETNS_PATH: &str = "/run/netns/";
     use futures::TryFutureExt;
 
-    use crate::data::ProfileName;
-
     use anyhow::{anyhow, Ok, Result};
     use netns_rs::NetNs;
     use nix::sched::CloneFlags;
@@ -330,26 +268,6 @@ pub mod ns {
         path::{Path, PathBuf},
     };
     use tokio::{self, fs::File};
-
-    pub trait ValidNamedNS: AsRef<Path> {}
-    impl ValidNamedNS for ProfileName {}
-
-    impl AsRef<Path> for ProfileName {
-        fn as_ref(&self) -> &Path {
-            Path::new(&self.0)
-        }
-    }
-
-    pub fn named_ns_exist<N: ValidNamedNS>(ns_name: &N) -> Result<bool> {
-        let mut p = PathBuf::from(NETNS_PATH);
-        p.push(ns_name);
-        let r = p.try_exists().map_err(anyhow::Error::from)?;
-        if r {
-            // file exists but not a file. should error
-            anyhow::ensure!(p.is_file());
-        }
-        Ok(r)
-    }
 
     pub fn enter_ns_by_fd(ns_fd: RawFd) -> Result<()> {
         nix::sched::setns(ns_fd, CloneFlags::CLONE_NEWNET)?;
@@ -459,104 +377,6 @@ pub mod ns {
     }
 }
 
-pub mod error {
-    use thiserror::Error;
-
-    #[derive(Error, Debug)]
-    #[error("Deviance from a configuration plan, or the configuration is faulty")]
-    pub struct DevianceError;
-
-    #[derive(Error, Debug)]
-    #[error("Something is missing, and it can be handled")]
-    pub struct MissingError;
-
-    #[derive(Error, Debug)]
-    #[error("Errors that shouldn't happen")]
-    pub struct ProgrammingError;
-}
-
-pub trait AssumeUnwrap {
-    type T;
-    fn assume(self) -> Result<Self::T>;
-}
-
-impl<T> AssumeUnwrap for Option<T> {
-    type T = T;
-    fn assume(self) -> Result<Self::T> {
-        self.ok_or(ProgrammingError.into())
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, Hash, Deserialize, Serialize, Clone)]
-pub enum ProcessGroup {
-    /// Kept across reloads
-    Top,
-    /// Daemons for all NS, killed when reloading
-    Supervisor,
-    /// Of specific subject
-    Subject(NSIDKey),
-    /// Daemon processes.
-    Sub(NSIDKey),
-}
-
-pub enum PidOp {
-    Kill(ProcessGroup, KillMask),
-    Add(ProcessGroup, TaskKind),
-}
-
-pub enum TaskKind {
-    Process(DPid),
-    Task(Pin<Box<dyn (Future<Output = TaskOutput>) + Send>>),
-}
-
-/// Actor model
-/// Awaiter for both async tasks and processes
-pub struct ProcessManager {
-    pub sx: UnboundedSender<PidOp>,
-    pub groups: Arc<Mutex<HashMap<ProcessGroup, GroupTasks>>>,
-    // server: Option<AbortHandle>,
-}
-
-#[derive(Default)]
-pub struct GroupTasks {
-    pids: Vec<DPid>,
-    tasks: JoinSet<TaskOutput>,
-}
-
-pub mod flags {
-    use bitflags::bitflags;
-    use serde::{Deserialize, Serialize};
-
-    bitflags! {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-        pub struct KillMask: u8 {
-            const Task = 1;
-            const Process = 2;
-        }
-    }
-}
-pub use flags::*;
-
-impl GroupTasks {
-    pub async fn kill(&mut self, mask: KillMask) {
-        if mask.intersects(KillMask::Process) {
-            Self::kill_pids(&mut self.pids).await;
-        }
-        if mask.intersects(KillMask::Task) {
-            self.tasks.abort_all();
-        }
-    }
-    async fn kill_pids(ve: &mut Vec<DPid>) {
-        let mut h = vec![];
-        while let Some(x) = ve.pop() {
-            if let Some(e) = wait_pid(x) {
-                h.push(e);
-            }
-        }
-        futures::future::join_all(h).await;
-    }
-}
-
 pub fn wait_pid(x: DPid) -> Option<PidFuture> {
     if let Result::Ok(f) = unsafe { PidFd::open(x.0 as i32, 0) } {
         unsafe {
@@ -568,185 +388,25 @@ pub fn wait_pid(x: DPid) -> Option<PidFuture> {
     }
 }
 
-use std::collections::hash_map::Entry;
+/// Remotely aborts a future
+pub struct AbortOnDrop(pub AbortHandle);
 
-use self::error::ProgrammingError;
-impl ProcessManager {
-    pub fn new() -> Arc<Self> {
-        let (sx, mut rx) = unbounded_channel::<PidOp>();
-        let groups: Arc<_> = Default::default();
-        let p = Arc::new(Self { sx, groups });
-        let g = p.groups.clone();
-        let p2 = p.clone();
-        tokio::spawn(async move {
-            while let Some(p) = rx.recv().await {
-                match p {
-                    PidOp::Add(ns, tsk) => {
-                        let mut w = g.lock().await;
-                        let mut e = w.entry(ns);
-                        let v = match e {
-                            Entry::Occupied(ref mut v) => v.get_mut(),
-                            Entry::Vacant(v) => v.insert(GroupTasks::default()),
-                        };
-                        match tsk {
-                            TaskKind::Process(pid) => v.pids.push(pid),
-                            TaskKind::Task(t) => {
-                                v.tasks.spawn(t);
-                            }
-                        };
-                    }
-                    PidOp::Kill(ns, mask) => {
-                        p2.kill_await(Some(&ns), mask).await;
-                    }
-                }
-            }
-        });
-
-        p
-    }
-    pub async fn kill_await(&self, ns: Option<&ProcessGroup>, mask: KillMask) {
-        let mut g = self.groups.lock().await;
-        if let Some(ns) = ns {
-            if let Some(ve) = g.get_mut(ns) {
-                ve.kill(mask).await;
-            }
-        } else {
-            for (_ns, ve) in g.iter_mut() {
-                ve.kill(mask).await;
-            }
-        }
-    }
-    pub async fn kill_subjects(&self, mask: KillMask) {
-        let mut g = self.groups.lock().await;
-        for (ns, ve) in g.iter_mut() {
-            if matches!(ns, ProcessGroup::Subject(_)) {
-                ve.kill(mask).await;
-            }
-        }
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort()
     }
 }
 
-pub type DaemonSender = UnboundedSender<Pin<Box<dyn Future<Output = TaskOutput> + Send>>>;
-
-/// Senders.
-#[derive(Debug, Clone)]
-pub struct TaskCtx {
-    pub pm: UnboundedSender<PidOp>,
-}
-
-impl TaskCtx {
-    pub fn reg(&self, pg: ProcessGroup, k: TaskKind) {
-        self.pm.send(PidOp::Add(pg, k)).unwrap()
+impl From<AbortHandle> for AbortOnDrop {
+    fn from(value: AbortHandle) -> Self {
+        Self(value)
     }
 }
 
-pub struct TaskOutput {
-    pub name: String,
-    pub result: Result<()>,
-    /// notified in case the task stops
-    pub signal: Option<oneshot::Sender<()>>,
-}
+#[derive(Debug)]
+pub struct AbortOnDropTokio<T>(pub JoinHandle<T>);
 
-impl TaskOutput {
-    pub fn new(
-        f: impl Future<Output = Result<()>> + Send + 'static,
-        name: String,
-    ) -> (
-        Pin<Box<dyn Future<Output = TaskOutput> + Send>>,
-        Receiver<()>,
-    ) {
-        let (sx, rx) = oneshot::channel();
-        (
-            Box::pin(async move {
-                let r = f.await;
-                Self::handle_task_result(r, name.clone());
-                TaskOutput {
-                    name,
-                    result: Ok(()),
-                    signal: Some(sx),
-                }
-            }),
-            rx,
-        )
-    }
-
-    pub fn wrapped<E2: std::error::Error + Send + Sync + 'static, T: 'static + Debug>(
-        f: impl Future<Output = Result<Result<T>, E2>> + Send + 'static,
-        name: String,
-    ) -> (
-        Pin<Box<dyn Future<Output = TaskOutput> + Send>>,
-        Receiver<()>,
-    ) {
-        let (sx, rx) = oneshot::channel();
-        (
-            Box::pin(async move {
-                let r = f.await;
-                let n2 = name.clone();
-                let r = match r {
-                    Result::Ok(x) => {
-                        Self::handle_task_result(x, n2);
-                        Ok(())
-                    }
-                    Err(x) => Err::<(), anyhow::Error>(x.into()),
-                };
-                TaskOutput {
-                    name,
-                    result: r,
-                    signal: Some(sx),
-                }
-            }),
-            rx,
-        )
-    }
-    pub fn immediately<T: Send + 'static + Debug>(
-        f: impl Future<Output = Result<T>> + Send + 'static,
-        name: String,
-    ) -> (
-        Pin<Box<dyn Future<Output = TaskOutput> + Send>>,
-        Receiver<()>,
-    ) {
-        let n2 = name.clone();
-        let h: AbortOnDrop<_> = tokio::spawn(async move {
-            let x = f.await;
-            Self::handle_task_result(x, name);
-            Ok(())
-        })
-        .into();
-        Self::wrapped(h, n2)
-    }
-    pub fn immediately_std<
-        T: Send + 'static + Debug,
-        E: std::error::Error + Send + Sync + 'static,
-    >(
-        f: impl Future<Output = Result<T, E>> + Send + 'static,
-        name: String,
-    ) -> (
-        Pin<Box<dyn Future<Output = TaskOutput> + Send>>,
-        Receiver<()>,
-    ) {
-        let n2 = name.clone();
-        let h: AbortOnDrop<_> = tokio::spawn(async move {
-            let x = f.await;
-            Self::handle_task_result(x, name);
-            Ok(())
-        })
-        .into();
-        Self::wrapped(h, n2)
-    }
-    pub fn handle_task_result<T: Debug, E: Debug>(x: Result<T, E>, name: String) {
-        // a task can error before Awaiter start awaiting, which produces an error
-        // that has to be handled early. Otherwise nothing will be logged, which looks like deadlock.
-        if let Err(e) = x {
-            log::error!("Task {} errored, {:?}", name, e);
-        } else {
-            log::trace!("Task {} has result {:?}", name, x.unwrap());
-        }
-    }
-}
-
-pub struct AbortOnDrop<T>(pub JoinHandle<T>);
-
-impl<T> Future for AbortOnDrop<T> {
+impl<T> Future for AbortOnDropTokio<T> {
     type Output = std::result::Result<T, JoinError>;
     fn poll(
         self: Pin<&mut Self>,
@@ -756,19 +416,19 @@ impl<T> Future for AbortOnDrop<T> {
     }
 }
 
-impl<T> Drop for AbortOnDrop<T> {
+impl<T> Drop for AbortOnDropTokio<T> {
     fn drop(&mut self) {
         self.0.abort()
     }
 }
 
-impl<T> From<JoinHandle<T>> for AbortOnDrop<T> {
+impl<T> From<JoinHandle<T>> for AbortOnDropTokio<T> {
     fn from(value: JoinHandle<T>) -> Self {
         Self(value)
     }
 }
 
-impl<T> AbortOnDrop<T> {
+impl<T> AbortOnDropTokio<T> {
     pub fn handle(&self) -> AbortHandle {
         self.0.abort_handle()
     }
@@ -786,7 +446,7 @@ async fn test_aod() {
 
     println!("--");
 
-    let h: AbortOnDrop<()> = tokio::spawn(async move {
+    let h: AbortOnDropTokio<()> = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(3)).await;
         println!("3");
     })
@@ -799,10 +459,6 @@ async fn test_aod() {
 
     // should output -- 3
 }
-
-// I have to use json because I skip fields in serde, which does not work those compact binary formats
-// I tried every one of them and none of them works.
-// not going to waste any more time on this
 
 pub fn to_vec_internal<T: serde::Serialize>(x: &T) -> Result<Vec<u8>> {
     let v = ron::to_string(x)?.into_bytes();

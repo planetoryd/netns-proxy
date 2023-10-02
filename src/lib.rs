@@ -14,21 +14,17 @@
 #![feature(let_chains)]
 #![feature(impl_trait_in_assoc_type)]
 #![feature(decl_macro)]
-#![feature(generic_const_exprs)]
-#[allow(unused_braces)]
+#![feature(return_position_impl_trait_in_trait)]
+#![feature(type_changing_struct_update)]
+// #![allow(unused)]
+#![deny(unused_must_use)]
+#![allow(unused_braces)]
+#![allow(unreachable_code)]
 
-pub mod data;
-pub mod netlink;
-pub mod nft;
-pub mod sub;
-pub mod util;
-pub mod watcher;
-pub mod ctrl;
-pub mod state;
+// pub mod watcher;
+pub mod flatpak;
+pub mod id_alloc;
+pub mod tasks;
 pub mod tun2proxy;
-pub mod schedule;
-
-// Standard procedure
-// Creates various netns, base-vpn, socks, i2p, lokinet, un-firewalled
-// Kill other running processes, suspected
-// Fork, setns, drop privs, start daemons
+pub mod util;
+pub mod listener;

@@ -16,7 +16,7 @@ futures = "0.3.28"
 ipnetwork = { version = "0.20.0", features = ["serde"] }
 users = "0.11.0"
 nix = { version = "0.26.2", features = ["user", "sched"] }
-serde = { version = "<=1.0.171", features = ["derive", "rc"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1.0.96"
 anyhow = { version = "1.0.71", features = ["backtrace"] }
 libc = "0.2.143"
@@ -40,12 +40,17 @@ env_logger = "0.10.0"
 tokio-stream = { version = "0.1.14", features = ["io-util"] }
 ron = "0.8.1"
 fixed-map = "0.9.2"
-async-recursion = "1.0.4"
+async-recursion = { path = "../async-recursion/" }
 bitflags = "2.4.0"
 tun2proxy = { path = "../tun2proxy" }
 smoltcp = "0.10.0"
-tokio-send-fd = "0.9.3"
+tokio-send-fd = { path = "../tokio-send-fd" }
 simple-stream = "0.11.0"
 leapfrog = "0.3.0"
-async_scheduler = { path = "../async_scheduler" }
 bimap = { version = "0.6.3", features = ["serde"] }
+netlink-ops = { path = "../netlink-ops" }
+abort-on-drop = "0.2.2"
+amplify = "4.1.0"
+rangemap = "1.4.0"
+rumpsteak = { path = "../rumpsteak" }
+static_assertions = "1.1.0"
