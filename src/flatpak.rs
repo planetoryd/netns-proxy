@@ -1,6 +1,7 @@
 use amplify::{From, Wrapper};
 use anyhow::Ok;
 use log::info;
+use serde::{Serialize, Deserialize};
 
 use std::{path::PathBuf, str::FromStr};
 
@@ -43,8 +44,9 @@ pub fn flatpak_perms_checkup(list: Vec<&FlatpakID>) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub struct FlatpakID(String);
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+pub struct FlatpakID(pub String);
 
 impl FromStr for FlatpakID {
     type Err = anyhow::Error;

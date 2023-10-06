@@ -6,14 +6,18 @@
 use anyhow::{anyhow, bail, ensure, Ok, Result};
 use clap::{Parser, Subcommand};
 
+use futures::channel::mpsc;
 use futures::{Future, SinkExt, StreamExt};
 use netlink_ops::netns::{Fcntl, NSCreate, NSIDFrom, Netns, NsFile, Pid};
-use netns_proxy::tasks::{Client, FDStream, TUN2Proxy};
+use netns_proxy::config::{self, Profiles};
+use netns_proxy::listener::Listener;
+use netns_proxy::tasks::{Client, FDStream, ProgramConfig, TUN2Proxy, Validate};
 use netns_proxy::tun2proxy::tuntap;
 use nix::sched::CloneFlags;
 use nix::unistd::{geteuid, Gid, Uid};
 
-use netns_proxy::util::{ns::*, perms::*, from_vec_internal};
+use netns_proxy::util::{from_vec_internal, ns::*, perms::*};
+use schematic::ConfigLoader;
 use std::env;
 use std::fs::File;
 use std::io::Read;
@@ -70,7 +74,9 @@ enum Commands {
         ns: String,
     },
     Tuntap {
+        /// Device FD, can be TUN or TAP
         dev: RawFd,
+        /// FD to config file
         conf: RawFd,
         /// Can be PIDFD, or Netns
         ns: RawFd,
@@ -81,6 +87,7 @@ enum Commands {
         /// NS to enter
         ns: RawFd,
     },
+    Watch {},
 }
 
 fn main() -> Result<()> {
@@ -106,23 +113,21 @@ fn main() -> Result<()> {
             dev.set_cloexec()?;
             let ns: File = unsafe { File::from_raw_fd(ns) };
             let ns = NsFile(ns);
-            ns.enter_ner_user()?;
             let mut conf: File = unsafe { File::from_raw_fd(conf) };
             let mut buf = Default::default();
             conf.read_to_end(&mut buf)?;
             let conf: TUN2Proxy = from_vec_internal(&buf)?;
+            ns.enter(conf.setns)?;
             tuntap(conf, dev)?;
             Ok(())
         }
-        Some(Commands::Id {}) => {
-            async_run(async move {
-                let ns = self_netns_identify()
+        Some(Commands::Id {}) => async_run(async move {
+            let ns = self_netns_identify()
                     .await?
                     .ok_or_else(|| anyhow!("No matches under the given netns directory. It means it's not a persistent, named NS. "))?;
-                println!("{:?}", ns);
-                Ok(())
-            })
-        }
+            println!("{:?}", ns);
+            Ok(())
+        }),
         Some(Commands::Exec {
             mut cmd,
             ns,
@@ -143,10 +148,11 @@ fn main() -> Result<()> {
             }
             if let Some(ns) = ns {
                 let n = NSIDFrom::Named(ns);
-                n.open_sync()?.enter_net()?;
+                n.open_sync()?.enter(CloneFlags::CLONE_NEWNET)?;
             } else if let Some(pi) = pid {
                 let n = NSIDFrom::Pid(Pid(pi.try_into()?));
-                n.open_sync()?.enter_ner_user()?;
+                n.open_sync()?
+                    .enter(CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWUSER)?;
             } else {
                 if dbg {
                     log::info!("Will not change NS");
@@ -183,13 +189,41 @@ fn main() -> Result<()> {
         }
         Some(Commands::GC { ns }) => {
             async_run(async move {
-                // send command 
+                // send command
+                Ok(())
+            })
+        }
+        Some(Commands::Watch {}) => {
+            use netns_proxy::watcher::*;
+            // Watcher is responsible for initiating subjects.
+            // It doesn't supervise processes. Therefore you can restart watchers after changing configs without interrupting anything.
+            async_run(async move {
+                let sock = config::ServerConf::default().server;
+                let profiles = ConfigLoader::<Profiles>::new().file("./fwatch.json")?.load()?;
+                let conf = Arc::new(profiles.config);
+                let w = FlatpakWatcher::new(sock, conf).await?;
+                
+                w.daemon().await?;
+
                 Ok(())
             })
         }
         None => {
             async_run(async move {
                 // start the server
+                // server implements the minimal set of features
+                // so it's not frequently restarted, reconfigured. It supervises the Tun2proxy, slirp processes
+                let conf = ProgramConfig::<{ Validate::Undone }>::default();
+                let conf: ProgramConfig<{ Validate::Done }> = conf.try_into()?;
+                let (sx, rx) = mpsc::unbounded();
+                let listener = Listener {
+                    conf,
+                    tasks: Default::default(),
+                    serve_loop: None,
+                    cb_loop: None,
+                    sx,
+                };
+                listener.run(rx);
 
                 Ok(())
             })

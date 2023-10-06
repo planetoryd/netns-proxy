@@ -6,37 +6,37 @@ use std::{
 
 use netlink_ops::netns::Pid;
 
-use anyhow::Result;
+use anyhow::{Ok, Result};
 use futures::StreamExt;
 use inotify::{Event, EventMask, WatchMask};
+use rumpsteak::{try_session, IntoSession};
 use std::result::Result as stdRes;
 use tokio::{fs, io::AsyncReadExt, sync::mpsc::UnboundedSender};
 
-pub trait Watcher {
-    fn new(signal: UnboundedSender<MainEvent>) -> Self;
+use crate::{
+    config::ProfilesA,
+    flatpak::FlatpakID,
+    tasks::{Client, Ctrl, CtrlMsg, InitialParams, Initiate, SubjectMsg, SubjectName, TUN2Proxy},
+};
+
+pub trait Watcher: Sized {
+    async fn new(sock: PathBuf, profiles: ProfilesA) -> Result<Self>;
     async fn daemon(self) -> Result<()>;
-}
-
-
-/// Events of the main task
-pub enum MainEvent {
-    Flatpak(FlatpakV),
-    Command(ToServer),
-    /// Some subjects have bounded lifetime
-    SubjectExpire(UniqueInstance)
 }
 
 pub struct FlatpakWatcher {
     seen_pid: HashSet<Pid>,
-    signal: UnboundedSender<MainEvent>,
+    client: Client,
+    profiles: ProfilesA,
 }
 
 impl Watcher for FlatpakWatcher {
-    fn new(signal: UnboundedSender<MainEvent>) -> Self {
-        Self {
+    async fn new(sock: PathBuf, profiles: ProfilesA) -> Result<Self> {
+        Ok(Self {
             seen_pid: Default::default(),
-            signal,
-        }
+            client: Client::connect(sock).await?,
+            profiles,
+        })
     }
     async fn daemon(mut self) -> Result<()> {
         use crate::util::perms::get_non_priv_user;
@@ -72,7 +72,7 @@ impl FlatpakWatcher {
     async fn process_ev(&mut self, ev: Event<OsString>, flatpak_dir: &PathBuf) -> Result<()> {
         if let Some(name) = ev.name {
             let name = name.to_string_lossy().into_owned();
-            if let Ok(num) = name.parse::<u32>() {
+            if let Result::Ok(num) = name.parse::<u32>() {
                 let p = Pid(num);
                 if self.seen_pid.contains(&p) {
                     // skip
@@ -105,13 +105,32 @@ impl FlatpakWatcher {
                         let maint = proc.task_main_thread()?;
                         let children = maint.children()?;
                         anyhow::ensure!(children.len() >= 1);
+
                         let the_child_pid = children[0] as u32;
 
-                        let resp = FlatpakV {
-                            id: flatpak_id,
-                            pid: Pid(the_child_pid)
-                        };
-                        self.signal.send(MainEvent::Flatpak(resp))?;
+                        let sname = SubjectName(format!("{}_{}", flatpak_id.0, the_child_pid));
+                        if let Some(profile_name) = self.profiles.flatpak.get(&flatpak_id) {
+                            if let Some(pro) = self.profiles.profiles.get(profile_name) {
+                                try_session(&mut self.client, async move |se: Ctrl<'_, Client>| {
+                                    let con = se.into_session()
+                                        .selectc(
+                                            Initiate(
+                                                sname,
+                                                InitialParams {
+                                                    user: crate::tasks::SetUser::Pid(Pid(
+                                                        the_child_pid,
+                                                    )),
+                                                    tun2proxy: pro.to_owned(),
+                                                },
+                                            ),
+                                            |k| CtrlMsg::SubjectMsg(SubjectMsg::Initiate(k)),
+                                        )
+                                        .await?;
+                                    con.send(label);
+                                    Ok(())
+                                });
+                            }
+                        }
                     }
                 }
             }

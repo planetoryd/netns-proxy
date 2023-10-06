@@ -1,4 +1,4 @@
-use crate::tasks::*;
+use crate::{tasks::*, config::{Validated, ServerConf}};
 use std::{
     path::{Path, PathBuf},
     result::Result as SResult, marker, pin::Pin,
@@ -44,11 +44,11 @@ use crate::{
 };
 
 pub struct Listener {
-    conf: ProgramConfig<{ Validate::Done }>,
-    tasks: ServerTasks,
-    serve_loop: Option<AbortHandle>,
-    cb_loop: Option<AbortHandle>,
-    sx: UnboundedSender<BoxFunc>,
+    pub conf: Validated<ServerConf>,
+    pub tasks: ServerTasks,
+    pub serve_loop: Option<AbortHandle>,
+    pub cb_loop: Option<AbortHandle>,
+    pub sx: UnboundedSender<BoxFunc>,
 }
 
 impl Listener {
@@ -82,6 +82,7 @@ impl Listener {
                         }) as AbortaFut, set.0);
                     }  
                     Identify::Sub(_) => {
+                        // Not in use yet
                         todo!()
                     }
                 }
@@ -93,7 +94,7 @@ impl Listener {
         }
     }
     /// Handle control connection
-    async fn handle_ctrl(mut server: Server, mut main: IntClient) -> Result<()> {
+    async fn handle_ctrl(mut server: Server, main: IntClient) -> Result<()> {
         try_session(
             &mut server,
             async move |mut se: <Ctrl<'_, Client> as FullDual<Client, Server>>::Dual| loop {
@@ -102,52 +103,59 @@ impl Listener {
                         SubjectMsg::GC(k) => {
                             se = se.next(&k);
                             boxfn!(main, state, set, {
-                                let sname = k.0;
-                                let skey = state
-                                    .tasks
-                                    .subject_names
-                                    .get_by_right(&sname)
-                                    .ok_or(InputError)?;
-                                state
-                                    .tasks
-                                    .subject
-                                    .get_mut(skey)
-                                    .ok_or(InvariantBreach)?
-                                    .kill()?;
-                                state.tasks.subject.remove(skey);
-                                
+                                state.gc_subject(&k.0)?;
                             });
                         }
                         SubjectMsg::Initiate(k) => {
-                            let mut recv = se.next(&k);
+                            // It's possible to send parameters only and have the Listener actor do the task
+                            // Instead of sending closures, we can send messages similar to whats here and Listener will handle them
+                            // Type them with session types too.
+                            let recv = se.next(&k);
                             let (dev, cont) = recv.receive().await?;
                             let (ns, cont) = cont.receive().await?;
                             boxfn!(main, state, set, {
-                                let sname = k.0;
-                                let id = state.tasks.sids.alloc_or()?;
-                                let skey = SubjectKey(id);
-                                state.tasks.subject_names.insert(skey.clone(), sname.clone());
-                                state
+                                let sname = k.0.clone();
+                                let sname1 = sname.clone();
+                                let skey = state.initiate_subject(sname.clone())?;
+                                let subj = state
                                     .tasks
                                     .subject
                                     .get_mut(&skey)
-                                    .ok_or(InvariantBreach)?
-                                    .run_tuntap(dev, k.1.tun2proxy, ns, &state.conf, &skey, |p| {
+                                    .ok_or(InvariantBreach)?;
+                                subj.run_tuntap(dev, k.1.tun2proxy, ns, &state.conf, &skey, |p| {
                                         abortable_spawn(
                                             Box::pin(async {
                                                 // error in PidFuture causes the entire program to crash
                                                 let rx = p.await?;
                            
-                                                Ok(Some(Box::new(move |state: &mut Listener, set: FutSetW| {
+                                                Ok(Some(boxfn!(_l, _s, {
                                                     if !rx.success() {
                                                         log::error!("Process Tun2proxy of {} exited with {}", sname, rx);
                                                     }
-                                                    Ok(())
-                                                }) as BoxFunc))
+                                                })))
                                             }),
                                             set,
                                         )
-                                    })?;
+                                })?;
+                                match k.1.user {
+                                    SetUser::Pid(p) => {
+                                        subj.watch(STaskType::UserProgram, p, |p| {
+                                            abortable_spawn(
+                                                Box::pin(async {
+                                                    let rx = p.await?;
+                                                    Ok(Some(boxfn!(lis, _s, {
+                                                        lis.gc_subject(&sname1)?;
+                                                        log::warn!("Process Tun2proxy of {} exited with {}. Subject will be removed.", sname1, rx);
+                                                    })))
+                                                }),
+                                                set,
+                                            )
+                                        })?;
+
+                                    }
+                                    _ => ()
+                                }
+                                
                             });
                             se = cont;
                         }
@@ -176,10 +184,11 @@ impl Listener {
             Ok(())
         }) as BoxFunc))
     }
-    async fn run(mut self) -> Result<()> {
-        let sock = UnixListener::bind(&self.conf.server)?;
+    pub async fn run(mut self, rx: UnboundedReceiver<BoxFunc>) -> Result<()> {
+        let sock = UnixListener::bind(&self.conf.0.server)?;
         let mut set = FutSet::new();
-        let (sx, rx) = mpsc::unbounded();
+        // let (sx, rx) = mpsc::unbounded();
+
         add_abortable_some!(Self::handle_fn(rx), self.cb_loop, set);
         add_abortable_some!(Self::sock_accept(sock), self.serve_loop, set);
         while let Some(fut_res) = set.next().await {

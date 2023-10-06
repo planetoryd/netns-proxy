@@ -23,10 +23,11 @@
 #![allow(incomplete_features)]
 #![allow(unreachable_code)]
 
-// pub mod watcher;
+pub mod watcher;
 pub mod flatpak;
 pub mod id_alloc;
 pub mod tasks;
 pub mod tun2proxy;
 pub mod util;
 pub mod listener;
+pub mod config;

@@ -2,9 +2,11 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     fmt::Display,
+    fs::create_dir_all,
+    io::Write,
     marker::{self, ConstParamTy},
     net::IpAddr,
-    os::fd::RawFd,
+    os::fd::{AsRawFd, RawFd},
     path::{Path, PathBuf},
     pin::Pin,
     process::exit,
@@ -24,7 +26,7 @@ use futures::{
     Future, Sink, SinkExt, Stream, StreamExt, TryFutureExt,
 };
 use netlink_ops::netns::{Fcntl, Pid, NSID};
-use nix::sys::signal::Signal::SIGTERM;
+use nix::{sched::CloneFlags, sys::signal::Signal::SIGTERM};
 use pidfd::PidFuture;
 use rumpsteak::{
     channel::{impl_recv, impl_send, Bidirectional, Recving, Sending},
@@ -49,7 +51,7 @@ use std::marker::Send as MSend;
 use crate::{
     id_alloc::{self, IDAlloc},
     listener::Listener,
-    util::{from_vec_internal, to_vec_internal, wait_pid, AbortOnDropTokio},
+    util::{from_vec_internal, to_vec_internal, wait_pid, AbortOnDropTokio}, config::{Validated, ServerConf, TUN2Proxy},
 };
 
 use crate::util::ChannelFailure;
@@ -66,6 +68,7 @@ pub struct ServerTasks {
 pub struct SubjectData {
     /// Relevant Futures which serve as event handlers
     pub map: FMap<STaskType, (AbortHandle, Pid)>,
+    pub users: u32,
 }
 
 impl SubjectData {
@@ -94,12 +97,13 @@ impl SubjectData {
         Ok(())
     }
     /// Run tuntap process for the subject and register it
+    /// We maintain an invariant here, any [TUN2Proxy] is validated, and then written into the /run directory, and read by the subprocess.
     pub fn run_tuntap(
         &mut self,
         dev: DevFd,
         conf: TUN2Proxy,
         ns: NSFd,
-        confstate: &ProgramConfig<{ Validate::Done }>,
+        confstate: &Validated<ServerConf>,
         id: &SubjectKey,
         spawn: impl FnOnce(PidFuture) -> AbortHandle,
     ) -> Result<()> {
@@ -107,12 +111,18 @@ impl SubjectData {
         ns.fd.unset_cloexec()?;
         let mut command = std::process::Command::new(std::env::current_exe()?);
         let path = confstate.tuntap_conf_path(id.0);
-        todo!();
-        // serialize, write file
+        let by = to_vec_internal(&conf)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .read(true)
+            .open(&path)?;
+        file.write_all(&by)?;
+        file.unset_cloexec()?;
         command
             .arg("tuntap")
             .arg(dev.fd.to_string())
-            .arg(path)
+            .arg(file.as_raw_fd().to_string())
             .arg(ns.fd.to_string());
         let child = command.spawn()?;
         let pid = Pid(child.id());
@@ -130,6 +140,7 @@ assert_impl_all!(PidFuture: marker::Send, Sync);
 #[derive(Clone, Copy, Debug, FKey, Serialize, Deserialize)]
 pub enum STaskType {
     Tun2proxy,
+    UserProgram,
 }
 
 pub type SKeyInner = u32;
@@ -152,6 +163,14 @@ impl Display for SubjectName {
 pub enum Msg {
     CtrlMsg(),
     Identify(),
+    SetUser(),
+}
+
+/// A subject can depend on a user. When the user shuts down the subject is GCed.
+#[derive(Serialize, Deserialize, Clone)]
+pub enum SetUser {
+    Unset,
+    Pid(Pid),
 }
 
 /// Client type
@@ -195,7 +214,7 @@ pub macro FDType( $t:ident, $inner:ident ) {
 pub enum CtrlMsg {
     SubjectMsg(),
     /// Allow setting config through protocol
-    ProgramConfig(ProgramConfig<{ Validate::Undone }>),
+    ProgramConfig(ServerConf),
 }
 
 #[choices]
@@ -211,33 +230,8 @@ pub struct GC(pub SubjectName);
 #[derive(Serialize, Deserialize, Clone)]
 pub struct InitialParams {
     pub tun2proxy: TUN2Proxy,
+    pub user: SetUser,
 }
-
-/// Initial params for Tun2proxy
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct TUN2Proxy {
-    /// Url to upstream proxy
-    pub url: String,
-    // /// Where should network traffic be sent from, ie. the NS where Tun2proxy is run
-    // pub put: NSID,
-    pub dns: TUN2DNS,
-    /// Disabling will remove Ipv6 entries from DNS (if TUN2DNS::Upstream enabled)
-    #[serde(default)]
-    pub ipv6: bool,
-    /// Treat the FD as Tap
-    #[serde(default)]
-    pub tap: bool,
-    pub mtu: usize,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub enum TUN2DNS {
-    /// Resolve names with proxy
-    Proxy,
-    /// Resolve names through proxy
-    Upstream(IpAddr),
-}
-
 // Wrapped because of foreign trait impls
 pub struct FramedUS(pub Framed<UnixStream, LengthDelimitedCodec>);
 
@@ -310,7 +304,7 @@ impl<'k> ChoiceB<'k> for Sub {
     type BrancherSession = End;
 }
 
-impl<'k> ChoiceB<'k> for ProgramConfig<{ Validate::Undone }> {
+impl<'k> ChoiceB<'k> for ServerConf {
     #[session('k Client)]
     type SelectorSession = End;
     #[session('k Server)]
@@ -342,6 +336,7 @@ pub fn exit_if_eof<T>(r: &Result<T>) {
     }
 }
 
+// Theoreticlly I should send futures over the channel as I shouldn't run blocking code.
 pub type BoxFunc =
     Box<dyn for<'a, 'b> FnOnce(&mut Listener, FutSetW<'a, 'b>) -> Result<()> + marker::Send>;
 pub type FutOut = Option<BoxFunc>;
@@ -437,55 +432,31 @@ impl<I: Serialize> Sending<I> for FramedUS {
     }
 }
 
-/// All config should be centralized here
-#[derive(Serialize, Deserialize, Clone)]
-pub struct ProgramConfig<const V: Validate> {
-    pub slirp4netns: PathBuf,
-    pub server: PathBuf,
-    /// Directory for tuntap confs
-    pub tuntap_conf: PathBuf,
-}
+impl Listener {
+    /// GC a subject, kill all related processes and futures
+    pub fn gc_subject(&mut self, sname: &SubjectName) -> Result<()> {
+        let skey = self
+            .tasks
+            .subject_names
+            .get_by_right(sname)
+            .ok_or(InputError)?;
+        self.tasks
+            .subject
+            .get_mut(skey)
+            .ok_or(InvariantBreach)?
+            .kill()?;
+        self.tasks.subject.remove(skey);
 
-#[derive(ConstParamTy, PartialEq, Eq)]
-pub enum Validate {
-    Done,
-    Undone,
-}
-
-impl Default for ProgramConfig<{ Validate::Undone }> {
-    fn default() -> Self {
-        Self {
-            slirp4netns: "/usr/bin/slirp4netns".parse().unwrap(),
-            server: "/var/lib/netns-proxy/sock".parse().unwrap(),
-            tuntap_conf: "/run/netns-proxy/tuntap/".parse().unwrap(),
-        }
+        Ok(())
     }
-}
+    /// Allocate a key
+    pub fn initiate_subject(&mut self, sname: SubjectName) -> Result<SubjectKey> {
+        let id = self.tasks.sids.alloc_or()?;
+        let skey = SubjectKey(id);
+        self.tasks.subject_names.insert(skey, sname);
+        self.tasks.subject.insert(skey, Default::default());
 
-impl ProgramConfig<{ Validate::Done }> {
-    pub fn tuntap_conf_path(&self, subject: impl ConfFile) -> PathBuf {
-        let mut path = self.tuntap_conf.clone();
-        path.set_file_name(subject.conf_file_name());
-        path
-    }
-}
-
-pub trait ConfFile {
-    fn conf_file_name(&self) -> String;
-}
-
-impl ConfFile for id_alloc::ID {
-    fn conf_file_name(&self) -> String {
-        self.to_string()
-    }
-}
-
-impl TryFrom<ProgramConfig<{ Validate::Undone }>> for ProgramConfig<{ Validate::Done }> {
-    type Error = anyhow::Error;
-    fn try_from(value: ProgramConfig<{ Validate::Undone }>) -> SResult<Self, Self::Error> {
-        todo!();
-
-        Ok(Self { ..value })
+        Ok(skey)
     }
 }
 

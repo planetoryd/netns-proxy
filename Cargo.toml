@@ -41,7 +41,6 @@ tokio-stream = { version = "0.1.14", features = ["io-util"] }
 ron = "0.8.1"
 fixed-map = "0.9.2"
 async-recursion = { path = "../async-recursion/" }
-bitflags = "2.4.0"
 tun2proxy = { path = "../tun2proxy" }
 smoltcp = "0.10.0"
 tokio-send-fd = { path = "../tokio-send-fd" }
@@ -54,3 +53,4 @@ amplify = "4.1.0"
 rangemap = "1.4.0"
 rumpsteak = { path = "../rumpsteak" }
 static_assertions = "1.1.0"
+schematic = "0.11.8"

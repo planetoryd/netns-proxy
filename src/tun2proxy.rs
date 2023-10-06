@@ -6,11 +6,8 @@ use simple_stream::{
     Blocking, Plain,
 };
 
+use crate::{util::ns::*, config::{TUN2Proxy, TUN2DNS}};
 use crate::util::*;
-use crate::{
-    tasks::{TUN2Proxy, TUN2DNS},
-    util::ns::*,
-};
 use anyhow::Result;
 use smoltcp::phy::TunTapInterface;
 use tun2proxy::{tun_to_proxy, NetworkInterface, Options, Proxy};
