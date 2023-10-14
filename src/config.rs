@@ -1,4 +1,6 @@
-use std::{collections::HashMap, default, fs::create_dir_all, net::IpAddr, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap, default, fs::create_dir_all, net::IpAddr, path::PathBuf, sync::Arc,
+};
 
 use crate::{flatpak::FlatpakID, id_alloc};
 use amplify::s;
@@ -104,7 +106,7 @@ pub enum TUN2DNS {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct WCloneFlags(#[serde(with = "int_repr")] CloneFlags);
+pub struct WCloneFlags(#[serde(with = "int_repr")] pub CloneFlags);
 
 impl Default for WCloneFlags {
     fn default() -> Self {

@@ -31,3 +31,4 @@ pub mod tun2proxy;
 pub mod util;
 pub mod listener;
 pub mod config;
+pub mod probe;

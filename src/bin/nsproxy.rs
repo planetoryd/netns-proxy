@@ -9,8 +9,9 @@ use clap::{Parser, Subcommand};
 use futures::channel::mpsc;
 use futures::{Future, SinkExt, StreamExt};
 use netlink_ops::netns::{Fcntl, NSCreate, NSIDFrom, Netns, NsFile, Pid};
-use netns_proxy::config::{self, Profiles};
+use netns_proxy::config::{self, Profiles, ServerConf};
 use netns_proxy::listener::Listener;
+use netns_proxy::probe;
 use netns_proxy::tasks::{Client, FDStream, ProgramConfig, TUN2Proxy, Validate};
 use netns_proxy::tun2proxy::tuntap;
 use nix::sched::CloneFlags;
@@ -81,13 +82,20 @@ enum Commands {
         /// Can be PIDFD, or Netns
         ns: RawFd,
     },
+    /// Start as sub and connect to the socket by path
     Sub {
         /// RPC socket
         sock: PathBuf,
         /// NS to enter
         ns: RawFd,
     },
+    /// Start as watcher daemon, which connects to a socket and has configs.
     Watch {},
+    /// Shortlived prober
+    Probe {
+        /// One end of socket pair
+        peer: RawFd,
+    },
 }
 
 fn main() -> Result<()> {
@@ -99,13 +107,20 @@ fn main() -> Result<()> {
             let fd: File = unsafe { File::from_raw_fd(ns) };
             let ns = NsFile(fd);
             ns.set_cloexec()?;
-            ns.enter_net()?;
+            ns.enter(CloneFlags::CLONE_NEWNET)?;
             // NS must be entered before tokio starts, because setns doesn't affect existing threads
             async_run(async move {
                 let c = Client::connect(&sock).await?;
                 unimplemented!();
                 Ok(())
             })
+        }
+        Some(Commands::Probe { peer }) => {
+            // The probing protocol
+            // 1. Enter net+user ns by pid, make TUN/TAP and send the FD back
+            async_single(probe::serve(peer));
+
+            Ok(())
         }
         Some(Commands::Tuntap { dev, conf, ns }) => {
             ns.set_cloexec()?;
@@ -199,10 +214,12 @@ fn main() -> Result<()> {
             // It doesn't supervise processes. Therefore you can restart watchers after changing configs without interrupting anything.
             async_run(async move {
                 let sock = config::ServerConf::default().server;
-                let profiles = ConfigLoader::<Profiles>::new().file("./fwatch.json")?.load()?;
+                let profiles = ConfigLoader::<Profiles>::new()
+                    .file("./fwatch.json")?
+                    .load()?;
                 let conf = Arc::new(profiles.config);
                 let w = FlatpakWatcher::new(sock, conf).await?;
-                
+
                 w.daemon().await?;
 
                 Ok(())
@@ -213,8 +230,8 @@ fn main() -> Result<()> {
                 // start the server
                 // server implements the minimal set of features
                 // so it's not frequently restarted, reconfigured. It supervises the Tun2proxy, slirp processes
-                let conf = ProgramConfig::<{ Validate::Undone }>::default();
-                let conf: ProgramConfig<{ Validate::Done }> = conf.try_into()?;
+                let conf_load = ConfigLoader::<ServerConf>::new().load()?;
+                let conf = conf_load.config.try_into()?;
                 let (sx, rx) = mpsc::unbounded();
                 let listener = Listener {
                     conf,
@@ -233,6 +250,14 @@ fn main() -> Result<()> {
 
 fn async_run(f: impl Future<Output = Result<()>>) -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(f)
+}
+
+fn async_single(f: impl Future<Output = Result<()>>) -> Result<()> {
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
