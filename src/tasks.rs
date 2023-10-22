@@ -197,7 +197,7 @@ FDType!(NSFd, fd);
 pub macro FDType( $t:ident, $inner:ident ) {
     #[derive(Clone)]
     pub struct $t {
-        $inner: RawFd,
+        pub $inner: RawFd,
     }
     impl Message<$t> for FD {
         fn downcast(self) -> SResult<$t, Self> {
@@ -205,6 +205,14 @@ pub macro FDType( $t:ident, $inner:ident ) {
         }
         fn upcast(label: $t) -> Self {
             Self(label.$inner)
+        }
+    }
+    impl Message<$t> for $t {
+        fn downcast(self) -> SResult<$t, Self> {
+            Result::Ok(self)
+        }
+        fn upcast(label: $t) -> Self {
+            label
         }
     }
 }

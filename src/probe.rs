@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 struct ProbeSub(#[route(Probe, Msg)] FramedUS, #[route(Probe, FD)] FDStream);
 
 #[derive(Role)]
-struct Probe(
+pub struct Probe(
     #[route(ProbeSub, Msg)] FramedUS,
     #[route(ProbeSub, FD)] FDStream,
 );
@@ -58,23 +58,41 @@ pub async fn serve(peer: RawFd) -> Result<()> {
         async move |ses: <Probing<'_, Probe> as FullDual<Probe, ProbeSub>>::Dual| {
             let (enter, cont) = ses.receive().await?;
             setns(enter.fd, enter.flags.0)?;
-            // It should make current thread and future spawned threads change netns. 
+            // It should make current thread and future spawned threads change netns.
             let (cr, cont) = cont.receive().await?;
             let tun = tidy_tuntap::Device::new(cr.name, cr.typ, false)?;
             tun_ops(tun.as_raw_fd())?;
-            
-            Ok(())
+            let e = cont
+                .send(DevFd {
+                    fd: tun.as_raw_fd(),
+                })
+                .await?;
+
+            Result::<_, anyhow::Error>::Ok(((), e))
         },
     )
     .await?;
     Ok(())
 }
 
+pub async fn start() -> Result<Probe> {
+    let (ax, bx) = tokio::net::UnixStream::pair()?;
+    let (fax, fbx) = tokio::net::UnixStream::pair()?;
+    // start a process to take the DevFD
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command.arg("probe").arg(bx.as_raw_fd().to_string());
+    let _child = command.spawn()?;
+    ax.send_stream(fbx).await?;
+    let f: Framed<tokio::net::UnixStream, LengthDelimitedCodec> =
+        Framed::new(ax, LengthDelimitedCodec::new());
+    Ok(Probe(FramedUS(f), FDStream(fax)))
+}
+
 #[session]
 pub type Probing = Send<
     ProbeSub,
     (FramedUS, Enter),
-    Send<ProbeSub, (FramedUS, CreateDevice), Receive<ProbeSub, (FramedUS, DevFd), End>>,
+    Send<ProbeSub, (FramedUS, CreateDevice), Receive<ProbeSub, (FDStream, DevFd), End>>,
 >;
 
 #[choices]
@@ -87,8 +105,8 @@ pub enum Msg {
 #[derive(Serialize, Deserialize)]
 pub struct Enter {
     /// NSFD or PIDFD
-    fd: RawFd,
-    flags: WCloneFlags,
+    pub fd: RawFd,
+    pub flags: WCloneFlags,
 }
 
 #[derive(Serialize, Deserialize)]

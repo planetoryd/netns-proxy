@@ -257,6 +257,7 @@ fn async_run(f: impl Future<Output = Result<()>>) -> Result<()> {
 }
 
 fn async_single(f: impl Future<Output = Result<()>>) -> Result<()> {
+    // This actually starts only one thread, suitable for setns ops.
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

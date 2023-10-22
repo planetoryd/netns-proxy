@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     ffi::OsString,
+    os::fd::AsRawFd,
     path::{Path, PathBuf},
 };
 
@@ -14,8 +15,9 @@ use std::result::Result as stdRes;
 use tokio::{fs, io::AsyncReadExt, sync::mpsc::UnboundedSender};
 
 use crate::{
-    config::ProfilesA,
+    config::{ProfilesA, WCloneFlags},
     flatpak::FlatpakID,
+    probe::{self, Probe, Enter},
     tasks::{Client, Ctrl, CtrlMsg, InitialParams, Initiate, SubjectMsg, SubjectName, TUN2Proxy},
 };
 
@@ -112,7 +114,8 @@ impl FlatpakWatcher {
                         if let Some(profile_name) = self.profiles.flatpak.get(&flatpak_id) {
                             if let Some(pro) = self.profiles.profiles.get(profile_name) {
                                 try_session(&mut self.client, async move |se: Ctrl<'_, Client>| {
-                                    let con = se.into_session()
+                                    let con = se
+                                        .into_session()
                                         .selectc(
                                             Initiate(
                                                 sname,
@@ -126,7 +129,19 @@ impl FlatpakWatcher {
                                             |k| CtrlMsg::SubjectMsg(SubjectMsg::Initiate(k)),
                                         )
                                         .await?;
-                                    con.send(label);
+                                    let fd = unsafe { pidfd::PidFd::open(the_child_pid as i32, 0) }.unwrap();
+                                    let mut probe = probe::start().await?;
+                                    try_session(
+                                        &mut probe,
+                                        async move |se: probe::Probing<'_, Probe>| {
+                                            se.send(Enter {
+                                                fd: fd.as_raw_fd(),
+                                                flags: WCloneFlags::default() // net + user
+                                            });
+
+                                        },
+                                    );
+                                    con.send();
                                     Ok(())
                                 });
                             }
