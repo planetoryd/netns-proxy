@@ -6,7 +6,6 @@
 #![feature(setgroups)]
 #![feature(get_mut_unchecked)]
 #![feature(assert_matches)]
-#![feature(generators, generator_trait)]
 #![feature(error_generic_member_access)]
 #![feature(associated_type_defaults)]
 #![feature(iterator_try_collect)]

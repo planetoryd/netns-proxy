@@ -9,10 +9,10 @@ use clap::{Parser, Subcommand};
 use futures::channel::mpsc;
 use futures::{Future, SinkExt, StreamExt};
 use netlink_ops::netns::{Fcntl, NSCreate, NSIDFrom, Netns, NsFile, Pid};
-use netns_proxy::config::{self, Profiles, ServerConf};
+use netns_proxy::config::{self, Profiles, ServerConf, TUN2Proxy};
 use netns_proxy::listener::Listener;
 use netns_proxy::probe;
-use netns_proxy::tasks::{Client, FDStream, ProgramConfig, TUN2Proxy, Validate};
+use netns_proxy::tasks::{Client, FDStream};
 use netns_proxy::tun2proxy::tuntap;
 use nix::sched::CloneFlags;
 use nix::unistd::{geteuid, Gid, Uid};
@@ -48,10 +48,11 @@ enum Commands {
     /// Exec in the netns, with everything else untampered. You may run this command with, or without SUID, or with sudo.
     Exec {
         /// Enter a persistent NS.
-        #[arg(short, long)]
+        #[arg(long)]
         ns: Option<String>,
         /// Use an empty, new network namespace. This uses syscall unshare, but without the need of sudo.
-        #[arg(long)]
+        /// Recommended
+        #[arg(short, long)]
         new: bool,
         /// Enter the Net NS of certain process
         #[arg(short, long)]
@@ -132,7 +133,7 @@ fn main() -> Result<()> {
             let mut buf = Default::default();
             conf.read_to_end(&mut buf)?;
             let conf: TUN2Proxy = from_vec_internal(&buf)?;
-            ns.enter(conf.setns)?;
+            ns.enter(conf.setns.0)?;
             tuntap(conf, dev)?;
             Ok(())
         }
@@ -163,18 +164,18 @@ fn main() -> Result<()> {
             }
             if let Some(ns) = ns {
                 let n = NSIDFrom::Named(ns);
-                n.open_sync()?.enter(CloneFlags::CLONE_NEWNET)?;
+                n.open_sync()?.enter(CloneFlags::CLONE_NEWNET)?;    
             } else if let Some(pi) = pid {
                 let n = NSIDFrom::Pid(Pid(pi.try_into()?));
                 n.open_sync()?
                     .enter(CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWUSER)?;
             } else {
                 if dbg {
-                    log::info!("Will not change NS");
+                    log::info!("will not change NS");
                 } else if new {
-                    nix::sched::unshare(CloneFlags::CLONE_NEWNET)?;
+                    nix::sched::unshare(CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWUSER)?;
                 } else {
-                    bail!("use --ns or --pid to specify the network namespace.");
+                    bail!("use --ns or --pid or --new");
                 }
             };
             if !dbg && !su {

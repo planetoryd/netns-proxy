@@ -17,8 +17,10 @@ use tokio::{fs, io::AsyncReadExt, sync::mpsc::UnboundedSender};
 use crate::{
     config::{ProfilesA, WCloneFlags},
     flatpak::FlatpakID,
-    probe::{self, Probe, Enter},
-    tasks::{Client, Ctrl, CtrlMsg, InitialParams, Initiate, SubjectMsg, SubjectName, TUN2Proxy},
+    probe::{self, CreateDevice, Enter, Probe},
+    tasks::{
+        Client, Ctrl, CtrlMsg, InitialParams, Initiate, NSFd, SubjectMsg, SubjectName,
+    },
 };
 
 pub trait Watcher: Sized {
@@ -112,9 +114,9 @@ impl FlatpakWatcher {
 
                         let sname = SubjectName(format!("{}_{}", flatpak_id.0, the_child_pid));
                         if let Some(profile_name) = self.profiles.flatpak.get(&flatpak_id) {
-                            if let Some(pro) = self.profiles.profiles.get(profile_name) {
+                            if let Some(profile) = self.profiles.profiles.get(profile_name) {
                                 try_session(&mut self.client, async move |se: Ctrl<'_, Client>| {
-                                    let con = se
+                                    let ctr = se
                                         .into_session()
                                         .selectc(
                                             Initiate(
@@ -123,27 +125,44 @@ impl FlatpakWatcher {
                                                     user: crate::tasks::SetUser::Pid(Pid(
                                                         the_child_pid,
                                                     )),
-                                                    tun2proxy: pro.to_owned(),
+                                                    tun2proxy: profile.to_owned(),
                                                 },
                                             ),
                                             |k| CtrlMsg::SubjectMsg(SubjectMsg::Initiate(k)),
                                         )
                                         .await?;
-                                    let fd = unsafe { pidfd::PidFd::open(the_child_pid as i32, 0) }.unwrap();
+                                    let fd = unsafe { pidfd::PidFd::open(the_child_pid as i32, 0) }
+                                        .unwrap();
+                                    let fd1 = fd.as_raw_fd();
                                     let mut probe = probe::start().await?;
-                                    try_session(
+                                    let devfd = try_session(
                                         &mut probe,
                                         async move |se: probe::Probing<'_, Probe>| {
-                                            se.send(Enter {
-                                                fd: fd.as_raw_fd(),
-                                                flags: WCloneFlags::default() // net + user
-                                            });
-
+                                            let se = se
+                                                .send(Enter {
+                                                    fd: fd1,
+                                                    flags: profile.setns, // decided by config
+                                                })
+                                                .await?;
+                                            let recv = se
+                                                .send(CreateDevice {
+                                                    name: "s_tun".to_owned(),
+                                                    typ: tidy_tuntap::Mode::Tun,
+                                                })
+                                                .await?;
+                                            let k = recv.receive().await?;
+                                            Result::<_, anyhow::Error>::Ok(k)
                                         },
-                                    );
-                                    con.send();
-                                    Ok(())
-                                });
+                                    )
+                                    .await?;
+                                    let k = ctr
+                                        .send(devfd)
+                                        .await?
+                                        .send(NSFd { fd: fd.as_raw_fd() })
+                                        .await?;
+                                    Result::<_, anyhow::Error>::Ok(((), k))
+                                })
+                                .await?;
                             }
                         }
                     }

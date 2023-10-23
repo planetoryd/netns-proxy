@@ -161,6 +161,10 @@ pub mod perms {
     }
 
     pub fn drop_privs_id(gi: Gid, ui: Uid) -> Result<()> {
+        if !nix::unistd::geteuid().is_root() {
+            // Unsure about security, the point is non-root may error in the following
+            return Ok(());
+        }
         log::trace!("groups, {:?}", nix::unistd::getgroups()?);
         log::trace!("GID to {gi}");
         nix::unistd::setresgid(gi, gi, gi)?;

@@ -93,6 +93,8 @@ pub struct TUN2Proxy {
     pub tap: bool,
     #[setting(default = 1500)]
     pub mtu: usize,
+    /// CloneFlags to setns
+    #[serde(default)]
     pub setns: WCloneFlags,
 }
 
@@ -105,11 +107,12 @@ pub enum TUN2DNS {
     Upstream(IpAddr),
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Copy)]
 pub struct WCloneFlags(#[serde(with = "int_repr")] pub CloneFlags);
 
 impl Default for WCloneFlags {
     fn default() -> Self {
+        // default value suited for flatpak, and typically other rootless use cases
         Self(CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWUSER)
     }
 }

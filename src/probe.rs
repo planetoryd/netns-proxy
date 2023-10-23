@@ -25,7 +25,7 @@ use crate::tasks::FD;
 use serde::{Deserialize, Serialize};
 
 #[derive(Role)]
-struct ProbeSub(#[route(Probe, Msg)] FramedUS, #[route(Probe, FD)] FDStream);
+pub struct ProbeSub(#[route(Probe, Msg)] FramedUS, #[route(Probe, FD)] FDStream);
 
 #[derive(Role)]
 pub struct Probe(
@@ -111,6 +111,6 @@ pub struct Enter {
 
 #[derive(Serialize, Deserialize)]
 pub struct CreateDevice {
-    name: String,
-    typ: tidy_tuntap::Mode,
+    pub name: String,
+    pub typ: tidy_tuntap::Mode,
 }
