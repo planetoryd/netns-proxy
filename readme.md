@@ -1,3 +1,5 @@
+# Use https://github.com/planetoryd/nsproxy instead
+
 # Netns-based selective proxying, for identity isolation
 
 > *identity isolation* because environ-variable based proxying is not safe for that.
